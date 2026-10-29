@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Thu, 3 Sep 2026 20:27:41 -0700
+Subject: [PATCH 29/37] Comb/Datapath/CombToSynth: propagate synth.test.arch
+ onto replacement carry-propagate adders
+
+sub -> add(lhs, ~rhs, 1), variadic add -> add(compress), mul -> add(partial
+products), and ReduceDelay's compress rewrites all created the adder fresh,
+so only 2-operand adds and compares honoured the architecture request.
+---
+ include/circt/Dialect/Comb/CombOps.h             |  9 +++++++++
+ lib/Conversion/CombToDatapath/CombToDatapath.cpp | 11 ++++++++---
+ lib/Conversion/CombToSynth/CombToSynth.cpp       |  1 +
+ lib/Dialect/Comb/CombOps.cpp                     |  7 +++++--
+ lib/Dialect/Datapath/Transforms/ReduceDelay.cpp  | 12 ++++++++----
+ 5 files changed, 31 insertions(+), 9 deletions(-)
+
+diff --git a/include/circt/Dialect/Comb/CombOps.h b/include/circt/Dialect/Comb/CombOps.h
+index 11c52d4e2..29266618f 100644
+--- a/include/circt/Dialect/Comb/CombOps.h
++++ b/include/circt/Dialect/Comb/CombOps.h
+@@ -93,6 +93,15 @@ Value createInject(OpBuilder &builder, Location loc, Value value,
+                    unsigned offset, Value replacement);
+ 
+ /// Replace a subtraction with an addition of the two's complement.
++/// Copy the adder-architecture request (`synth.test.arch`, consumed by
++/// CombToSynth's determineAdderArch) from an op being lowered onto the
++/// carry-propagate adder that replaces it, so a sub, a variadic add or a
++/// multiplier keeps the architecture chosen for it (circt-abc PHYS-DP-2).
++inline void copyAdderArchAttr(mlir::Operation *from, mlir::Operation *to) {
++  if (auto a = from->getAttr("synth.test.arch"))
++    to->setAttr("synth.test.arch", a);
++}
++
+ LogicalResult convertSubToAdd(comb::SubOp subOp,
+                               mlir::PatternRewriter &rewriter);
+ 
+diff --git a/lib/Conversion/CombToDatapath/CombToDatapath.cpp b/lib/Conversion/CombToDatapath/CombToDatapath.cpp
+index f8fa6ca3f..dcd50c6a9 100644
+--- a/lib/Conversion/CombToDatapath/CombToDatapath.cpp
++++ b/lib/Conversion/CombToDatapath/CombToDatapath.cpp
+@@ -48,7 +48,9 @@ struct CombAddOpConversion : OpConversionPattern<AddOp> {
+     auto results = datapath::CompressOp::create(rewriter, op.getLoc(),
+                                                 op.getOperands(), 2);
+     // carry+saved
+-    rewriter.replaceOpWithNewOp<AddOp>(op, results.getResults(), true);
++    auto cpa = AddOp::create(rewriter, op.getLoc(), results.getResults(), true);
++    copyAdderArchAttr(op, cpa);
++    rewriter.replaceOp(op, cpa);
+     return success();
+   }
+ };
+@@ -68,8 +70,11 @@ struct CombMulOpConversion : OpConversionPattern<MulOp> {
+     // Create partial product rows - number of rows == width
+     auto pp = datapath::PartialProductOp::create(rewriter, op.getLoc(),
+                                                  op.getInputs(), width);
+-    // Sum partial products
+-    rewriter.replaceOpWithNewOp<AddOp>(op, pp.getResults(), true);
++    // Sum partial products (the multiplier's architecture request, if any,
++    // selects its final carry-propagate adder)
++    auto sum = AddOp::create(rewriter, op.getLoc(), pp.getResults(), true);
++    copyAdderArchAttr(op, sum);
++    rewriter.replaceOp(op, sum);
+     return success();
+   }
+ };
+diff --git a/lib/Conversion/CombToSynth/CombToSynth.cpp b/lib/Conversion/CombToSynth/CombToSynth.cpp
+index 07d0bebf4..dd28f071e 100644
+--- a/lib/Conversion/CombToSynth/CombToSynth.cpp
++++ b/lib/Conversion/CombToSynth/CombToSynth.cpp
+@@ -1052,6 +1052,7 @@ struct CombMulOpConversion : OpConversionPattern<MulOp> {
+ 
+     // Sum the two addends using a carry-propagate adder
+     auto newAdd = comb::AddOp::create(rewriter, loc, addends, true);
++    comb::copyAdderArchAttr(op, newAdd);
+     replaceOpAndCopyNamehint(rewriter, op, newAdd);
+     return success();
+   }
+diff --git a/lib/Dialect/Comb/CombOps.cpp b/lib/Dialect/Comb/CombOps.cpp
+index 81f3f4495..aebe5773d 100644
+--- a/lib/Dialect/Comb/CombOps.cpp
++++ b/lib/Dialect/Comb/CombOps.cpp
+@@ -265,8 +265,11 @@ llvm::LogicalResult comb::convertSubToAdd(comb::SubOp subOp,
+       comb::createOrFoldNot(rewriter, subOp.getLoc(), rhs, subOp.getTwoState());
+   auto one =
+       hw::ConstantOp::create(rewriter, subOp.getLoc(), subOp.getType(), 1);
+-  replaceOpWithNewOpAndCopyNamehint<comb::AddOp>(
+-      rewriter, subOp, ValueRange{lhs, notRhs, one}, subOp.getTwoState());
++  auto add = comb::AddOp::create(rewriter, subOp.getLoc(),
++                                 ValueRange{lhs, notRhs, one},
++                                 subOp.getTwoState());
++  copyAdderArchAttr(subOp, add);
++  replaceOpAndCopyNamehint(rewriter, subOp, add);
+   return success();
+ }
+ 
+diff --git a/lib/Dialect/Datapath/Transforms/ReduceDelay.cpp b/lib/Dialect/Datapath/Transforms/ReduceDelay.cpp
+index 1fcd7bee1..2a2107980 100644
+--- a/lib/Dialect/Datapath/Transforms/ReduceDelay.cpp
++++ b/lib/Dialect/Datapath/Transforms/ReduceDelay.cpp
+@@ -61,8 +61,10 @@ struct FoldAddReplicate : public OpRewritePattern<comb::AddOp> {
+                                                       newCompressOperands, 2);
+ 
+     // Add the results of the CompressOp
+-    rewriter.replaceOpWithNewOp<comb::AddOp>(addOp, newCompressOp.getResults(),
+-                                             true);
++    auto cpa = comb::AddOp::create(rewriter, addOp.getLoc(),
++                                   newCompressOp.getResults(), true);
++    comb::copyAdderArchAttr(addOp, cpa);
++    rewriter.replaceOp(addOp, cpa);
+     return success();
+   }
+ };
+@@ -133,8 +135,10 @@ struct FoldMuxAdd : public OpRewritePattern<comb::AddOp> {
+                                                       newCompressOperands, 2);
+ 
+     // Add the results of the CompressOp
+-    rewriter.replaceOpWithNewOp<comb::AddOp>(addOp, newCompressOp.getResults(),
+-                                             true);
++    auto cpa = comb::AddOp::create(rewriter, addOp.getLoc(),
++                                   newCompressOp.getResults(), true);
++    comb::copyAdderArchAttr(addOp, cpa);
++    rewriter.replaceOp(addOp, cpa);
+     return success();
+   }
+ };
+-- 
+2.52.0
+

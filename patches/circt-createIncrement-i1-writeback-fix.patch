@@ -1,0 +1,131 @@
+diff --git a/lib/Conversion/ImportVerilog/Expressions.cpp b/lib/Conversion/ImportVerilog/Expressions.cpp
+index ec1397c392..b9129ba482 100644
+--- a/lib/Conversion/ImportVerilog/Expressions.cpp
++++ b/lib/Conversion/ImportVerilog/Expressions.cpp
+@@ -294,7 +294,7 @@ struct ExprVisitor {
+ 
+     if (!isa<moore::IntType, moore::ArrayType, moore::UnpackedArrayType,
+              moore::QueueType, moore::AssocArrayType, moore::StringType,
+-             moore::OpenUnpackedArrayType>(derefType)) {
++             moore::OpenUnpackedArrayType, moore::StructType>(derefType)) {
+       mlir::emitError(loc) << "unsupported expression: element select into "
+                            << expr.value().type->toString() << "\n";
+       return {};
+@@ -978,6 +978,21 @@ struct RvalueExprVisitor : public ExprVisitor {
+   Value visit(const slang::ast::HierarchicalValueExpression &expr) {
+     auto hierLoc = context.convertLocation(expr.symbol.location);
+ 
++
++    // If the symbol was captured by a function, it will be a BlockArgument.
++    // We must use it instead of the out-of-scope hierarchical value to preserve region isolation.
++    if (auto value = context.valueSymbols.lookup(&expr.symbol)) {
++      if (isa<BlockArgument>(value) && cast<BlockArgument>(value).getOwner()->getParentOp()->hasTrait<mlir::OpTrait::IsIsolatedFromAbove>()) {
++        if (isa<moore::RefType>(value.getType())) {
++          auto readOp = moore::ReadOp::create(builder, hierLoc, value);
++          if (context.rvalueReadCallback)
++            context.rvalueReadCallback(readOp);
++          value = readOp.getResult();
++        }
++        return value;
++      }
++    }
++
+     // Canonicalize self-references (e.g., SubD.z inside SubD) to local
+     // variable lookups. When the hierarchical path's first instance body
+     // is the same module that declares the target symbol, the reference
+@@ -1049,6 +1064,12 @@ struct RvalueExprVisitor : public ExprVisitor {
+     if (auto value = context.materializeConstant(constant, *expr.type, loc))
+       return value;
+ 
++    if (expr.symbol.kind == slang::ast::SymbolKind::Parameter) {
++      auto &param = expr.symbol.as<slang::ast::ParameterSymbol>();
++      if (auto value = context.materializeConstant(param.getValue(), *expr.type, loc))
++        return value;
++    }
++
+     // Emit an error for those hierarchical values not recorded in the
+     // `valueSymbols`.
+     auto d = mlir::emitError(loc, "unknown hierarchical name `")
+@@ -1156,22 +1177,27 @@ struct RvalueExprVisitor : public ExprVisitor {
+     Value postValue;
+     // Catch the special case where a signed 1 bit value (i1) is incremented,
+     // as +1 can not be expressed as a signed 1 bit value. For any 1-bit number
+-    // negating is equivalent to incrementing.
++    // negating is equivalent to incrementing (and to decrementing).
+     if (moore::isIntType(preValue.getType(), 1)) {
+       postValue = moore::NotOp::create(builder, loc, preValue).getResult();
+     } else {
+-
+       auto one = moore::ConstantOp::create(
+           builder, loc, cast<moore::IntType>(preValue.getType()), 1);
+       postValue =
+           isInc ? moore::AddOp::create(builder, loc, preValue, one).getResult()
+                 : moore::SubOp::create(builder, loc, preValue, one).getResult();
+-      auto assignOp =
+-          moore::BlockingAssignOp::create(builder, loc, arg, postValue);
+-      if (context.variableAssignCallback)
+-        context.variableAssignCallback(assignOp);
+     }
+ 
++    // Write the incremented value back to the operand. This must run for the
++    // 1-bit case too: previously the i1 branch computed the toggled value but
++    // never emitted the BlockingAssignOp, so `x++`/`x--` on a 1-bit variable was
++    // silently dropped (e.g. CVA6 lsu_bypass's `write_pointer++`/`read_pointer++`
++    // on 1-bit FIFO pointers never advanced -> the LSU input FIFO wedged).
++    auto assignOp =
++        moore::BlockingAssignOp::create(builder, loc, arg, postValue);
++    if (context.variableAssignCallback)
++      context.variableAssignCallback(assignOp);
++
+     if (isPost)
+       return preValue;
+     return postValue;
+@@ -2114,7 +2140,8 @@ struct RvalueExprVisitor : public ExprVisitor {
+           expr.arguments(), loc, moore::IntFormat::Decimal, false);
+       if (failed(fmtValue))
+         return {};
+-      return fmtValue.value();
++      auto strTy = moore::StringType::get(context.getContext());
++      return builder.create<moore::FormatStringToStringOp>(loc, fmtValue.value());
+     }
+ 
+     // Convert the system call using unified dispatch
+@@ -3811,6 +3838,38 @@ Value Context::convertSystemCall(
+     return moore::FOpenBIOp::create(builder, loc, filename, modeAttr);
+   }
+ 
++  //===--------------------------------------------------------------------===//
++  // Memory loading System Tasks
++  //===--------------------------------------------------------------------===//
++
++  if (nameId == ksn::ReadMemB || nameId == ksn::ReadMemH || name == "$readmemb" || name == "$readmemh") {
++    assert(numArgs >= 2 && numArgs <= 4 && "`$readmemh/b` takes 2 to 4 arguments");
++    std::string filenameStr;
++    if (auto *strLit = args[0]->unwrapImplicitConversions().as_if<slang::ast::StringLiteral>()) {
++      filenameStr = strLit->getValue();
++    } else if (auto *cv = args[0]->getConstant(); cv && cv->isString()) {
++      filenameStr = cv->str();
++    } else {
++      // Dynamic filename is not supported by sv.readmem, ignore it to prevent crash.
++      return mlir::UnrealizedConversionCastOp::create(
++                 builder, loc, moore::VoidType::get(getContext()), ValueRange{})
++          .getResult(0);
++    }
++
++    const auto *valueArg = args[1];
++    if (const auto *assign = valueArg->as_if<slang::ast::AssignmentExpression>())
++      valueArg = &assign->left();
++    auto memory = convertLvalueExpression(*valueArg);
++    if (!memory)
++      return {};
++    bool is_hex = (nameId == ksn::ReadMemH || name == "$readmemh");
++    moore::ReadmemBIOp::create(builder, loc, builder.getStringAttr(filenameStr), memory,
++                               is_hex ? builder.getUnitAttr() : UnitAttr{});
++    return mlir::UnrealizedConversionCastOp::create(
++               builder, loc, moore::VoidType::get(getContext()), ValueRange{})
++        .getResult(0);
++  }
++
+   //===--------------------------------------------------------------------===//
+   // Command Line Input System Functions
+   //===--------------------------------------------------------------------===//

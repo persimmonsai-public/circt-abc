@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Wed, 2 Sep 2026 23:40:34 -0700
+Subject: [PATCH 12/14] drc_size: per-load Elmore sink slew, and count
+ wire-dominated violations separately
+
+Placement-aware drc_size checked only the driver's OUTPUT slew, but the
+slew that violates the library limit is the one at each LOAD pin after
+the wire's RC degradation -- which is where OpenROAD checks it. With
+read_place in effect, per fanout edge L = Manhattan distance,
+tau = r*L*(c*L/2 + Cpin) (kOhm/um * um * fF = ps), and the sink slew is
+sqrt(slew_drv^2 + (2.2*tau)^2); the worst sink drives the sizing
+decision. A separate count reports violations whose 2.2*tau alone
+exceeds the limit -- these are wire-dominated: no driver size removes
+them and they belong to the repeater/split tier, not upsizing.
+
+r and c come from the .place header (resistance_per_um / cap_per_um).
+Guarded by Scl_PlaceIsRunning, so the no-placement path is unchanged
+(cap-only, byte-identical to before). Sized netlist CEC-equivalent to
+the original on ibex; the wire term is ~0 there (a small die, no long
+nets) and the interesting count is on large designs.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ src/map/scl/sclDrc.c | 70 ++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 65 insertions(+), 5 deletions(-)
+
+diff --git a/src/map/scl/sclDrc.c b/src/map/scl/sclDrc.c
+index 41dbc0ec8..c231d7561 100644
+--- a/src/map/scl/sclDrc.c
++++ b/src/map/scl/sclDrc.c
+@@ -18,6 +18,7 @@
+ 
+ ***********************************************************************/
+ 
++#include <math.h>
+ #include "sclSize.h"
+ 
+ ABC_NAMESPACE_IMPL_START
+@@ -49,6 +50,51 @@ ABC_NAMESPACE_IMPL_START
+   <= 0 disables the slew criterion. Returns the number of gates changed.]
+ 
+ ***********************************************************************/
++/**Function*************************************************************
++
++  Synopsis    [Worst load-pin slew of a placed net under an Elmore wire.]
++
++  Description [SlewDrv is the driver's output slew (ps). For every located
++  fanout: L = Manhattan distance (um), tau = r*L*(c*L/2 + Cpin) with r in
++  kOhm/um and c in fF/um from the .place header (kOhm*fF = ps), slew at
++  the sink = sqrt(SlewDrv^2 + (2.2*tau)^2). Returns the worst sink slew;
++  *pWireOnly receives the worst 2.2*tau alone (what no driver size can
++  remove). Unlocated fanouts contribute the driver slew.]
++
++***********************************************************************/
++static float Abc_SclDrcWorstSinkSlew( SC_Man * p, Abc_Obj_t * pObj, float SlewDrv, float * pWireOnly )
++{
++    Abc_Obj_t * pFanout;
++    float xD, yD, xS, yS, r = Scl_PlaceResPerUm(), c = Scl_PlaceCapPerUm();
++    float Worst = SlewDrv, WireOnly = 0;
++    int k;
++    if ( !Scl_PlaceObjCoord( p->pNtk, Abc_ObjId(pObj), &xD, &yD ) )
++        { *pWireOnly = 0; return SlewDrv; }
++    Abc_ObjForEachFanout( pObj, pFanout, k )
++    {
++        float L, Cpin = 0, Tau, SlewSink;
++        int iFanin;
++        if ( !Scl_PlaceObjCoord( p->pNtk, Abc_ObjId(pFanout), &xS, &yS ) )
++            continue;
++        L = Abc_AbsFloat(xD - xS) + Abc_AbsFloat(yD - yS);
++        if ( Abc_ObjIsNode(pFanout) && Abc_SclObjCell(pFanout) )
++        {
++            Abc_Obj_t * pFanin; int j;
++            iFanin = -1;
++            Abc_ObjForEachFanin( pFanout, pFanin, j )
++                if ( pFanin == pObj ) { iFanin = j; break; }
++            if ( iFanin >= 0 && iFanin < (int)Abc_SclObjCell(pFanout)->n_inputs )
++                Cpin = SC_CellPinCap( Abc_SclObjCell(pFanout), iFanin );
++        }
++        Tau = r * L * ( c * L / 2 + Cpin );
++        SlewSink = (float)sqrt( SlewDrv * SlewDrv + (2.2f * Tau) * (2.2f * Tau) );
++        Worst = Abc_MaxFloat( Worst, SlewSink );
++        WireOnly = Abc_MaxFloat( WireOnly, 2.2f * Tau );
++    }
++    *pWireOnly = WireOnly;
++    return Worst;
++}
++
+ int Abc_SclDrcSizePerform( SC_Lib * pLib, Abc_Ntk_t * pNtk, float SlewLimit,
+                            int fUseWireLoads, int nIters, int fVerbose )
+ {
+@@ -56,13 +102,13 @@ int Abc_SclDrcSizePerform( SC_Lib * pLib, Abc_Ntk_t * pNtk, float SlewLimit,
+     Abc_Obj_t * pObj;
+     SC_Cell * pCell, * pBest, * pTemp;
+     SC_Pin * pPinOut;
+-    float Load, Slew;
+-    int i, k, iter, nChanged, nTotal = 0, nCapViol, nSlewViol;
++    float Load, Slew, WireOnly;
++    int i, k, iter, nChanged, nTotal = 0, nCapViol, nSlewViol, nWireDom;
+     p = Abc_SclManStart( pLib, pNtk, fUseWireLoads, 1, 0, 0 );
+     for ( iter = 0; iter < nIters; iter++ )
+     {
+         nChanged = 0;
+-        nCapViol = nSlewViol = 0;
++        nCapViol = nSlewViol = nWireDom = 0;
+         Abc_NtkForEachNode1( pNtk, pObj, i )
+         {
+             pCell = Abc_SclObjCell( pObj );
+@@ -70,6 +116,19 @@ int Abc_SclDrcSizePerform( SC_Lib * pLib, Abc_Ntk_t * pNtk, float SlewLimit,
+                 continue;
+             Load = Abc_SclObjLoadMax( p, pObj );
+             Slew = Abc_SclObjSlewMax( p, pObj );
++            // placement-aware: the slew that matters is the one at each LOAD
++            // pin after the wire's RC degradation (OpenROAD checks there),
++            // not the driver's output slew. Per fanout edge: L = Manhattan
++            // distance, tau = r*L*(c*L/2 + Cpin) [kOhm*fF = ps], slew_sink =
++            // sqrt(slew^2 + (2.2 tau)^2). The worst sink is what is checked.
++            if ( SlewLimit > 0 && Scl_PlaceIsRunning(pNtk) )
++            {
++                float SlewSink = Abc_SclDrcWorstSinkSlew( p, pObj, Slew, &WireOnly );
++                if ( SlewSink > Slew )
++                    Slew = SlewSink;
++                if ( WireOnly > SlewLimit )
++                    nWireDom++;
++            }
+             pPinOut = SC_CellPin( pCell, pCell->n_inputs );
+             if ( Load <= pPinOut->max_out_cap &&
+                  (SlewLimit <= 0 || Slew <= SlewLimit) )
+@@ -102,9 +161,10 @@ int Abc_SclDrcSizePerform( SC_Lib * pLib, Abc_Ntk_t * pNtk, float SlewLimit,
+         }
+         nTotal += nChanged;
+         if ( fVerbose )
+-            printf( "drc_size iter %d: %d cap / %d slew violations, "
++            printf( "drc_size iter %d: %d cap / %d slew violations "
++                    "(%d wire-dominated: no drive fixes them, repeat/split), "
+                     "%d gates upsized.\n",
+-                    iter, nCapViol, nSlewViol, nChanged );
++                    iter, nCapViol, nSlewViol, nWireDom, nChanged );
+         if ( nChanged == 0 )
+             break;
+         Abc_SclTimeNtkRecompute( p, NULL, NULL, 0, 0 );
+-- 
+2.52.0
+

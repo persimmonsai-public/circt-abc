@@ -1,0 +1,3 @@
+add_subdirectory(StructuralMapper)
+add_subdirectory(ABCBridge)
+add_subdirectory(RegisterMapper)

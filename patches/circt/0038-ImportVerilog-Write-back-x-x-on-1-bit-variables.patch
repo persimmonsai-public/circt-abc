@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Wed, 28 Oct 2026 09:58:52 -0700
+Subject: [PATCH] [ImportVerilog] Write back x++/x-- on 1-bit variables
+
+createIncrement computed the toggled value for a 1-bit operand but only
+emitted the BlockingAssignOp in the wider-width branch, so `x++`, `++x`,
+`x--` and `--x` on a `bit` or `logic` variable were silently dropped. Emit
+the assignment for both cases.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/Conversion/ImportVerilog/Expressions.cpp  | 14 ++++++----
+ test/Conversion/ImportVerilog/increment-i1.sv | 28 +++++++++++++++++++
+ 2 files changed, 36 insertions(+), 6 deletions(-)
+ create mode 100644 test/Conversion/ImportVerilog/increment-i1.sv
+
+diff --git a/lib/Conversion/ImportVerilog/Expressions.cpp b/lib/Conversion/ImportVerilog/Expressions.cpp
+index cdcaeaa74..02006556a 100644
+--- a/lib/Conversion/ImportVerilog/Expressions.cpp
++++ b/lib/Conversion/ImportVerilog/Expressions.cpp
+@@ -1220,22 +1220,24 @@ struct RvalueExprVisitor : public ExprVisitor {
+     Value postValue;
+     // Catch the special case where a signed 1 bit value (i1) is incremented,
+     // as +1 can not be expressed as a signed 1 bit value. For any 1-bit number
+-    // negating is equivalent to incrementing.
++    // negating is equivalent to incrementing (and to decrementing).
+     if (moore::isIntType(preValue.getType(), 1)) {
+       postValue = moore::NotOp::create(builder, loc, preValue).getResult();
+     } else {
+-
+       auto one = moore::ConstantOp::create(
+           builder, loc, cast<moore::IntType>(preValue.getType()), 1);
+       postValue =
+           isInc ? moore::AddOp::create(builder, loc, preValue, one).getResult()
+                 : moore::SubOp::create(builder, loc, preValue, one).getResult();
+-      auto assignOp =
+-          moore::BlockingAssignOp::create(builder, loc, arg, postValue);
+-      if (context.variableAssignCallback)
+-        context.variableAssignCallback(assignOp);
+     }
+ 
++    // Write the new value back for the 1-bit case too, or `x++` on a 1-bit
++    // variable is silently dropped.
++    auto assignOp =
++        moore::BlockingAssignOp::create(builder, loc, arg, postValue);
++    if (context.variableAssignCallback)
++      context.variableAssignCallback(assignOp);
++
+     if (isPost)
+       return preValue;
+     return postValue;
+diff --git a/test/Conversion/ImportVerilog/increment-i1.sv b/test/Conversion/ImportVerilog/increment-i1.sv
+new file mode 100644
+index 000000000..e26e7210f
+--- /dev/null
++++ b/test/Conversion/ImportVerilog/increment-i1.sv
+@@ -0,0 +1,28 @@
++// RUN: circt-translate --import-verilog %s | FileCheck %s
++// REQUIRES: slang
++
++// Increments and decrements of a 1-bit variable toggle it, and must write the
++// toggled value back like any other width.
++
++// CHECK-LABEL: moore.module @IncrementI1
++module IncrementI1;
++  bit a;
++  logic b;
++  int c;
++
++  initial begin
++    // CHECK: [[A:%.+]] = moore.read %a
++    // CHECK: [[NOT:%.+]] = moore.not [[A]] : i1
++    // CHECK: moore.blocking_assign %a, [[NOT]] : i1
++    a++;
++    // CHECK: [[A:%.+]] = moore.read %a
++    // CHECK: [[NOT:%.+]] = moore.not [[A]] : i1
++    // CHECK: moore.blocking_assign %a, [[NOT]] : i1
++    --a;
++    // CHECK: [[B:%.+]] = moore.read %b
++    // CHECK: [[NOT:%.+]] = moore.not [[B]] : l1
++    // CHECK: moore.blocking_assign %b, [[NOT]] : l1
++    // CHECK: moore.zext [[B]]
++    c = b++;
++  end
++endmodule
+-- 
+2.52.0
+

@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Sat, 29 Aug 2026 20:12:10 -0700
+Subject: [PATCH 18/37] comb.extract canonicalizer: do not self-replace through
+ a concat cycle
+
+In a graph region the concat may (transitively) use the very extract being
+canonicalized: %e = extract(%c); %c = concat(..., %e, ...) is how a
+partial-update false loop looks after aggregates are lowered to bit vectors
+(a struct_inject chain over a probe of the signal being driven, once
+flattened). isOpTriviallyRecursive only guards DIRECT self-operands; when
+extractConcatToConcatExtract selects exactly the extract's own result out of
+the concat, the 'replacement' IS the op -- RAUW of x with x leaves the uses
+in place and RewriterBase::eraseOp asserts use_empty.
+
+Bail instead; there is nothing to simplify. Found on CVA6 after the
+struct_inject lowering landed: canonicalize crashed on 58 modules' worth of
+false-loop shapes that previously never reached this pattern.
+---
+ lib/Dialect/Comb/CombFolds.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/lib/Dialect/Comb/CombFolds.cpp b/lib/Dialect/Comb/CombFolds.cpp
+index d80b0cab2..e5b9967d1 100644
+--- a/lib/Dialect/Comb/CombFolds.cpp
++++ b/lib/Dialect/Comb/CombFolds.cpp
+@@ -576,6 +576,14 @@ extractConcatToConcatExtract(ExtractOp op, ConcatOp innerCat,
+   }
+ 
+   if (reverseConcatArgs.size() == 1) {
++    // In a graph region the concat may (transitively) use this very extract:
++    // `%e = extract(%c); %c = concat(..., %e, ...)` is how a partial-update
++    // false loop looks after aggregates are lowered to bit vectors. If the
++    // extract selects exactly its own result out of the concat, the
++    // "replacement" IS the op -- a self-RAUW leaves the uses in place and
++    // eraseOp asserts. Bail; there is nothing to simplify.
++    if (reverseConcatArgs[0] == op.getResult())
++      return failure();
+     replaceOpAndCopyNamehint(rewriter, op, reverseConcatArgs[0]);
+   } else {
+     replaceOpWithNewOpAndCopyNamehint<ConcatOp>(
+-- 
+2.52.0
+

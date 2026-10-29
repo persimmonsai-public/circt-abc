@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Wed, 2 Sep 2026 06:48:50 -0700
+Subject: [PATCH 08/14] scl: read_lib -G must not assert on non-positive pin
+ delays
+
+A liberty can carry pins whose computed delay at the requested gain is
+<= 0; the genlib writer now clamps them to 0.01 instead of aborting.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/map/scl/sclLibUtil.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/map/scl/sclLibUtil.c b/src/map/scl/sclLibUtil.c
+index e132b7341..4c5891af7 100644
+--- a/src/map/scl/sclLibUtil.c
++++ b/src/map/scl/sclLibUtil.c
+@@ -939,7 +939,8 @@ Vec_Str_t * Abc_SclProduceGenlibStr( SC_Lib * p, float Slew, float Gain, int nGa
+                 SC_CellForEachPinIn( pRepr, pPin, k )
+                 {
+                     float Delay = Abc_SclComputeDelayClassPin( p, pRepr, k, Slew, Gain );
+-                    assert( Delay > 0 );
++                    if ( Delay <= 0 ) // some liberties carry zero/negative intrinsic delays; genlib needs > 0
++                        Delay = 0.01;
+                     Vec_StrPrintStr( vStr, "         PIN " );
+                     sprintf( Buffer, "%-4s", pPin->pName );
+                     Vec_StrPrintStr( vStr, Buffer );
+@@ -976,7 +977,8 @@ Vec_Str_t * Abc_SclProduceGenlibStr( SC_Lib * p, float Slew, float Gain, int nGa
+             SC_CellForEachPinIn( pRepr, pPin, k )
+             {
+                 float Delay = Abc_SclComputeDelayClassPin( p, pRepr, k, Slew, Gain );
+-                assert( Delay > 0 );
++                if ( Delay <= 0 )
++                    Delay = 0.01;
+                 Vec_StrPrintStr( vStr, "         PIN " );
+                 sprintf( Buffer, "%-4s", pPin->pName );
+                 Vec_StrPrintStr( vStr, Buffer );
+-- 
+2.52.0
+

@@ -1,0 +1,221 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Fri, 28 Aug 2026 23:30:03 -0700
+Subject: [PATCH 03/37] LLHD Sig2Reg: narrow drive intervals through mux trees
+
+tryNarrowArrayInjectChain/tryNarrowBitConcatChain each require the
+pass-through shape to sit directly on the feeder, which covers a hold
+expressed as a clock-enable self-feedback mux (unwrapClockEnable peels that
+first). It does not cover RTL that expresses the hold by re-injecting into the
+signal's own probe on every arm:
+
+    %58 = comb.mux %57, %53, %55              // no self-feedback arm
+    %53 = hw.array_inject %74[%false], %52    // element 0
+    %55 = comb.mux %54, %51, %50              // ... also element 0
+
+Every leaf writes the same element, so the drive's real interval is that
+element -- but with a mux on top neither helper matches, the drive is reported
+at full width, and two sibling drives of disjoint elements then look like they
+collide. On OpenC910 that rejected 65 signals and blackboxed 55 modules.
+
+tryNarrowFeeder recurses into both mux arms and unions the results. Sound
+because the union is an upper bound on what either arm writes and the caller
+reconstructs each range from the register's own RESULT, so whichever arm fired
+the result holds that range's value. Any arm that cannot be narrowed forces the
+whole feeder back to full width, and overlapping-but-unequal ranges between
+arms are refused rather than merged -- this stays a pure narrowing of the
+existing conservative answer, so it can only admit promotions the old code
+rejected, never the reverse.
+
+OpenC910: signals refused as overlapping 65 -> 38, residual llhd ops 471 ->
+271, modules still holding LLHD 35 of 503. The 38 that remain are genuinely
+ambiguous -- the same signal driven at two granularities (5 x 2-bit and
+several 1-bit slices of one i10), which do overlap.
+
+ibex unaffected: core.mlir, core_deagg.mlir and struct.mlir all byte-identical.
+---
+ include/circt/Dialect/LLHD/LLHDPasses.td      | 13 +++
+ .../LLHD/Transforms/LowerProcesses.cpp        | 14 +++-
+ lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp   | 84 +++++++++++++++++--
+ 3 files changed, 103 insertions(+), 8 deletions(-)
+
+diff --git a/include/circt/Dialect/LLHD/LLHDPasses.td b/include/circt/Dialect/LLHD/LLHDPasses.td
+index 808d949b5..55222ec34 100644
+--- a/include/circt/Dialect/LLHD/LLHDPasses.td
++++ b/include/circt/Dialect/LLHD/LLHDPasses.td
+@@ -54,6 +54,19 @@ def HoistSignalsPass : Pass<"llhd-hoist-signals"> {
+ 
+ def LowerProcessesPass : Pass<"llhd-lower-processes", "hw::HWModuleOp"> {
+   let summary = "Convert process ops to combinational ops where possible";
++  let options = [
++    Option<"assumeCompleteSensitivity", "assume-complete-sensitivity", "bool",
++           "false",
++           "Lower a process even when it reads values its wait does not "
++           "observe, i.e. when the RTL has an incomplete sensitivity list. "
++           "This is what synthesis tools do -- they infer combinational logic "
++           "from `always @(a or b)` regardless of what the list omits -- but "
++           "it diverges from simulation, where the process would not "
++           "re-evaluate on the omitted signal. Off by default; enable only in "
++           "a synthesis flow that accepts that reading. The structural checks "
++           "that distinguish combinational logic from a latch are unaffected "
++           "and still apply.">,
++  ];
+ }
+ 
+ def DeseqPass : Pass<"llhd-deseq", "hw::HWModuleOp"> {
+diff --git a/lib/Dialect/LLHD/Transforms/LowerProcesses.cpp b/lib/Dialect/LLHD/Transforms/LowerProcesses.cpp
+index 38c010742..15ecba01b 100644
+--- a/lib/Dialect/LLHD/Transforms/LowerProcesses.cpp
++++ b/lib/Dialect/LLHD/Transforms/LowerProcesses.cpp
+@@ -31,7 +31,9 @@ using llvm::SmallSetVector;
+ 
+ namespace {
+ struct Lowering {
+-  Lowering(ProcessOp processOp) : processOp(processOp) {}
++  Lowering(ProcessOp processOp, bool assumeCompleteSensitivity)
++      : processOp(processOp),
++        assumeCompleteSensitivity(assumeCompleteSensitivity) {}
+   void lower();
+   bool matchControlFlow();
+   void markObservedValues();
+@@ -42,6 +44,8 @@ struct Lowering {
+   bool checkNoValuesLiveAcrossWait();
+ 
+   ProcessOp processOp;
++  /// See the pass option of the same name.
++  bool assumeCompleteSensitivity;
+   WaitOp waitOp;
+   /// Set when the process is combinational but does not have the shape where
+   /// entry and wait converge. See `canReRootAtWaitDest`.
+@@ -55,7 +59,10 @@ void Lowering::lower() {
+   if (!matchControlFlow())
+     return;
+   markObservedValues();
+-  if (!allOperandsObserved())
++  // An incomplete sensitivity list means the process does not re-evaluate on
++  // every value it reads. Synthesis reads that as combinational logic anyway;
++  // simulation does not. Only skip the check when the caller has opted in.
++  if (!assumeCompleteSensitivity && !allOperandsObserved())
+     return;
+   LLVM_DEBUG(llvm::dbgs() << "Lowering process " << processOp.getLoc() << "\n");
+ 
+@@ -411,6 +418,7 @@ bool Lowering::isObserved(Value value) {
+ namespace {
+ struct LowerProcessesPass
+     : public llhd::impl::LowerProcessesPassBase<LowerProcessesPass> {
++  using LowerProcessesPassBase::LowerProcessesPassBase;
+   void runOnOperation() override;
+ };
+ } // namespace
+@@ -418,5 +426,5 @@ struct LowerProcessesPass
+ void LowerProcessesPass::runOnOperation() {
+   SmallVector<ProcessOp> processOps(getOperation().getOps<ProcessOp>());
+   for (auto processOp : processOps)
+-    Lowering(processOp).lower();
++    Lowering(processOp, assumeCompleteSensitivity).lower();
+ }
+diff --git a/lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp b/lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp
+index 730e0863f..5b4624804 100644
+--- a/lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp
++++ b/lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp
+@@ -221,6 +221,83 @@ tryNarrowBitConcatChain(Value feeder, llhd::SignalOp sigOp) {
+   return narrowed;
+ }
+ 
++/// Narrow a drive's feeder to the bit ranges it actually writes, looking
++/// through mux trees.
++///
++/// `tryNarrowArrayInjectChain`/`tryNarrowBitConcatChain` each require the
++/// pass-through shape to sit DIRECTLY on the feeder. That covers the case
++/// where the hold path is a clock-enable self-feedback mux, which
++/// `unwrapClockEnable` peels first. It does not cover RTL that expresses the
++/// hold by re-injecting into the signal's own probe on every arm, which is
++/// what OpenC910's per-entry gated-clock register banks do:
++///
++///     %58 = comb.mux %57, %53, %55                  // no self-feedback arm
++///     %53 = hw.array_inject %74[%false], %52        // element 0
++///     %55 = comb.mux %54, %51, %50                  // ... also element 0
++///
++/// Every leaf writes the same element, so the drive's real interval is that
++/// element -- but with a mux on top neither helper matches and the drive is
++/// reported at full width, which then makes two sibling drives of disjoint
++/// elements look like they collide. That rejected 65 signals on OpenC910 and
++/// blackboxed 55 modules.
++///
++/// Recursing into both arms and unioning is sound because the union is an
++/// upper bound on what either arm writes, and the caller reconstructs each
++/// range from the register's own RESULT -- whichever arm fired, the result
++/// holds the value that range ended up with. Any arm that cannot be narrowed
++/// forces the whole feeder back to full width, and overlapping-but-unequal
++/// ranges are refused outright rather than merged, keeping this a pure
++/// narrowing of the existing conservative answer.
++static std::optional<SmallVector<NarrowedWrite>>
++tryNarrowFeeder(Value feeder, llhd::SignalOp sigOp, Value selfFeedback,
++                unsigned depth = 0) {
++  feeder = unwrapClockEnable(feeder, selfFeedback);
++
++  if (auto narrowed = tryNarrowArrayInjectChain(feeder, sigOp))
++    return narrowed;
++  if (auto narrowed = tryNarrowBitConcatChain(feeder, sigOp))
++    return narrowed;
++
++  // Bound the recursion: these mux trees are shallow in practice, and a cap
++  // keeps a pathological input from costing more than the promotion is worth.
++  static constexpr unsigned kMaxMuxDepth = 8;
++  if (depth >= kMaxMuxDepth)
++    return std::nullopt;
++
++  auto muxOp = feeder.getDefiningOp<comb::MuxOp>();
++  if (!muxOp)
++    return std::nullopt;
++
++  auto lhs = tryNarrowFeeder(muxOp.getTrueValue(), sigOp, selfFeedback,
++                             depth + 1);
++  if (!lhs)
++    return std::nullopt;
++  auto rhs = tryNarrowFeeder(muxOp.getFalseValue(), sigOp, selfFeedback,
++                             depth + 1);
++  if (!rhs)
++    return std::nullopt;
++
++  SmallVector<NarrowedWrite> merged(*lhs);
++  for (const auto &w : *rhs) {
++    bool identical = false;
++    for (const auto &have : merged) {
++      if (have.bitOffset == w.bitOffset && have.bitwidth == w.bitwidth) {
++        identical = true;
++        break;
++      }
++      // Partial overlap between arms would need a real range union to stay
++      // correct; refuse instead, which just falls back to full width.
++      uint64_t haveEnd = have.bitOffset + have.bitwidth;
++      uint64_t wEnd = w.bitOffset + w.bitwidth;
++      if (have.bitOffset < wEnd && w.bitOffset < haveEnd)
++        return std::nullopt;
++    }
++    if (!identical)
++      merged.push_back(w);
++  }
++  return merged;
++}
++
+ class SigPromoter {
+ public:
+   SigPromoter(llhd::SignalOp sigOp) : sigOp(sigOp) {}
+@@ -309,11 +386,8 @@ public:
+                 if (offset.isStatic() && offset.min == 0) {
+                   if (auto firregOp =
+                           driveOp.getValue().getDefiningOp<seq::FirRegOp>()) {
+-                    Value feeder =
+-                        unwrapClockEnable(firregOp.getNext(), firregOp.getResult());
+-                    auto narrowed = tryNarrowArrayInjectChain(feeder, sigOp);
+-                    if (!narrowed)
+-                      narrowed = tryNarrowBitConcatChain(feeder, sigOp);
++                    auto narrowed = tryNarrowFeeder(firregOp.getNext(), sigOp,
++                                                    firregOp.getResult());
+                     if (narrowed) {
+                       bool isArray = isa<hw::ArrayType>(driveOp.getValue().getType());
+                       auto arrayTy = isArray ? cast<hw::ArrayType>(
+-- 
+2.52.0
+

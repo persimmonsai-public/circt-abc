@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Wed, 2 Sep 2026 21:52:04 -0700
+Subject: [PATCH 28/37] HWAggregateToComb: decoded one-hot lowering for wide
+ dynamic array reads (decoded-array-get-min, default 8)
+
+OR_i (replicate(index == i) & element_i), the last element covering
+out-of-bounds indices (index >= N-1) as the mux tree does. ~2 AIG nodes
+per element per bit against ~3 for the binary mux tree: ibex's 32-entry
+register file read 651 -> 497 nodes after ABC dc2 on a reproducer, the
+whole ibex merged AIG 24,713 -> 22,740. Option 0 restores the tree
+(byte-identical).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ include/circt/Dialect/HW/Passes.td            | 14 ++++++
+ .../HW/Transforms/HWAggregateToComb.cpp       | 50 +++++++++++++++++--
+ 2 files changed, 59 insertions(+), 5 deletions(-)
+
+diff --git a/include/circt/Dialect/HW/Passes.td b/include/circt/Dialect/HW/Passes.td
+index d5d7585bd..ec118df37 100644
+--- a/include/circt/Dialect/HW/Passes.td
++++ b/include/circt/Dialect/HW/Passes.td
+@@ -119,7 +119,21 @@ def HWAggregateToComb : Pass<"hw-aggregate-to-comb", "hw::HWModuleOp"> {
+     This pass will change the behavior of out-of-bounds access of arrays,
+     specifically the last element of the array is used as a value for
+     out-of-bounds access.
++
++    Array reads with a dynamic index are lowered as a decoded one-hot
++    AND-OR select (each element ANDed with `index == i`, OR-reduced) when
++    the array has at least `decoded-array-get-min` elements, and as a
++    binary mux tree otherwise. The decoded form is ~2 AIG nodes per
++    element per bit against ~3 for the tree (measured on ibex's 32-entry
++    register file: 1.40x after ABC's dc2, the largest single term of the
++    gate-count gap vs. Yosys, whose $pmux is the decoded form). 0 disables
++    the decoded form.
+   }];
++  let options = [
++    Option<"decodedArrayGetMin", "decoded-array-get-min", "unsigned", "8",
++           "Minimum element count for the decoded one-hot array_get "
++           "lowering (0 = always use the mux tree)">,
++  ];
+   let dependentDialects = ["comb::CombDialect"];
+ }
+ 
+diff --git a/lib/Dialect/HW/Transforms/HWAggregateToComb.cpp b/lib/Dialect/HW/Transforms/HWAggregateToComb.cpp
+index 2917a99fb..a39c2956a 100644
+--- a/lib/Dialect/HW/Transforms/HWAggregateToComb.cpp
++++ b/lib/Dialect/HW/Transforms/HWAggregateToComb.cpp
+@@ -56,7 +56,11 @@ struct HWAggregateConstantOpConversion
+ };
+ 
+ struct HWArrayGetOpConversion : OpConversionPattern<hw::ArrayGetOp> {
+-  using OpConversionPattern<hw::ArrayGetOp>::OpConversionPattern;
++  HWArrayGetOpConversion(TypeConverter &typeConverter, MLIRContext *ctx,
++                         unsigned decodedMin)
++      : OpConversionPattern<hw::ArrayGetOp>(typeConverter, ctx),
++        decodedMin(decodedMin) {}
++  unsigned decodedMin;
+ 
+   LogicalResult
+   matchAndRewrite(hw::ArrayGetOp op, OpAdaptor adaptor,
+@@ -86,6 +90,39 @@ struct HWArrayGetOpConversion : OpConversionPattern<hw::ArrayGetOp> {
+       results.push_back(rewriter.createOrFold<comb::ExtractOp>(
+           op.getLoc(), lowered, i * elemWidth, elemWidth));
+ 
++    // Decoded one-hot select for wide arrays: OR_i (replicate(index == i)
++    // & element_i). The last element also covers out-of-bounds indices
++    // (index >= N-1), matching the mux tree's documented semantics.
++    auto loc = op.getLoc();
++    unsigned idxWidth = index.getType().getIntOrFloatBitWidth();
++    if (decodedMin > 0 && numElements >= decodedMin && idxWidth > 0 &&
++        idxWidth < 64) {
++      uint64_t indexable = 1ull << idxWidth;
++      auto elemTy = rewriter.getIntegerType(elemWidth);
++      SmallVector<Value> terms;
++      for (size_t i = 0; i < numElements; ++i) {
++        if (i >= indexable)
++          break; // unreachable elements
++        Value ci = hw::ConstantOp::create(rewriter, loc, APInt(idxWidth, i));
++        bool last = i + 1 == numElements;
++        Value sel = comb::ICmpOp::create(
++            rewriter, loc,
++            last && indexable > numElements ? comb::ICmpPredicate::uge
++                                            : comb::ICmpPredicate::eq,
++            index, ci, /*twoState=*/true);
++        Value mask = elemWidth == 1
++                         ? sel
++                         : comb::ReplicateOp::create(rewriter, loc, elemTy, sel);
++        terms.push_back(
++            comb::AndOp::create(rewriter, loc, mask, results[i], true));
++      }
++      Value decoded = terms.size() == 1
++                          ? terms.front()
++                          : comb::OrOp::create(rewriter, loc, terms, true);
++      rewriter.replaceOp(op, decoded);
++      return success();
++    }
++
+     SmallVector<Value> bits;
+     comb::extractBits(rewriter, index, bits);
+     auto result = comb::constructMuxTree(rewriter, op.getLoc(), bits, results,
+@@ -353,9 +390,11 @@ public:
+ } // namespace
+ 
+ static void populateHWAggregateToCombOpConversionPatterns(
+-    RewritePatternSet &patterns, AggregateTypeConverter &typeConverter) {
+-  patterns.add<HWArrayGetOpConversion,
+-               HWArrayCreateLikeOpConversion<hw::ArrayCreateOp>,
++    RewritePatternSet &patterns, AggregateTypeConverter &typeConverter,
++    unsigned decodedArrayGetMin) {
++  patterns.add<HWArrayGetOpConversion>(typeConverter, patterns.getContext(),
++                                       decodedArrayGetMin);
++  patterns.add<HWArrayCreateLikeOpConversion<hw::ArrayCreateOp>,
+                HWArrayCreateLikeOpConversion<hw::ArrayConcatOp>,
+                HWAggregateConstantOpConversion, HWArraySliceOpConversion,
+                HWArrayInjectOpConversion, HWStructCreateOpConversion,
+@@ -402,7 +441,8 @@ void HWAggregateToCombPass::runOnOperation() {
+ 
+   RewritePatternSet patterns(&getContext());
+   AggregateTypeConverter typeConverter;
+-  populateHWAggregateToCombOpConversionPatterns(patterns, typeConverter);
++  populateHWAggregateToCombOpConversionPatterns(patterns, typeConverter,
++                                               decodedArrayGetMin);
+ 
+   if (failed(mlir::applyPartialConversion(getOperation(), target,
+                                           std::move(patterns))))
+-- 
+2.52.0
+

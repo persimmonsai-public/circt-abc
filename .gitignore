@@ -1,0 +1,13 @@
+# Build trees
+mapper/build/
+third_party/circt/
+third_party/yosys/
+third_party/abc/
+third_party/mockturtle/
+build/
+
+# Flow outputs and caches
+out/
+*.log
+__pycache__/
+*.pyc

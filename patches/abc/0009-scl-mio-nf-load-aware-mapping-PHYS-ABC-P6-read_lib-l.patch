@@ -1,0 +1,597 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Wed, 2 Sep 2026 11:25:06 -0700
+Subject: [PATCH 09/14] scl/mio/nf: load-aware mapping (PHYS-ABC P6): read_lib
+ -l, &nf -l
+
+read_lib -l derives a GENLIB from the NLDM liberty with EVERY drive
+variant and per pin `UNKNOWN <cap fF> 999 <PD ps> <LD ps/fF> <PD> <LD>`
+(Abc_SclComputeLoadDelayPin: tangent of the delay-vs-load row at the
+average slew). Mio_Cell2_t carries iLDs/iCaps; Mio_CollectRootsNew2
+keeps all variants in that mode (the truth-table dedup then applies only
+to the const/buffer/inverter slots). &nf -l evaluates
+PD + LD*load(root) + AvgLD*cap(pin) at the two cut-match arrival sites
+and in Nf_CutRequired, from a per-node load vector: round 0 = flow refs
+x average pin cap + the wire_load table by fanout count, later rounds =
+input caps of the cells chosen for the fanouts, clamped at -X (30 fF).
+The AvgLD*cap term is the logical-effort self-penalty: without it the
+delay round picks maximal drives everywhere and the next round's loads
+explode. SCL_GENLIB_DUMP=<file> writes the derived
+GENLIB for inspection.
+
+Stock paths are byte-identical (read_lib without -l, &nf without -l).
+Note: a liberty without timing tables makes `read_lib -G` map on the
+0.01 ps clamp; the load-aware genlib must come from an NLDM liberty.
+On a cv64a6 group under the SCL STA without wires, &nf -l was much
+faster than stock &nf, and than stock plus upsize/dnsize, with less
+area (CEC-equivalent).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/aig/gia/gia.h        |   2 +
+ src/aig/gia/giaNf.c      | 128 ++++++++++++++++++++++++++++++++++++---
+ src/base/abci/abc.c      |  16 ++++-
+ src/map/mio/mio.h        |   4 +-
+ src/map/mio/mioUtils.c   |  11 +++-
+ src/map/scl/scl.c        |  12 ++--
+ src/map/scl/sclLib.h     |   1 +
+ src/map/scl/sclLibUtil.c | 120 +++++++++++++++++++++++++++++++++++-
+ 8 files changed, 278 insertions(+), 16 deletions(-)
+
+diff --git a/src/aig/gia/gia.h b/src/aig/gia/gia.h
+index b4d2ba35b..72ccf1ea6 100644
+--- a/src/aig/gia/gia.h
++++ b/src/aig/gia/gia.h
+@@ -370,6 +370,8 @@ struct Jf_Par_t_
+     int            fCutHashing;
+     int            fCutSimple;
+     int            fCutGroup;
++    int            fUseLoads;      // load-aware delays: PD + LD*load per pin (PHYS-ABC P6)
++    float          MaxLoadF;       // load clamp (fF) for load-aware delays; high-fanout nets get buffered later
+     int            fVerbose;
+     int            fVeryVerbose;
+     int            nLutSizeMax;
+diff --git a/src/aig/gia/giaNf.c b/src/aig/gia/giaNf.c
+index 7df056ba8..e2259eed1 100644
+--- a/src/aig/gia/giaNf.c
++++ b/src/aig/gia/giaNf.c
+@@ -30,6 +30,8 @@
+ #include "opt/dau/dau.h"
+ #include "misc/util/utilNam.h"
+ #include "map/scl/sclCon.h"
++#include "map/scl/sclLib.h"
++#include "map/scl/sclSize.h"
+ #include "misc/tim/tim.h"
+ 
+ #ifdef _MSC_VER
+@@ -105,6 +107,10 @@ struct Nf_Man_t_
+     Vec_Flt_t       vCutFlows;      // temporary cut area
+     Vec_Int_t       vCutDelays;     // temporary cut delay
+     Vec_Int_t       vBackup;        // backup literals
++    Vec_Flt_t       vLoads;         // per-node output load estimate (fF), load-aware mode (PHYS-ABC P6)
++    Vec_Flt_t *     vWireCaps;      // wire cap by fanout count (fF), from the SC_Lib wire_load model
++    float           AvgCapF;        // average input pin cap of the library cells (fF)
++    float           AvgLDF;         // average load-delay slope of the library pins (ps/fF): the cost a pin's own cap imposes on its driver
+     int             iCur;           // current position
+     int             Iter;           // mapping iterations
+     int             fUseEla;        // use exact area
+@@ -139,6 +145,14 @@ static inline int          Nf_ObjMapRefNum( Nf_Man_t * p, int i, int c )
+ static inline int          Nf_ObjMapRefInc( Nf_Man_t * p, int i, int c )             { return (*Vec_IntEntryP(&p->vMapRefs, Abc_Var2Lit(i,c)))++;       }
+ static inline int          Nf_ObjMapRefDec( Nf_Man_t * p, int i, int c )             { return --(*Vec_IntEntryP(&p->vMapRefs, Abc_Var2Lit(i,c)));       }
+ static inline float        Nf_ObjFlowRefs( Nf_Man_t * p, int i, int c )              { return Vec_FltEntry(&p->vFlowRefs, Abc_Var2Lit(i,c));            }
++// load-aware per-pin delay: PD + LD * load(root); falls back to the fixed
++// genlib delay when loads are off (byte-identical to stock &nf then)
++// PD + LD*load(root) + AvgLD*cap(pin): the last term charges the pin's own
++// input cap at the library's average slope, so a big-drive cell pays for the
++// load it puts on its driver inside the same round (logical-effort view);
++// without it the delay round picks maximal drives everywhere and the next
++// round's recomputed loads explode.
++static inline int          Nf_CellPinDelay( Nf_Man_t * p, Mio_Cell2_t * pC, int k, int iObj ) { return p->pPars->fUseLoads ? pC->iDelays[k] + (int)(pC->iLDs[k] * Vec_FltEntry(&p->vLoads, iObj)) + (int)(p->AvgLDF * pC->iCaps[k]) : pC->iDelays[k]; }
+ static inline int          Nf_ObjRequired( Nf_Man_t * p, int i, int c )              { return Vec_IntEntry(&p->vRequired, Abc_Var2Lit(i,c));            }
+ static inline void         Nf_ObjSetRequired( Nf_Man_t * p,int i, int c, int f )     { Vec_IntWriteEntry(&p->vRequired, Abc_Var2Lit(i,c), f);           }
+ static inline void         Nf_ObjUpdateRequired( Nf_Man_t * p,int i, int c, int f )  { if (Nf_ObjRequired(p, i, c) > f) Nf_ObjSetRequired(p, i, c, f);  }
+@@ -399,6 +413,8 @@ Nf_Man_t * Nf_StoCreate( Gia_Man_t * pGia, Jf_Par_t * pPars )
+     Vec_FltFill( &p->vCutFlows, Gia_ManObjNum(pGia), 0 );              // cut area
+     Vec_IntFill( &p->vCutDelays,Gia_ManObjNum(pGia), 0 );              // cut delay
+     Vec_IntGrow( &p->vBackup, 1000 );
++    if ( pPars->fUseLoads )
++        Vec_FltFill( &p->vLoads, Gia_ManObjNum(pGia), 0 );
+     // references
+     vFlowRefs = Vec_IntAlloc(0);
+     Mf_ManSetFlowRefs( pGia, vFlowRefs );
+@@ -413,6 +429,21 @@ Nf_Man_t * Nf_StoCreate( Gia_Man_t * pGia, Jf_Par_t * pPars )
+     if ( p->pCells == NULL )
+         return NULL;
+     p->InvDelayI = p->pCells[3].iDelays[0];
++    if ( pPars->fUseLoads )
++    {
++        extern void * Abc_FrameReadLibScl();
++        SC_Lib * pScl = (SC_Lib *)Abc_FrameReadLibScl();
++        SC_WireLoad * pWL = pScl ? Abc_SclFindWireLoadModel( pScl, 0 ) : NULL;
++        double CapSum = 0, LDSum = 0; int nPins = 0, iC, k;
++        for ( iC = 4; iC < p->nCells; iC++ )
++            for ( k = 0; k < (int)p->pCells[iC].nFanins; k++ )
++                CapSum += p->pCells[iC].iCaps[k], LDSum += p->pCells[iC].iLDs[k], nPins++;
++        p->AvgCapF   = nPins ? (float)(CapSum / nPins / SCL_NUM) : 1.0f;
++        p->AvgLDF    = nPins ? (float)(LDSum / nPins / SCL_NUM) : 0.0f;
++        p->vWireCaps = pWL ? Abc_SclFindWireCaps( pWL, 64 ) : NULL;
++        if ( pPars->fVerbose )
++            printf( "Load-aware mapping: %d cells, average pin cap %.3f fF, average LD %.3f ps/fF, wire model %s.\n", p->nCells, p->AvgCapF, p->AvgLDF, pWL ? pWL->pName : "none" );
++    }
+     p->InvAreaW  = p->pCells[3].AreaW;
+     p->InvAreaF  = p->pCells[3].AreaF;
+     Nf_ObjMatchD(p, 0, 0)->Gate = 0;
+@@ -427,6 +458,8 @@ void Nf_StoDelete( Nf_Man_t * p )
+     ABC_FREE( p->vMapRefs.pArray );
+     ABC_FREE( p->vFlowRefs.pArray );
+     ABC_FREE( p->vRequired.pArray );
++    ABC_FREE( p->vLoads.pArray );
++    Vec_FltFreeP( &p->vWireCaps );
+     ABC_FREE( p->vCutSets.pArray );
+     ABC_FREE( p->vCutFlows.pArray );
+     ABC_FREE( p->vCutDelays.pArray );
+@@ -1169,9 +1202,9 @@ void Nf_ManCutMatchOne( Nf_Man_t * p, int iObj, int * pCut, int * pCutSet )
+         {
+             ArrivalD  = pBestF[iFanin]->M[fComplF][0].D;
+             ArrivalA  = pBestF[iFanin]->M[fComplF][1].D;
+-            if ( ArrivalA + pC->iDelays[k] <= Required && Required != SCL_INFINITY )
++            if ( ArrivalA + Nf_CellPinDelay(p, pC, k, iObj) <= Required && Required != SCL_INFINITY )
+             {
+-                Delay = Abc_MaxInt( Delay, ArrivalA + pC->iDelays[k] );
++                Delay = Abc_MaxInt( Delay, ArrivalA + Nf_CellPinDelay(p, pC, k, iObj) );
+                 if ( AreaF >= (float)1e32 || pBestF[iFanin]->M[fComplF][1].F >= (float)1e32 )
+                     AreaF = (float)1e32;
+                 else
+@@ -1179,9 +1212,9 @@ void Nf_ManCutMatchOne( Nf_Man_t * p, int iObj, int * pCut, int * pCutSet )
+             }
+             else 
+             {
+-                if ( pD->D < SCL_INFINITY && pA->D < SCL_INFINITY && ArrivalD + pC->iDelays[k] > Required )
++                if ( pD->D < SCL_INFINITY && pA->D < SCL_INFINITY && ArrivalD + Nf_CellPinDelay(p, pC, k, iObj) > Required )
+                     break;
+-                Delay = Abc_MaxInt( Delay, ArrivalD + pC->iDelays[k] );
++                Delay = Abc_MaxInt( Delay, ArrivalD + Nf_CellPinDelay(p, pC, k, iObj) );
+                 //AreaF += pBestF[iFanin]->M[fComplF][0].F;
+                 if ( AreaF >= (float)1e32 || pBestF[iFanin]->M[fComplF][0].F >= (float)1e32 )
+                     AreaF = (float)1e32;
+@@ -1253,7 +1286,7 @@ static inline void Nf_ObjPrepareBuf( Nf_Man_t * p, Gia_Obj_t * pObj )
+     pDn->fCompl = pAn->fCompl = 1;
+     pDn->fBest = 1;
+ }
+-static inline int Nf_CutRequired( Nf_Man_t * p, Nf_Mat_t * pM, int * pCutSet )
++static inline int Nf_CutRequired( Nf_Man_t * p, Nf_Mat_t * pM, int * pCutSet, int iRoot )
+ {
+     Mio_Cell2_t * pCell = Nf_ManCell( p, pM->Gate );
+     int * pCut = Nf_CutFromHandle( pCutSet, pM->CutH );
+@@ -1261,11 +1294,11 @@ static inline int Nf_CutRequired( Nf_Man_t * p, Nf_Mat_t * pM, int * pCutSet )
+     int Arr, Req, Arrival = 0, Required = 0;
+     Nf_CutForEachVarCompl( pCut, pM->Cfg, iVar, fCompl, i )
+     {
+-        Arr     = Nf_ManObj(p, iVar)->M[fCompl][0].D + pCell->iDelays[i];
++        Arr     = Nf_ManObj(p, iVar)->M[fCompl][0].D + Nf_CellPinDelay(p, pCell, i, iRoot);
+         Req     = Nf_ObjRequired(p, iVar, fCompl);
+         Arrival = Abc_MaxInt( Arrival, Arr );
+         if ( Req < SCL_INFINITY )
+-            Required = Abc_MaxInt( Required, Req + pCell->iDelays[i] );
++            Required = Abc_MaxInt( Required, Req + Nf_CellPinDelay(p, pCell, i, iRoot) );
+     }
+     return Abc_MaxInt( Required + p->pPars->nReqTimeFlex*p->InvDelayI, Arrival ); 
+ }
+@@ -1275,7 +1308,7 @@ static inline void Nf_ObjComputeRequired( Nf_Man_t * p, int iObj )
+     int c, * pCutSet = Nf_ObjCutSet( p, iObj );
+     for ( c = 0; c < 2; c++ )
+         if ( Nf_ObjRequired(p, iObj, c) == SCL_INFINITY )
+-            Nf_ObjSetRequired( p, iObj, c, Nf_CutRequired(p, &pBest->M[c][0], pCutSet) );
++            Nf_ObjSetRequired( p, iObj, c, Nf_CutRequired(p, &pBest->M[c][0], pCutSet, iObj) );
+ }
+ void Nf_ManCutMatch( Nf_Man_t * p, int iObj )
+ {
+@@ -1426,9 +1459,86 @@ static inline Nf_Mat_t * Nf_ObjMatchBest( Nf_Man_t * p, int i, int c )
+         return pD;
+     return NULL;
+ }
++/**Function*************************************************************
++  Synopsis    [Per-node output load estimate for load-aware mapping (P6).]
++  Description [Round 0: flow references x average pin cap + wire cap by
++  fanout count. Later rounds: the input caps of the cells actually chosen
++  for the fanouts in the previous round (cut leaves of every referenced
++  best match), plus the wire cap for that many consumers.]
++***********************************************************************/
++static inline float Nf_ManWireCap( Nf_Man_t * p, int nFans )
++{
++    if ( p->vWireCaps == NULL || nFans <= 0 )
++        return 0;
++    return Vec_FltEntry( p->vWireCaps, Abc_MinInt(nFans, Vec_FltSize(p->vWireCaps)-1) );
++}
++void Nf_ManComputeLoads( Nf_Man_t * p )
++{
++    Gia_Obj_t * pObj; int i, c, k, iVar, fCompl, nUsed = 0;
++    Vec_Int_t * vFans;
++    if ( !p->pPars->fUseLoads )
++        return;
++    vFans = Vec_IntStart( Gia_ManObjNum(p->pGia) );
++    Vec_FltFill( &p->vLoads, Gia_ManObjNum(p->pGia), 0 );
++    if ( p->Iter == 0 )
++    {
++        Gia_ManForEachObj( p->pGia, pObj, i )
++        {
++            float Refs = Vec_FltEntry(&p->vFlowRefs, 2*i) + Vec_FltEntry(&p->vFlowRefs, 2*i+1);
++            int nFans = (int)(Refs + 0.5);
++            Vec_FltWriteEntry( &p->vLoads, i, Refs * p->AvgCapF + Nf_ManWireCap(p, nFans) );
++        }
++    }
++    else
++    {
++        Gia_ManForEachAnd( p->pGia, pObj, i )
++        for ( c = 0; c < 2; c++ )
++        {
++            Nf_Mat_t * pM; Mio_Cell2_t * pCell; int * pCut;
++            if ( !Nf_ObjMapRefNum(p, i, c) )
++                continue;
++            pM = Nf_ObjMatchBest( p, i, c );
++            if ( pM->Gate < 4 || !Nf_ObjHasCuts(p, i) )
++                continue;
++            pCell = Nf_ManCell( p, pM->Gate );
++            pCut  = Nf_CutFromHandle( Nf_ObjCutSet(p, i), pM->CutH );
++            Nf_CutForEachVarCompl( pCut, pM->Cfg, iVar, fCompl, k )
++            {
++                Vec_FltAddToEntry( &p->vLoads, iVar, (float)pCell->iCaps[k] / SCL_NUM );
++                Vec_IntAddToEntry( vFans, iVar, 1 );
++            }
++            nUsed++;
++        }
++        Gia_ManForEachObj( p->pGia, pObj, i )
++        {
++            int nFans = Vec_IntEntry( vFans, i );
++            if ( nFans == 0 ) // node not referenced by the previous mapping: keep the flow estimate
++            {
++                float Refs = Vec_FltEntry(&p->vFlowRefs, 2*i) + Vec_FltEntry(&p->vFlowRefs, 2*i+1);
++                Vec_FltWriteEntry( &p->vLoads, i, Refs * p->AvgCapF + Nf_ManWireCap(p, (int)(Refs + 0.5)) );
++            }
++            else
++                Vec_FltAddToEntry( &p->vLoads, i, Nf_ManWireCap(p, nFans) );
++        }
++    }
++    // clamp: nets beyond the library's characterized load get buffer trees downstream
++    if ( p->pPars->MaxLoadF > 0 )
++        Gia_ManForEachObj( p->pGia, pObj, i )
++            if ( Vec_FltEntry(&p->vLoads, i) > p->pPars->MaxLoadF )
++                Vec_FltWriteEntry( &p->vLoads, i, p->pPars->MaxLoadF );
++    if ( p->pPars->fVerbose )
++    {
++        double Sum = 0; float Max = 0;
++        Gia_ManForEachAnd( p->pGia, pObj, i )
++            Sum += Vec_FltEntry(&p->vLoads, i), Max = Abc_MaxFloat( Max, Vec_FltEntry(&p->vLoads, i) );
++        printf( "Loads (round %d): %d mapped refs, mean %.2f fF, max %.2f fF\n", p->Iter, nUsed, Sum / Abc_MaxInt(1, Gia_ManAndNum(p->pGia)), Max );
++    }
++    Vec_IntFree( vFans );
++}
+ void Nf_ManComputeMapping( Nf_Man_t * p )
+ {
+     Gia_Obj_t * pObj; int i, arrTime;
++    Nf_ManComputeLoads( p );
+     if ( p->pManTim )
+         Tim_ManIncrementTravId( p->pManTim );    
+     Gia_ManForEachObjWithBoxes( p->pGia, pObj, i )
+@@ -2031,6 +2141,7 @@ void Nf_ManResetMatches( Nf_Man_t * p, int Round )
+ void Nf_ManComputeMappingEla( Nf_Man_t * p )
+ {
+     int fVerbose = 0;
++    Nf_ManComputeLoads( p );
+     Gia_Obj_t * pObj;
+     Mio_Cell2_t * pCell;
+     Nf_Mat_t Mb, * pMb = &Mb, * pM;
+@@ -2706,6 +2817,7 @@ void Nf_ManSetDefaultPars( Jf_Par_t * pPars )
+     pPars->nLutSizeMax  =  NF_LEAF_MAX;
+     pPars->nCutNumMax   =  NF_CUT_MAX;
+     pPars->MapDelayTarget = 0;
++    pPars->MaxLoadF     = 30.0;
+ }
+ Gia_Man_t * Nf_ManPerformMappingInt( Gia_Man_t * pGia, Jf_Par_t * pPars )
+ {
+diff --git a/src/base/abci/abc.c b/src/base/abci/abc.c
+index 9a20230f6..7c0758a97 100644
+--- a/src/base/abci/abc.c
++++ b/src/base/abci/abc.c
+@@ -46887,7 +46887,7 @@ int Abc_CommandAbc9Nf( Abc_Frame_t * pAbc, int argc, char ** argv )
+     Gia_Man_t * pNew; int c;
+     Nf_ManSetDefaultPars( pPars );
+     Extra_UtilGetoptReset();
+-    while ( ( c = Extra_UtilGetopt( argc, argv, "KCFARLEDQMWZakpqfvwh" ) ) != EOF )
++    while ( ( c = Extra_UtilGetopt( argc, argv, "KCFARLEDQMWZXakpqflvwh" ) ) != EOF )
+     {
+         switch ( c )
+         {
+@@ -47039,6 +47039,18 @@ int Abc_CommandAbc9Nf( Abc_Frame_t * pAbc, int argc, char ** argv )
+         case 'q':
+             pPars->fPinQuick ^= 1;
+             break;
++        case 'X':
++            if ( globalUtilOptind >= argc )
++            {
++                Abc_Print( -1, "Command line switch \"-X\" should be followed by a floating point number.\n" );
++                goto usage;
++            }
++            pPars->MaxLoadF = (float)atof(argv[globalUtilOptind]);
++            globalUtilOptind++;
++            break;
++        case 'l':
++            pPars->fUseLoads ^= 1;
++            break;
+         case 'f':
+             pPars->fPinFilter ^= 1;
+             break;
+@@ -47098,6 +47110,8 @@ usage:
+     Abc_Print( -2, "\t-p       : toggles pin permutation (more matches - better quality) [default = %s]\n",  pPars->fPinPerm? "yes": "no" );
+     Abc_Print( -2, "\t-q       : toggles quick mapping (fewer matches - worse quality) [default = %s]\n",    pPars->fPinQuick? "yes": "no" );
+     Abc_Print( -2, "\t-f       : toggles filtering matches (useful with unit delay model) [default = %s]\n", pPars->fPinFilter? "yes": "no" );
++    Abc_Print( -2, "\t-l       : toggles load-aware delays PD + LD*load per pin (needs read_lib -l) [default = %s]\n", pPars->fUseLoads? "yes": "no" );
++    Abc_Print( -2, "\t-X num   : load clamp in fF for load-aware delays (0 = none) [default = %.1f]\n", pPars->MaxLoadF );
+     Abc_Print( -2, "\t-v       : toggles verbose output [default = %s]\n",                                   pPars->fVerbose? "yes": "no" );
+     Abc_Print( -2, "\t-w       : toggles very verbose output [default = %s]\n",                              pPars->fVeryVerbose? "yes": "no" );
+     Abc_Print( -2, "\t-h       : prints the command usage\n");
+diff --git a/src/map/mio/mio.h b/src/map/mio/mio.h
+index 499a9e6e5..d3add06f4 100644
+--- a/src/map/mio/mio.h
++++ b/src/map/mio/mio.h
+@@ -66,7 +66,9 @@ struct Mio_Cell2_t_
+     word            AreaW;          // area
+     word            uTruth;         // truth table
+     int             iDelayAve;      // average delay
+-    int             iDelays[6];     // delay
++    int             iDelays[6];     // delay (block/intrinsic, SCL_NUM-scaled ps)
++    int             iLDs[6];        // delay per unit load (SCL_NUM-scaled ps/fF), from the genlib fanout-delay field
++    int             iCaps[6];       // input pin capacitance (SCL_NUM-scaled fF), from the genlib input-load field
+     void *          pMioGate;       // gate pointer
+ };
+ 
+diff --git a/src/map/mio/mioUtils.c b/src/map/mio/mioUtils.c
+index e75fcd90f..ddea82a0e 100644
+--- a/src/map/mio/mioUtils.c
++++ b/src/map/mio/mioUtils.c
+@@ -765,12 +765,21 @@ static inline void Mio_CollectCopy2( Mio_Cell2_t * pCell, Mio_Gate_t * pGate )
+     for ( k = 0, pPin = pGate->pPins; pPin; pPin = pPin->pNext, k++ )
+     {
+         pCell->iDelays[k] = (int)(SCL_NUM/2 * pPin->dDelayBlockRise + SCL_NUM/2 * pPin->dDelayBlockFall);
++        pCell->iLDs[k]    = (int)(SCL_NUM/2 * pPin->dDelayFanoutRise + SCL_NUM/2 * pPin->dDelayFanoutFall);
++        pCell->iCaps[k]   = (int)(SCL_NUM * pPin->dLoadInput);
+         pCell->iDelayAve += pCell->iDelays[k];
+     }
+     if ( pCell->nFanins )
+         pCell->iDelayAve /= pCell->nFanins;
+ }
+ 
++// PHYS-ABC P6: when the genlib was produced by `read_lib -l`, every drive
++// variant of a function must stay visible to the mapper (their (PD, LD)
++// differ); the truth-table dedup below then applies only to the four
++// special slots (const0/1, buffer, inverter).
++static int s_MioLoadAware = 0;
++void Mio_SetLoadAwareMode( int f ) { s_MioLoadAware = f; }
++int  Mio_IsLoadAwareMode()         { return s_MioLoadAware; }
+ Mio_Cell2_t * Mio_CollectRootsNew2( Mio_Library_t * pLib, int nInputs, int * pnGates, int fVerbose )
+ {
+     Mio_Gate_t * pGate0;
+@@ -791,7 +800,7 @@ Mio_Cell2_t * Mio_CollectRootsNew2( Mio_Library_t * pLib, int nInputs, int * pnG
+     for ( pCell = ppCells0; pCell < ppCells0 + iCell0; pCell++ )
+     {
+         // check if the gate with this functionality already exists
+-        for ( i = 0; i < iCell; i++ )
++        for ( i = (s_MioLoadAware && pCell->nFanins > 1) ? iCell : 0; i < iCell; i++ )
+             if ( ppCells[i].pName && ppCells[i].uTruth == pCell->uTruth )
+             {
+                 if ( Mio_CompareTwo2( ppCells + i, pCell ) )
+diff --git a/src/map/scl/scl.c b/src/map/scl/scl.c
+index 37277ece9..72907c59f 100644
+--- a/src/map/scl/scl.c
++++ b/src/map/scl/scl.c
+@@ -201,13 +201,13 @@ int Scl_CommandReadLib( Abc_Frame_t * pAbc, int argc, char ** argv )
+     int fUsePrefix = 0;
+     int fUseAll = 0;
+     int fSkipMultiOuts = 0;
+-    
++    int fLoadAware = 0;
+     SC_DontUse dont_use = {0};
+     dont_use.dont_use_list = ABC_ALLOC(char *, argc);
+     dont_use.size = 0;
+ 
+     Extra_UtilGetoptReset();
+-    while ( ( c = Extra_UtilGetopt( argc, argv, "SGMXdnuvwmpash" ) ) != EOF )
++    while ( ( c = Extra_UtilGetopt( argc, argv, "SGMXdnuvwmpaslh" ) ) != EOF )
+     {
+         switch ( c )
+         {
+@@ -275,6 +275,9 @@ int Scl_CommandReadLib( Abc_Frame_t * pAbc, int argc, char ** argv )
+         case 'p':
+             fUsePrefix ^= 1;
+             break;            
++        case 'l':
++            fLoadAware ^= 1;
++            break;
+         case 'a':
+             fUseAll ^= 1;
+             break;            
+@@ -340,13 +343,13 @@ int Scl_CommandReadLib( Abc_Frame_t * pAbc, int argc, char ** argv )
+     // extract genlib library
+     if ( pAbc->pLibScl )
+     {
+-        Abc_SclInstallGenlib( pAbc->pLibScl, Slew, Gain, fUseAll, nGatesMin );
++        Abc_SclInstallGenlib2( pAbc->pLibScl, Slew, Gain, fUseAll, nGatesMin, fLoadAware );
+         Mio_LibraryTransferCellIds();
+     }
+     return 0;
+ 
+ usage:
+-    fprintf( pAbc->Err, "usage: read_lib [-SG float] [-M num] [-dnuvwmpash] [-X cell_name] <file> <file2>\n" );
++    fprintf( pAbc->Err, "usage: read_lib [-SG float] [-M num] [-dnuvwmpaslh] [-X cell_name] <file> <file2>\n" );
+     fprintf( pAbc->Err, "\t           reads Liberty library from file\n" );
+     fprintf( pAbc->Err, "\t-S float : the slew parameter used to generate the library [default = %.2f]\n", Slew );
+     fprintf( pAbc->Err, "\t-G float : the gain parameter used to generate the library [default = %.2f]\n", Gain );
+@@ -359,6 +362,7 @@ usage:
+     fprintf( pAbc->Err, "\t-w       : toggle writing information about skipped gates [default = %s]\n", fVeryVerbose? "yes": "no" );
+     fprintf( pAbc->Err, "\t-m       : toggle merging library with exisiting library [default = %s]\n", fMerge? "yes": "no" );
+     fprintf( pAbc->Err, "\t-p       : toggle using prefix for the cell names [default = %s]\n", fUsePrefix? "yes": "no" );
++    fprintf( pAbc->Err, "\t-l       : toggle load-aware GENLIB (all drive variants, per-pin PD/LD/cap for &nf -l) [default = %s]\n", fLoadAware? "yes": "no" );
+     fprintf( pAbc->Err, "\t-a       : toggle reading all cells when using gain-based modeling [default = %s]\n", fUseAll? "yes": "no" );
+     fprintf( pAbc->Err, "\t-s       : toggle skipping cells with two outputs [default = %s]\n", fSkipMultiOuts? "yes": "no" );
+     fprintf( pAbc->Err, "\t-h       : prints the command summary\n" );
+diff --git a/src/map/scl/sclLib.h b/src/map/scl/sclLib.h
+index fd2f5bb49..24f7ae74c 100644
+--- a/src/map/scl/sclLib.h
++++ b/src/map/scl/sclLib.h
+@@ -838,6 +838,7 @@ extern int           Abc_SclHasDelayInfo( void * pScl );
+ extern float         Abc_SclComputeAverageSlew( SC_Lib * p );
+ extern void          Abc_SclDumpGenlib( char * pFileName, SC_Lib * p, float Slew, float Gain, int nGatesMin );
+ extern void          Abc_SclInstallGenlib( void * pScl, float Slew, float Gain, int fUseAll, int nGatesMin );
++extern void          Abc_SclInstallGenlib2( void * pScl, float Slew, float Gain, int fUseAll, int nGatesMin, int fLoadAware );
+ 
+ 
+ ABC_NAMESPACE_HEADER_END
+diff --git a/src/map/scl/sclLibUtil.c b/src/map/scl/sclLibUtil.c
+index 4c5891af7..c4f5b3e53 100644
+--- a/src/map/scl/sclLibUtil.c
++++ b/src/map/scl/sclLibUtil.c
+@@ -1118,22 +1118,140 @@ Mio_Library_t * Abc_SclDeriveGenlib( void * pScl, void * pMio, float SlewInit, f
+   SeeAlso     []
+ 
+ ***********************************************************************/
++/**Function*************************************************************
++  Synopsis    [Load-aware GENLIB: every cell, per pin PD/LD/cap (PHYS-ABC P6).]
++  Description [PIN <name> UNKNOWN <cap fF> 999 <PD ps> <LD ps/fF> <PD> <LD>.
++  The mapper (&nf -l) evaluates PD + LD*load(root) instead of a fixed
++  per-pin delay, and sees all drive variants of a function.]
++***********************************************************************/
++int Abc_SclComputeLoadDelayPin( SC_Lib * p, SC_Cell * pCell, int iPin, float Slew, float * pLDfF, float * pPD )
++{
++    SC_Pair Load0, Load1, Load2;
++    SC_Pair ArrIn  = { 0.0, 0.0 };
++    SC_Pair SlewIn = { Slew, Slew };
++    SC_Pair ArrOut0 = { 0.0, 0.0 }, ArrOut1 = { 0.0, 0.0 }, ArrOut2 = { 0.0, 0.0 };
++    SC_Pair SlewOut = { 0.0, 0.0 };
++    SC_Timing * pTime = Scl_CellPinTime( pCell, iPin );
++    Vec_Flt_t * vIndex = pTime ? &pTime->pCellRise.vIndex1 : NULL; // capacitance axis
++    if ( vIndex == NULL )
++        return 0;
++    if ( Vec_FltSize(vIndex) == 1 )
++    {
++        *pLDfF = 0;
++        *pPD = Vec_FltEntry( (Vec_Flt_t *)Vec_PtrEntry(&pTime->pCellRise.vData, 0), 0 );
++        return 1;
++    }
++    Load0.rise = Load0.fall = 0.0;
++    Load1.rise = Load1.fall = Vec_FltEntry( vIndex, 0 );
++    Load2.rise = Load2.fall = Vec_FltEntry( vIndex, Vec_FltSize(vIndex) - 2 );
++    Scl_LibPinArrival( pTime, &ArrIn, &SlewIn, &Load0, &ArrOut0, &SlewOut );
++    Scl_LibPinArrival( pTime, &ArrIn, &SlewIn, &Load1, &ArrOut1, &SlewOut );
++    Scl_LibPinArrival( pTime, &ArrIn, &SlewIn, &Load2, &ArrOut2, &SlewOut );
++    ArrOut0.rise = 0.5 * ArrOut0.rise + 0.5 * ArrOut0.fall;
++    ArrOut1.rise = 0.5 * ArrOut1.rise + 0.5 * ArrOut1.fall;
++    ArrOut2.rise = 0.5 * ArrOut2.rise + 0.5 * ArrOut2.fall;
++    *pLDfF = (Load2.rise > Load1.rise) ? (ArrOut2.rise - ArrOut1.rise) / (Load2.rise - Load1.rise) : 0;
++    *pPD   = ArrOut0.rise;
++    return 1;
++}
++Vec_Str_t * Abc_SclProduceGenlibStrLoad( SC_Lib * p, float Slew, int * pnCellCount )
++{
++    char Buffer[200];
++    Vec_Str_t * vStr;
++    SC_Cell * pCell;
++    SC_Pin * pPin, * pPinOut;
++    int i, j, k, Count = 2, nSkipped = 0;
++    Abc_SclMarkSkippedCells( p );
++    vStr = Vec_StrAlloc( 1000 );
++    Vec_StrPrintStr( vStr, "GATE _const0_            0.00 z=CONST0;\n" );
++    Vec_StrPrintStr( vStr, "GATE _const1_            0.00 z=CONST1;\n" );
++    SC_LibForEachCell( p, pCell, i )
++    {
++        float LD[16], PD[16];
++        if ( pCell->n_inputs == 0 || pCell->n_outputs != 1 || pCell->fSkip || pCell->n_inputs > 6 )
++        {
++            if ( getenv("SCL_GENLIB_DUMP") )
++                fprintf( stderr, "skip %s: n_inputs %d n_outputs %d fSkip %d\n", pCell->pName, pCell->n_inputs, pCell->n_outputs, pCell->fSkip );
++            continue;
++        }
++        for ( k = 0; k < pCell->n_inputs; k++ )
++        {
++            if ( !Abc_SclComputeLoadDelayPin( p, pCell, k, Slew, LD + k, PD + k ) )
++                break;
++            if ( PD[k] <= 0 ) PD[k] = 0.01;
++            if ( LD[k] < 0 )  LD[k] = 0;
++        }
++        if ( k < pCell->n_inputs )
++        {
++            if ( getenv("SCL_GENLIB_DUMP") )
++                fprintf( stderr, "skip %s: pin %d has no delay table (pins %d, out vRTimings %d, vTimings[%d] %d)\n", pCell->pName, k,
++                         Vec_PtrSize(&pCell->vPins), Vec_PtrSize(&SC_CellPin(pCell, pCell->n_inputs)->vRTimings), k,
++                         k < Vec_PtrSize(&SC_CellPin(pCell, pCell->n_inputs)->vRTimings) ? Vec_PtrSize(&((SC_Timings *)Vec_PtrEntry(&SC_CellPin(pCell, pCell->n_inputs)->vRTimings, k))->vTimings) : -1 );
++            nSkipped++; continue;
++        }
++        SC_CellForEachPinOut( pCell, pPinOut, j )
++        {
++            assert( strlen(pCell->pName) < 200 );
++            Vec_StrPrintStr( vStr, "GATE " );
++            sprintf( Buffer, "%-16s", pCell->pName );
++            Vec_StrPrintStr( vStr, Buffer );
++            sprintf( Buffer, " %7.2f ", pCell->area );
++            Vec_StrPrintStr( vStr, Buffer );
++            Vec_StrPrintStr( vStr, SC_CellPinName(pCell, j) );
++            Vec_StrPrintStr( vStr, "=" );
++            Vec_StrPrintStr( vStr, SC_CellPinOutFunc(pCell, j-pCell->n_inputs) ? SC_CellPinOutFunc(pCell, j-pCell->n_inputs) : "?" );
++            Vec_StrPrintStr( vStr, ";\n" );
++            SC_CellForEachPinIn( pCell, pPin, k )
++            {
++                Vec_StrPrintStr( vStr, "         PIN " );
++                sprintf( Buffer, "%-4s", pPin->pName );
++                Vec_StrPrintStr( vStr, Buffer );
++                sprintf( Buffer, " UNKNOWN  %.4f  999  %7.3f  %8.4f  %7.3f  %8.4f\n",
++                         SC_CellPinCap(pCell, k), PD[k], LD[k], PD[k], LD[k] );
++                Vec_StrPrintStr( vStr, Buffer );
++            }
++            Count++;
++        }
++    }
++    Vec_StrPrintStr( vStr, "\n.end\n" );
++    Vec_StrPush( vStr, '\0' );
++    if ( nSkipped )
++        printf( "Load-aware GENLIB: %d cell(s) skipped (no usable delay table).\n", nSkipped );
++    if ( pnCellCount )
++        *pnCellCount = Count;
++    return vStr;
++}
+ void Abc_SclInstallGenlib( void * pScl, float SlewInit, float Gain, int fUseAll, int nGatesMin )
++{
++    Abc_SclInstallGenlib2( pScl, SlewInit, Gain, fUseAll, nGatesMin, 0 );
++}
++void Abc_SclInstallGenlib2( void * pScl, float SlewInit, float Gain, int fUseAll, int nGatesMin, int fLoadAware )
+ {
+     SC_Lib * p = (SC_Lib *)pScl;
+     Vec_Str_t * vStr, * vStr2;
+     float Slew = (SlewInit == 0) ? Abc_SclComputeAverageSlew(p) : SlewInit;
+     int RetValue, nGateCount = SC_LibCellNum(p);
+-    if ( Gain == 0 )
++    extern void Mio_SetLoadAwareMode( int f );
++    Mio_SetLoadAwareMode( fLoadAware );
++    if ( fLoadAware )
++        vStr = Abc_SclProduceGenlibStrLoad( p, Slew, &nGateCount );
++    else if ( Gain == 0 )
+         vStr = Abc_SclProduceGenlibStrSimple(p);
+     else
+         vStr = Abc_SclProduceGenlibStr( p, Slew, Gain, nGatesMin, fUseAll, &nGateCount );
++    if ( getenv("SCL_GENLIB_DUMP") ) // debugging aid: write the derived GENLIB text
++    {
++        FILE * pFile = fopen( getenv("SCL_GENLIB_DUMP"), "wb" );
++        if ( pFile ) { fputs( Vec_StrArray(vStr), pFile ); fclose( pFile ); }
++    }
+     vStr2 = Vec_StrDup( vStr );
+     RetValue = Mio_UpdateGenlib2( vStr, vStr2, p->pName, 0 );
+     Vec_StrFree( vStr );
+     Vec_StrFree( vStr2 );
+     if ( !RetValue )
+         printf( "Reading library has filed.\n" );
++    else if ( fLoadAware )
++        printf( "Derived load-aware GENLIB library \"%s\" with %d gates (per-pin PD/LD/cap at slew %.2f ps).\n", p->pName, nGateCount, Slew );
+     else if ( Gain != 0 )
+         printf( "Derived GENLIB library \"%s\" with %d gates using slew %.2f ps and gain %.2f.\n", p->pName, nGateCount, Slew, Gain );
+ //    else
+-- 
+2.52.0
+

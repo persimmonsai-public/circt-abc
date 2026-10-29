@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Sat, 29 Aug 2026 21:58:00 -0700
+Subject: [PATCH 19/37] HWAggregateToComb: leave ops inside LLHD regions alone
+
+The conversion's materializations land at module scope, and an llhd.wait's
+operands must be defined inside its region -- rewriting aggregate ops inside
+an unlowered llhd.process produces 'llhd.wait op using value defined outside
+the region'. Ops with an llhd-dialect ancestor are now dynamically legal,
+checked by dialect namespace to avoid a dependency on LLHD.
+
+Found when the pass started running mid-pipeline on OpenC910, whose one
+remaining unlowered process (ct_ebiu_write_channel) is deliberately left
+for skip-unmappable.
+---
+ .../HW/Transforms/HWAggregateToComb.cpp       | 29 +++++++++++++++----
+ 1 file changed, 23 insertions(+), 6 deletions(-)
+
+diff --git a/lib/Dialect/HW/Transforms/HWAggregateToComb.cpp b/lib/Dialect/HW/Transforms/HWAggregateToComb.cpp
+index c7c31f375..7c075288d 100644
+--- a/lib/Dialect/HW/Transforms/HWAggregateToComb.cpp
++++ b/lib/Dialect/HW/Transforms/HWAggregateToComb.cpp
+@@ -373,15 +373,32 @@ struct HWAggregateToCombPass
+ };
+ } // namespace
+ 
++/// Ops inside an LLHD region (an unlowered `llhd.process` or
++/// `llhd.combinational`) are off limits: the conversion's materializations
++/// land at module scope, and an `llhd.wait`'s operands must be defined
++/// inside its region -- rewriting through the boundary produces
++/// "'llhd.wait' op using value defined outside the region". Checked by
++/// dialect namespace to avoid a dependency on LLHD.
++static bool isInsideLLHDRegion(Operation *op) {
++  for (auto *parent = op->getParentOp(); parent;
++       parent = parent->getParentOp())
++    if (parent->getName().getDialectNamespace() == "llhd")
++      return true;
++  return false;
++}
++
+ void HWAggregateToCombPass::runOnOperation() {
+   ConversionTarget target(getContext());
+ 
+-  target.addIllegalOp<hw::ArrayGetOp, hw::ArrayCreateOp, hw::ArrayConcatOp,
+-                      hw::AggregateConstantOp, hw::ArrayInjectOp,
+-                      hw::ArraySliceOp, hw::StructCreateOp,
+-                      hw::StructExtractOp, hw::StructInjectOp>();
+-  target.addDynamicallyLegalOp<comb::MuxOp>(
+-      [](comb::MuxOp op) { return hw::type_isa<IntegerType>(op.getType()); });
++  target.addDynamicallyLegalOp<hw::ArrayGetOp, hw::ArrayCreateOp,
++                               hw::ArrayConcatOp, hw::AggregateConstantOp,
++                               hw::ArrayInjectOp, hw::ArraySliceOp,
++                               hw::StructCreateOp, hw::StructExtractOp,
++                               hw::StructInjectOp>(
++      [](Operation *op) { return isInsideLLHDRegion(op); });
++  target.addDynamicallyLegalOp<comb::MuxOp>([](comb::MuxOp op) {
++    return hw::type_isa<IntegerType>(op.getType()) || isInsideLLHDRegion(op);
++  });
+   target.addLegalDialect<hw::HWDialect, comb::CombDialect>();
+ 
+   RewritePatternSet patterns(&getContext());
+-- 
+2.52.0
+

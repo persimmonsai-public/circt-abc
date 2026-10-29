@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Thu, 3 Sep 2026 00:20:27 -0700
+Subject: [PATCH 13/14] repeater: pick the smallest adequate buffer (1.05x
+ segment cap, was 1.5x)
+
+Repeaters should be as small as the wire segment allows; the 1.5x margin
+oversized them. OpenROAD's post-hoc resizer already defaults to large
+buffers (the measured ibex P&R-growth cause), so the synthesis-side
+pre-buffering should lean small.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+EOF
+---
+ src/map/scl/sclDrc.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/map/scl/sclDrc.c b/src/map/scl/sclDrc.c
+index c231d7561..c621302ae 100644
+--- a/src/map/scl/sclDrc.c
++++ b/src/map/scl/sclDrc.c
+@@ -223,7 +223,11 @@ int Abc_SclInsertRepeaters( SC_Lib * pLib, Abc_Ntk_t * pNtk, float LcritUm,
+         SC_RingForEachCell( pBufClass->pRepr, pTemp, t )
+         {
+             SC_Pin * pPo = SC_CellPin( pTemp, pTemp->n_inputs );
+-            if ( pPo->max_out_cap >= 1.5 * SegCap )
++            // smallest buffer whose drive covers one Lcrit segment (a small
++            // margin, not 1.5x): repeaters should be as small as the wire
++            // allows -- OpenROAD's post-hoc resizer otherwise defaults to
++            // large buffers, the measured P&R-growth cause on ibex.
++            if ( pPo->max_out_cap >= 1.05 * SegCap )
+             {
+                 pBufCell = pTemp;
+                 break;
+-- 
+2.52.0
+

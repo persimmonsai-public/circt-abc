@@ -1,0 +1,135 @@
+/* Hermetic liberty for the prefix-final-adder tests: the two adder cells of
+   adders.lib plus the generic gates a prefix network is built from. Inverting
+   compound cells are cheaper than their non-inverting forms, as in real CMOS,
+   so the emitter's polarity tracking is exercised. No PDK data. */
+library(prefix_cells) {
+  cell(TFA) {
+    area : 0.16 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(CI) { direction : input ; }
+    pin(CO) {
+      direction : output ;
+      function : "(((A^B)&CI)|(A&B))" ;
+    }
+    pin(S) {
+      direction : output ;
+      function : "(A^B^CI)" ;
+    }
+  }
+  cell(THA) {
+    area : 0.08 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(CO) {
+      direction : output ;
+      function : "(A&B)" ;
+    }
+    pin(S) {
+      direction : output ;
+      function : "(A^B)" ;
+    }
+  }
+  cell(TINV) {
+    area : 0.02 ;
+    pin(A) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!A)" ;
+    }
+  }
+  cell(TNAND2) {
+    area : 0.03 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!(A&B))" ;
+    }
+  }
+  cell(TNOR2) {
+    area : 0.03 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!(A|B))" ;
+    }
+  }
+  cell(TAND2) {
+    area : 0.04 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(A&B)" ;
+    }
+  }
+  cell(TOR2) {
+    area : 0.04 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(A|B)" ;
+    }
+  }
+  cell(TXOR2) {
+    area : 0.05 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(A^B)" ;
+    }
+  }
+  cell(TXNOR2) {
+    area : 0.05 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!(A^B))" ;
+    }
+  }
+  cell(TAOI21) {
+    area : 0.035 ;
+    pin(A1) { direction : input ; }
+    pin(A2) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!((A1&A2)|B))" ;
+    }
+  }
+  cell(TOAI21) {
+    area : 0.035 ;
+    pin(A1) { direction : input ; }
+    pin(A2) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!((A1|A2)&B))" ;
+    }
+  }
+  cell(TAO21) {
+    area : 0.045 ;
+    pin(A1) { direction : input ; }
+    pin(A2) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "((A1&A2)|B)" ;
+    }
+  }
+  cell(TOA21) {
+    area : 0.045 ;
+    pin(A1) { direction : input ; }
+    pin(A2) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "((A1|A2)&B)" ;
+    }
+  }
+}

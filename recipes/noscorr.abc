@@ -1,0 +1,12 @@
+# ABC-ACCEL A2 tiered recipe: the shipped default minus `scorr`.
+# scorr is the recipe's only unbounded stage; on register-heavy residuals
+# (fpnew divsqrt/FMA groups here, flop-memories in the step-4 experiment)
+# it runs for hours without converging. Everything else is identical to
+# ABCBridge.cpp's built-in body, classical resub included.
+strash; dc2
+&get -n; &deepsyn -J 100 -I 4 -S 200 -T 10; &put
+strash; &get -n; &dch -f; &if -C 32 -K 6; &put
+strash; &get -n; &resub -N 2; &put
+resub -K 16 -N 3
+strash; &get -n; &dch -f; &nf -C 32 -D {period}; &put
+strash; &get -n; &nf -D {period}; &put

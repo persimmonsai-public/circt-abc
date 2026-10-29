@@ -1,0 +1,10 @@
+circt-abc
+Copyright 2026 The circt-abc authors
+
+Licensed under the Apache License v2.0 with LLVM Exceptions (see LICENSE).
+
+The container image built from the Dockerfile adds, unmodified unless noted:
+  OpenROAD-flow-scripts, OpenROAD and the asap7 platform (BSD-3-Clause), from
+  the openroad/orfs image; CIRCT and LLVM (Apache-2.0 WITH LLVM-exception),
+  with patches/circt; ABC (Berkeley, see patches/README), with patches/abc;
+  mockturtle (MIT), with patches/mockturtle-emap.patch; sv2v (BSD-3-Clause).

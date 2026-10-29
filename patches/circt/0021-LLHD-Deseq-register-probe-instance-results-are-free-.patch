@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Sat, 29 Aug 2026 23:41:26 -0700
+Subject: [PATCH 21/37] LLHD Deseq: register/probe/instance results are free
+ inputs, not poison
+
+computeBoolean's fallback poisons any unsupported op with a
+trigger-structured i1 operand -- and chased THROUGH state elements into
+their input cones to decide it. A register result at process-evaluation
+time does not combinationally depend on the current trigger event, no
+matter what its next/reset wiring mentions: it is some register's current
+state, i.e. a free input, exactly like a module port. Return unknown for
+seq.firreg, seq.compreg, llhd.prb and hw.instance results instead of
+recursing into them.
+
+The found case is OpenC910's ct_ebiu_write_channel, the last unlowered
+module in any of the three test designs: an earlier process in the module
+had already lowered to a toggle register
+    %aw_vb_sel = seq.firreg (xor %en, %aw_vb_sel) ... reset (xor %rst, 1)
+and a later process's drive enable reads it; the reset wiring mentions the
+analyzed process's own reset trigger, so the whole module was refused as
+'poison condition'.
+
+Also names the poisoning op under LLVM_DEBUG -- the abort was previously
+undebuggable ('Condition: x' says nothing about WHERE the analysis gave up),
+and finding this took exactly one run once the print existed.
+
+OpenC910: residual llhd 11 -> 0, modules holding llhd 1 -> 0 of 504,
+registers 4,787 -> 4,789 (the two recovered processes' state). CVA6
+unchanged (301 registers, 0 llhd). Reproducer (a process whose enable reads
+another process's toggle register) lowers to 0 llhd and is SAT-proven
+equivalent to its RTL at d8.
+---
+ lib/Dialect/LLHD/Transforms/Deseq.cpp | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/lib/Dialect/LLHD/Transforms/Deseq.cpp b/lib/Dialect/LLHD/Transforms/Deseq.cpp
+index d85d1d0ec..c922417cd 100644
+--- a/lib/Dialect/LLHD/Transforms/Deseq.cpp
++++ b/lib/Dialect/LLHD/Transforms/Deseq.cpp
+@@ -765,6 +765,20 @@ TruthTable Deseq::computeBoolean(OpResult value) {
+     return result;
+   }
+ 
++  // Results of state elements and other opaque defs -- registers, signal
++  // probes, instance outputs -- are FREE INPUTS to this analysis: their value
++  // at process-evaluation time does not combinationally depend on the current
++  // trigger event, even when their own input cone mentions the trigger
++  // signals. The generic fallback below would chase THROUGH them into that
++  // cone and report poison. OpenC910's ct_ebiu_write_channel is the found
++  // case: an earlier process in the same module has already been lowered to
++  //   %aw_vb_sel = seq.firreg (xor %en, %aw_vb_sel) ... reset (xor %rst, 1)
++  // and a later process's drive enable reads %aw_vb_sel -- the reset wiring
++  // mentions the analyzed process's own reset trigger, so the whole module
++  // was refused over a value that is simply "some register's current state".
++  if (isa<seq::FirRegOp, seq::CompRegOp, llhd::ProbeOp, hw::InstanceOp>(op))
++    return getUnknownBoolean();
++
+   // Otherwise check if the operation depends on any of the triggers. If it
+   // does, create a poison value since we don't really know how the trigger
+   // affects this boolean. If it doesn't, create an unknown value.
+@@ -776,8 +790,11 @@ TruthTable Deseq::computeBoolean(OpResult value) {
+         auto result = computeBoolean(operand);
+         return result.isPoison() || (result != getUnknownBoolean() &&
+                                      !result.isTrue() && !result.isFalse());
+-      }))
++      })) {
++    LLVM_DEBUG(llvm::dbgs()
++               << "  - Poison boolean at unsupported op: " << *op << "\n");
+     return getPoisonBoolean();
++  }
+   return getUnknownBoolean();
+ }
+ 
+-- 
+2.52.0
+

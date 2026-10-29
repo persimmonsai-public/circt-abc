@@ -1,0 +1,414 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Tue, 1 Sep 2026 21:19:21 -0700
+Subject: [PATCH 04/14] =?UTF-8?q?scl:=20drc=5Fsize=20command=20=E2=80=94?=
+ =?UTF-8?q?=20enforce=20max=5Fout=5Fcap=20and=20a=20slew=20limit=20by=20up?=
+ =?UTF-8?q?sizing?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Neither upsize/dnsize nor buffer ever ENFORCE the library's electrical
+rules: a D1 gate can silently drive 20x its max_out_cap (the only trace
+is stime's printout), and on unrepaired netlists the resulting slews
+leave the NLDM characterization range, where both OpenSTA and
+Scl_LibLookup linearly extrapolate -- measured as a large delay inflation
+against first-principles arithmetic. drc_size sweeps
+the mapped network (placement-aware loads when read_place is active)
+and upsizes each violator to the smallest same-function variant whose
+max_out_cap covers its real load; -S adds a slew limit as further
+upsizing pressure.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ src/map/scl/module.make  |   1 +
+ src/map/scl/scl.c        |  58 ++++++++++++++++++
+ src/map/scl/sclBufSize.c |  23 +++++++-
+ src/map/scl/sclDrc.c     | 124 +++++++++++++++++++++++++++++++++++++++
+ src/map/scl/sclPlace.c   |  71 ++++++++++++++++++++++
+ src/map/scl/sclSize.h    |   4 ++
+ 6 files changed, 279 insertions(+), 2 deletions(-)
+ create mode 100644 src/map/scl/sclDrc.c
+
+diff --git a/src/map/scl/module.make b/src/map/scl/module.make
+index 4762c5898..f01913c58 100644
+--- a/src/map/scl/module.make
++++ b/src/map/scl/module.make
+@@ -2,6 +2,7 @@ SRC +=  src/map/scl/scl.c \
+     src/map/scl/sclBuffer.c \
+     src/map/scl/sclBufSize.c \
+     src/map/scl/sclDnsize.c \
++    src/map/scl/sclDrc.c \
+     src/map/scl/sclLiberty.c \
+     src/map/scl/sclLibScl.c \
+     src/map/scl/sclLibUtil.c \
+diff --git a/src/map/scl/scl.c b/src/map/scl/scl.c
+index b108933fb..1fa82a4b5 100644
+--- a/src/map/scl/scl.c
++++ b/src/map/scl/scl.c
+@@ -57,6 +57,7 @@ static int Scl_CommandWriteConstr( Abc_Frame_t * pAbc, int argc, char ** argv );
+ static int Scl_CommandPrintConstr( Abc_Frame_t * pAbc, int argc, char ** argv );
+ static int Scl_CommandResetConstr( Abc_Frame_t * pAbc, int argc, char ** argv );
+ static int Scl_CommandReadPlace  ( Abc_Frame_t * pAbc, int argc, char ** argv );
++static int Scl_CommandDrcSize    ( Abc_Frame_t * pAbc, int argc, char ** argv );
+ static int Scl_CommandPrintPlace ( Abc_Frame_t * pAbc, int argc, char ** argv );
+ static int Scl_CommandResetPlace ( Abc_Frame_t * pAbc, int argc, char ** argv );
+ 
+@@ -129,6 +130,7 @@ void Scl_Init( Abc_Frame_t * pAbc )
+     Cmd_CommandAdd( pAbc, "SCL mapping",  "print_constr",  Scl_CommandPrintConstr, 0 ); 
+     Cmd_CommandAdd( pAbc, "SCL mapping",  "reset_constr",  Scl_CommandResetConstr, 0 );
+     Cmd_CommandAdd( pAbc, "SCL mapping",  "read_place",    Scl_CommandReadPlace,   0 );
++    Cmd_CommandAdd( pAbc, "SCL mapping",  "drc_size",      Scl_CommandDrcSize,     1 );
+     Cmd_CommandAdd( pAbc, "SCL mapping",  "print_place",   Scl_CommandPrintPlace,  0 );
+     Cmd_CommandAdd( pAbc, "SCL mapping",  "reset_place",   Scl_CommandResetPlace,  0 ); 
+ }
+@@ -2250,6 +2252,62 @@ usage:
+   SeeAlso     []
+ 
+ ***********************************************************************/
++int Scl_CommandDrcSize( Abc_Frame_t * pAbc, int argc, char ** argv )
++{
++    Abc_Ntk_t * pNtk = Abc_FrameReadNtk(pAbc);
++    float SlewLimit = 0;
++    int c, nIters = 5, fUseWireLoads = 1, fVerbose = 0;
++    Extra_UtilGetoptReset();
++    while ( ( c = Extra_UtilGetopt( argc, argv, "SIcvh" ) ) != EOF )
++    {
++        switch ( c )
++        {
++        case 'S':
++            if ( globalUtilOptind >= argc ) goto usage;
++            SlewLimit = atof(argv[globalUtilOptind]);
++            globalUtilOptind++;
++            break;
++        case 'I':
++            if ( globalUtilOptind >= argc ) goto usage;
++            nIters = atoi(argv[globalUtilOptind]);
++            globalUtilOptind++;
++            break;
++        case 'c':
++            fUseWireLoads ^= 1;
++            break;
++        case 'v':
++            fVerbose ^= 1;
++            break;
++        case 'h':
++        default:
++            goto usage;
++        }
++    }
++    if ( pNtk == NULL || !Abc_NtkHasMapping(pNtk) )
++    {
++        fprintf( pAbc->Err, "There is no current mapped network.\n" );
++        return 1;
++    }
++    if ( pAbc->pLibScl == NULL )
++    {
++        fprintf( pAbc->Err, "There is no Liberty library available.\n" );
++        return 1;
++    }
++    Abc_SclDrcSizePerform( (SC_Lib *)pAbc->pLibScl, pNtk, SlewLimit,
++                           fUseWireLoads, nIters, fVerbose );
++    return 0;
++
++usage:
++    fprintf( pAbc->Err, "usage: drc_size [-S float] [-I num] [-cvh]\n" );
++    fprintf( pAbc->Err, "\t         upsizes gates violating max_out_cap (and a slew limit)\n" );
++    fprintf( pAbc->Err, "\t-S num : slew limit in library time units (0 = cap only) [default = 0]\n" );
++    fprintf( pAbc->Err, "\t-I num : maximum iterations [default = 5]\n" );
++    fprintf( pAbc->Err, "\t-c     : toggle wire loads / placement-aware loads [default = on]\n" );
++    fprintf( pAbc->Err, "\t-v     : verbose\n" );
++    fprintf( pAbc->Err, "\t-h     : help\n" );
++    return 1;
++}
++
+ int Scl_CommandReadPlace( Abc_Frame_t * pAbc, int argc, char ** argv )
+ {
+     Abc_Ntk_t * pNtk = Abc_FrameReadNtk(pAbc);
+diff --git a/src/map/scl/sclBufSize.c b/src/map/scl/sclBufSize.c
+index 9f4e07885..b06935472 100644
+--- a/src/map/scl/sclBufSize.c
++++ b/src/map/scl/sclBufSize.c
+@@ -211,10 +211,23 @@ void Abc_NtkComputeFanoutInfo( Abc_Obj_t * pObj, float Slew )
+ float Abc_NtkComputeNodeLoad( Bus_Man_t * p, Abc_Obj_t * pObj )
+ {
+     Abc_Obj_t * pFanout;
+-    float Load;
++    float Load, WireCap = -1;
+     int i;
+     assert( Bus_SclObjLoad(pObj) == 0 );
+-    Load = Abc_SclFindWireLoad( p->vWireCaps, Abc_ObjFanoutNum(pObj) );
++    // placement-aware wire cap when the driver (and some sinks) have
++    // coordinates -- the average-by-fanout table underestimates broadcast
++    // nets by orders of magnitude and made blind buffering a measured
++    // post-place LOSS on cv64a6
++    {
++        Vec_Ptr_t * vTemp = Vec_PtrAlloc( Abc_ObjFanoutNum(pObj) );
++        Abc_ObjForEachFanout( pObj, pFanout, i )
++            Vec_PtrPush( vTemp, pFanout );
++        WireCap = Scl_PlaceFanoutsWireCap( p->pNtk, pObj, vTemp );
++        Vec_PtrFree( vTemp );
++    }
++    if ( WireCap < 0 )
++        WireCap = Abc_SclFindWireLoad( p->vWireCaps, Abc_ObjFanoutNum(pObj) );
++    Load = WireCap;
+     Abc_ObjForEachFanout( pObj, pFanout, i )
+         Load += Bus_SclObjCin( pFanout );
+     Bus_SclObjSetLoad( pObj, Load );
+@@ -225,6 +238,8 @@ float Abc_NtkComputeFanoutLoad( Bus_Man_t * p, Vec_Ptr_t * vFanouts )
+     Abc_Obj_t * pFanout;
+     float Load;
+     int i;
++    // no driver in scope here; the table stands in for the (sub)net span.
++    // callers that know the driver adjust via Abc_NtkComputeNodeLoad
+     Load = Abc_SclFindWireLoad( p->vWireCaps, Vec_PtrSize(vFanouts) );
+     Vec_PtrForEachEntry( Abc_Obj_t *, vFanouts, pFanout, i )
+         Load += Bus_SclObjCin( pFanout );
+@@ -379,6 +394,10 @@ Abc_Obj_t * Abc_SclAddOneInv( Bus_Man_t * p, Abc_Obj_t * pObj, Vec_Ptr_t * vFano
+         else
+             Abc_ObjPatchFanin( pFanout, pObj, pInv );
+     }
++    // place the new buffer at the centroid of its located fanouts BEFORE
++    // computing its load, so the load (and every further tree level) sees
++    // a realistic span instead of the average table
++    Scl_PlaceSetCentroidFromFanouts( p->pNtk, pInv );
+     // set the gate
+     pCellNew = Abc_SclFindSmallestGate( p->pInv, Load / Gain );
+     Vec_IntSetEntry( p->pNtk->vGates, Abc_ObjId(pInv), pCellNew->Id );
+diff --git a/src/map/scl/sclDrc.c b/src/map/scl/sclDrc.c
+new file mode 100644
+index 000000000..160f0570b
+--- /dev/null
++++ b/src/map/scl/sclDrc.c
+@@ -0,0 +1,124 @@
++/**CFile****************************************************************
++
++  FileName    [sclDrc.c]
++
++  SystemName  [ABC: Logic synthesis and verification system.]
++
++  PackageName [Standard-cell library representation.]
++
++  Synopsis    [DRC-driven sizing: enforce max_out_cap / max slew.]
++
++  Author      [circt-abc project]
++
++  Affiliation [-]
++
++  Date        [Started 2026-09-02.]
++
++  Revision    []
++
++***********************************************************************/
++
++#include "sclSize.h"
++
++ABC_NAMESPACE_IMPL_START
++
++////////////////////////////////////////////////////////////////////////
++///                        DECLARATIONS                              ///
++////////////////////////////////////////////////////////////////////////
++
++// Neither upsize/dnsize nor buffer ever ENFORCE the library's electrical
++// design rules: a D1 gate can be left driving 20x its max_out_cap and the
++// only trace is a printout. On unrepaired netlists that also destroys the
++// honesty of every timing number downstream: slews leave the NLDM
++// characterization range and both OpenSTA and Scl_LibLookup linearly
++// extrapolate, compounding stage over stage (measured 8-10x delay
++// inflation on a 4nm library). This pass upsizes each gate to the
++// smallest same-function variant whose output max_out_cap covers its
++// actual load (placement-aware when read_place is in effect), and
++// optionally treats a slew limit as a further upsizing pressure.
++
++////////////////////////////////////////////////////////////////////////
++///                     FUNCTION DEFINITIONS                         ///
++////////////////////////////////////////////////////////////////////////
++
++/**Function*************************************************************
++
++  Synopsis    [Enforces max_out_cap (and a slew limit) by upsizing.]
++
++  Description [SlewLimit in library time units (ps in SCL-internal terms);
++  <= 0 disables the slew criterion. Returns the number of gates changed.]
++
++***********************************************************************/
++int Abc_SclDrcSizePerform( SC_Lib * pLib, Abc_Ntk_t * pNtk, float SlewLimit,
++                           int fUseWireLoads, int nIters, int fVerbose )
++{
++    SC_Man * p;
++    Abc_Obj_t * pObj;
++    SC_Cell * pCell, * pBest, * pTemp;
++    SC_Pin * pPinOut;
++    float Load, Slew;
++    int i, k, iter, nChanged, nTotal = 0, nCapViol, nSlewViol;
++    p = Abc_SclManStart( pLib, pNtk, fUseWireLoads, 1, 0, 0 );
++    for ( iter = 0; iter < nIters; iter++ )
++    {
++        nChanged = 0;
++        nCapViol = nSlewViol = 0;
++        Abc_NtkForEachNode1( pNtk, pObj, i )
++        {
++            pCell = Abc_SclObjCell( pObj );
++            if ( pCell == NULL || pCell->n_outputs != 1 )
++                continue;
++            Load = Abc_SclObjLoadMax( p, pObj );
++            Slew = Abc_SclObjSlewMax( p, pObj );
++            pPinOut = SC_CellPin( pCell, pCell->n_inputs );
++            if ( Load <= pPinOut->max_out_cap &&
++                 (SlewLimit <= 0 || Slew <= SlewLimit) )
++                continue;
++            if ( Load > pPinOut->max_out_cap )
++                nCapViol++;
++            else
++                nSlewViol++;
++            // smallest same-function cell whose output pin covers the load;
++            // when only the slew is violated, demand one step more drive
++            // than the current cell provides
++            pBest = NULL;
++            SC_RingForEachCell( pCell->pRepr, pTemp, k )
++            {
++                SC_Pin * pPo = SC_CellPin( pTemp, pTemp->n_inputs );
++                if ( pPo->max_out_cap < Load )
++                    continue;
++                if ( Load <= pPinOut->max_out_cap && pTemp->area <= pCell->area )
++                    continue; // slew-only violation: require a bigger cell
++                pBest = pTemp;
++                break;
++            }
++            if ( pBest == NULL )
++                pBest = pCell->pRepr->pPrev; // largest available
++            if ( pBest == pCell )
++                continue;
++            Abc_SclObjSetCell( pObj, pBest );
++            Abc_SclUpdateLoad( p, pObj, pCell, pBest );
++            nChanged++;
++        }
++        nTotal += nChanged;
++        if ( fVerbose )
++            printf( "drc_size iter %d: %d cap / %d slew violations, "
++                    "%d gates upsized.\n",
++                    iter, nCapViol, nSlewViol, nChanged );
++        if ( nChanged == 0 )
++            break;
++        Abc_SclTimeNtkRecompute( p, NULL, NULL, 0, 0 );
++    }
++    printf( "drc_size: %d gate(s) upsized for electrical DRC "
++            "(max_out_cap%s).\n", nTotal,
++            SlewLimit > 0 ? " + slew limit" : "" );
++    Abc_SclSclGates2MioGates( pLib, pNtk ); // updates gate pointers
++    Abc_SclManFree( p );
++    return nTotal;
++}
++
++////////////////////////////////////////////////////////////////////////
++///                       END OF FILE                                ///
++////////////////////////////////////////////////////////////////////////
++
++ABC_NAMESPACE_IMPL_END
+diff --git a/src/map/scl/sclPlace.c b/src/map/scl/sclPlace.c
+index 254a76fb7..2fd3c78cd 100644
+--- a/src/map/scl/sclPlace.c
++++ b/src/map/scl/sclPlace.c
+@@ -288,6 +288,77 @@ int Scl_PlaceReadFile( Abc_Ntk_t * pNtk, char * pFileName, int fVerbose )
+     return 1;
+ }
+ 
++/**Function*************************************************************
++
++  Synopsis    [HPWL wire cap over a driver and an explicit fanout set.]
++
++  Description [For the buffering engine: unlike Scl_PlaceNetWireCap this
++  SKIPS fanouts without coordinates (freshly created buffers) instead of
++  refusing the whole net -- the tree under construction still sees the
++  span of the located sinks. Returns -1 when placement is not loaded,
++  the driver is unlocated, or no fanout is located (caller falls back
++  to the wire-load table).]
++
++***********************************************************************/
++float Scl_PlaceFanoutsWireCap( Abc_Ntk_t * pNtk, Abc_Obj_t * pDriver,
++                               Vec_Ptr_t * vFanouts )
++{
++    Abc_Obj_t * pFanout;
++    float x, y, xMin, xMax, yMin, yMax;
++    int i, nLocated = 0;
++    if ( !Scl_PlaceIsRunning(pNtk) )
++        return -1;
++    if ( !Scl_PlaceObjCoord( pNtk, Abc_ObjId(pDriver), &x, &y ) )
++        return -1;
++    xMin = xMax = x;
++    yMin = yMax = y;
++    Vec_PtrForEachEntry( Abc_Obj_t *, vFanouts, pFanout, i )
++    {
++        if ( pFanout == NULL )
++            continue;
++        if ( !Scl_PlaceObjCoord( pNtk, Abc_ObjId(pFanout), &x, &y ) )
++            continue;
++        nLocated++;
++        xMin = Abc_MinFloat( xMin, x );
++        xMax = Abc_MaxFloat( xMax, x );
++        yMin = Abc_MinFloat( yMin, y );
++        yMax = Abc_MaxFloat( yMax, y );
++    }
++    if ( nLocated == 0 )
++        return -1;
++    return s_pSclPlace->CapPerUm * ( (xMax - xMin) + (yMax - yMin) );
++}
++
++/**Function*************************************************************
++
++  Synopsis    [Places an object at the centroid of its located fanouts.]
++
++  Description [For freshly created buffers: gives them a coordinate so
++  later load computations (and further tree levels) see realistic
++  spans. Returns 0 if no fanout had a coordinate.]
++
++***********************************************************************/
++int Scl_PlaceSetCentroidFromFanouts( Abc_Ntk_t * pNtk, Abc_Obj_t * pObj )
++{
++    Abc_Obj_t * pFanout;
++    float x, y, sx = 0, sy = 0;
++    int i, n = 0;
++    if ( !Scl_PlaceIsRunning(pNtk) )
++        return 0;
++    Abc_ObjForEachFanout( pObj, pFanout, i )
++    {
++        if ( !Scl_PlaceObjCoord( pNtk, Abc_ObjId(pFanout), &x, &y ) )
++            continue;
++        sx += x;
++        sy += y;
++        n++;
++    }
++    if ( n == 0 )
++        return 0;
++    Scl_PlaceSetObjCoord( pNtk, Abc_ObjId(pObj), sx / n, sy / n );
++    return 1;
++}
++
+ /**Function*************************************************************
+ 
+   Synopsis    [Transfers the placement across a network duplication.]
+diff --git a/src/map/scl/sclSize.h b/src/map/scl/sclSize.h
+index ee040916f..69244659f 100644
+--- a/src/map/scl/sclSize.h
++++ b/src/map/scl/sclSize.h
+@@ -623,6 +623,8 @@ extern void          Abc_SclAddWireLoad( SC_Man * p, Abc_Obj_t * pObj, int fSubt
+ extern void          Abc_SclComputeLoad( SC_Man * p );
+ extern void          Abc_SclUpdateLoad( SC_Man * p, Abc_Obj_t * pObj, SC_Cell * pOld, SC_Cell * pNew );
+ extern void          Abc_SclUpdateLoadSplit( SC_Man * p, Abc_Obj_t * pBuffer, Abc_Obj_t * pFanout );
++/*=== sclDrc.c =================================================================*/
++extern int           Abc_SclDrcSizePerform( SC_Lib * pLib, Abc_Ntk_t * pNtk, float SlewLimit, int fUseWireLoads, int nIters, int fVerbose );
+ /*=== sclPlace.c ===============================================================*/
+ extern int           Scl_PlaceReadFile( Abc_Ntk_t * pNtk, char * pFileName, int fVerbose );
+ extern void          Scl_PlaceStop();
+@@ -631,6 +633,8 @@ extern int           Scl_PlaceObjCoord( Abc_Ntk_t * pNtk, int Id, float * pX, fl
+ extern void          Scl_PlaceSetObjCoord( Abc_Ntk_t * pNtk, int Id, float X, float Y );
+ extern int           Scl_PlaceNetWireCap( Abc_Ntk_t * pNtk, Abc_Obj_t * pObj, float * pCap );
+ extern void          Scl_PlaceTransfer( Abc_Ntk_t * pNtkOld, Abc_Ntk_t * pNtkNew );
++extern float         Scl_PlaceFanoutsWireCap( Abc_Ntk_t * pNtk, Abc_Obj_t * pDriver, Vec_Ptr_t * vFanouts );
++extern int           Scl_PlaceSetCentroidFromFanouts( Abc_Ntk_t * pNtk, Abc_Obj_t * pObj );
+ extern float         Scl_PlaceCapPerUm();
+ extern float         Scl_PlaceResPerUm();
+ extern void          Scl_PlacePrint( Abc_Ntk_t * pNtk );
+-- 
+2.52.0
+

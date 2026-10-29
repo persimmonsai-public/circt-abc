@@ -1,0 +1,24 @@
+/* Minimal hermetic liberty for remove-identity-buffers tests: one real
+   identity (buffer) cell and one arity-1 NON-identity (inverter) cell. */
+library(test_cells) {
+  cell(TESTBUF) {
+    area : 0.01 ;
+    pin(A) {
+      direction : input ;
+    }
+    pin(Y) {
+      direction : output ;
+      function : "A" ;
+    }
+  }
+  cell(TESTINV) {
+    area : 0.01 ;
+    pin(A) {
+      direction : input ;
+    }
+    pin(Y) {
+      direction : output ;
+      function : "(!A)" ;
+    }
+  }
+}

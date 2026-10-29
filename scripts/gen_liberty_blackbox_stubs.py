@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""gen_liberty_blackbox_stubs.py -- generate empty-body SV module declarations
+for every cell in a liberty file, for feeding to circt-verilog as blackbox
+stubs (needed so real standard-cell instances -- both ones pre-existing in
+RTL like the clock-gating cell, and ones ABC's mapper produces -- can be
+elaborated/re-imported without a hand-transcribed, error-prone port list per
+cell).
+
+Why not CIRCT's own ImportLiberty or Yosys's read_liberty? Production
+liberties routinely carry constructs one or the other grammar rejects
+(unit-suffixed numbers such as `time_unit : 1ns ;`, `input_voltage :
+default ;`), and only cell and pin names and directions are needed here.
+This script does that one narrow thing via a brace-depth-tracking parser
+that never touches `function`/timing-table syntax at all. It is NOT
+sufficient for anything that needs cell functions; use a real liberty
+parser for that.
+
+Usage:
+    python3 gen_liberty_blackbox_stubs.py <liberty.lib> [<liberty.lib> ...] -o stubs.sv
+"""
+import argparse
+import re
+import sys
+from pathlib import Path
+
+_CELL_RE = re.compile(r'^\s*cell\s*\(\s*"?([A-Za-z0-9_]+)"?\s*\)\s*\{')
+_PIN_RE = re.compile(r'^\s*pin\s*\(\s*"?([A-Za-z0-9_\[\]]+)"?\s*\)\s*\{')
+_BUS_PIN_RE = re.compile(r'^\s*bus\s*\(\s*"?([A-Za-z0-9_]+)"?\s*\)\s*\{')
+_DIRECTION_RE = re.compile(r'^\s*direction\s*:\s*(input|output|inout)\s*;')
+# Sub-blocks that re-declare pin(...)/direction for an alternate view (DFT
+# scan-test mode) or aren't logical signal ports at all (power/ground) --
+# skip their contents entirely rather than treating nested pin(...) as
+# additional top-level ports. Scan flops typically have a
+# `test_cell() { pin(SI){...} pin(SE){...} ... }` sub-block duplicating
+# every functional pin.
+_OPAQUE_SUBBLOCK_RE = re.compile(r'^\s*(?:test_cell|pg_pin)\s*\(')
+
+
+def parse_cells(text: str):
+    """Brace-depth-tracking scan. Yields (cell_name, [(pin_name, direction), ...])."""
+    lines = text.splitlines()
+    i = 0
+    n = len(lines)
+    cells = []
+    while i < n:
+        m = _CELL_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        cell_name = m.group(1)
+        depth = lines[i].count("{") - lines[i].count("}")
+        i += 1
+        pins = []
+        pending_pin = None
+        pin_depth = None
+        opaque_depth = None  # set while inside a test_cell()/pg_pin() sub-block
+        while i < n and depth > 0:
+            line = lines[i]
+            if opaque_depth is not None:
+                depth += line.count("{") - line.count("}")
+                if depth <= opaque_depth:
+                    opaque_depth = None
+                i += 1
+                continue
+            if _OPAQUE_SUBBLOCK_RE.match(line):
+                opaque_depth = depth
+                depth += line.count("{") - line.count("}")
+                i += 1
+                continue
+            if pending_pin is None:
+                pm = _PIN_RE.match(line) or _BUS_PIN_RE.match(line)
+                if pm:
+                    pending_pin = pm.group(1)
+                    pin_depth = depth
+            else:
+                dm = _DIRECTION_RE.match(line)
+                if dm:
+                    pins.append((pending_pin, dm.group(1)))
+            depth += line.count("{") - line.count("}")
+            if pending_pin is not None and depth <= pin_depth:
+                pending_pin = None
+                pin_depth = None
+            i += 1
+        # De-dup while preserving first-seen order, in case any other
+        # sub-block shape not yet seen also redeclares a pin name.
+        deduped = []
+        seen_names = set()
+        for name, direction in pins:
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            deduped.append((name, direction))
+        cells.append((cell_name, deduped))
+    return cells
+
+
+def sv_stub(cell_name: str, pins) -> str:
+    if not pins:
+        return f"module {cell_name} ();\nendmodule\n"
+    ports = []
+    for name, direction in pins:
+        # Liberty bus/bit names like "A[0]" aren't valid bare SV port
+        # identifiers -- skip individual bit expansion (not needed for a
+        # port-count/name-shape blackbox; real designs at this stage
+        # instantiate ABC-mapped single-bit standard cells, not buses).
+        clean = name.replace("[", "_").replace("]", "")
+        ports.append(f"  {direction} {clean}")
+    return f"module {cell_name} (\n" + ",\n".join(ports) + "\n);\nendmodule\n"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("liberty_files", nargs="+", type=Path)
+    ap.add_argument("-o", "--output", required=True, type=Path)
+    args = ap.parse_args()
+
+    seen = {}
+    for lib_path in args.liberty_files:
+        text = lib_path.read_text(errors="replace")
+        for name, pins in parse_cells(text):
+            if name in seen:
+                continue
+            seen[name] = pins
+
+    with args.output.open("w") as f:
+        f.write(
+            "// AUTO-GENERATED by gen_liberty_blackbox_stubs.py -- do not hand-edit.\n"
+            "// Empty-body blackbox declarations for liberty standard cells, derived\n"
+            "// from liberty pin lists only (no function/timing information).\n"
+            f"// Source liberty files: {', '.join(str(p) for p in args.liberty_files)}\n\n"
+        )
+        for name, pins in sorted(seen.items()):
+            f.write(sv_stub(name, pins))
+            f.write("\n")
+
+    print(f"Wrote {len(seen)} cell stubs to {args.output}")
+
+
+if __name__ == "__main__":
+    main()

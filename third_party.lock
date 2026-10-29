@@ -1,0 +1,24 @@
+# Every external input the flow and the circt-abc image are built from.
+
+# CIRCT: llvm/circt at this commit, plus patches/circt/0*.patch (git am).
+CIRCT_REV=2b809f9a3a2783a7f9e91b4917c82d9a028550e9
+
+# ABC (yosys-abc, the mapper's ABC): YosysHQ/abc at this commit (the abc
+# vendored by Yosys v0.67), plus patches/abc/0*.patch.
+ABC_REV=e026ed5380f3bdc3beea2ff9ffc23236fc549d5b
+
+# mockturtle (emap-bridge): lsils/mockturtle at this commit, plus
+# patches/mockturtle-emap.patch.
+MOCKTURTLE_REV=0886ebfdd101ce1110daf3d60b96d72edd3143ea
+
+# ORFS base image: OpenROAD, ORFS and the asap7 platform, unmodified.
+ORFS_IMAGE=openroad/orfs:26Q3-277-gf9ec54a6d
+
+# Yosys (CEC and miter scripts): the one in the ORFS image,
+# The-OpenROAD-Project/yosys at this commit (v0.68-9).
+YOSYS_REV=a5af9d690a43744bf6b2cc3dea2717c16b54621c
+
+# sv2v (OpenSTA-compatible netlist): zachjs/sv2v release.
+SV2V_VERSION=v0.0.11
+
+# Benchmark RTL: pinned per design in designs/<name>/manifest.yaml.

@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Mon, 31 Aug 2026 20:50:35 -0700
+Subject: [PATCH 23/37] [LLHD] Deseq all-equal-table rule; UnrollLoops live-out
+ threading
+
+Deseq: a two-trigger value table whose entries ALL map to one identical
+known value v (reset entry included), each non-reset entry firing only
+on a clock edge, is a constant-v register -- load v on every edge, reset
+to v. Must run before the clockWhileReset dispatch: cv64a6's
+issue_read_operands spells it {clockEdge&resetActive->v, resetEdge->v,
+clockEdge&xEnable->v}, whose first entry steers the specific-pattern
+path into 'unknown reset scheme'.
+
+UnrollLoops: LCSSA-style live-out threading. A loop value used after
+the loop (the break idiom's 'if (i == N)') is handed out along every
+exit edge as a fresh exit-block argument, so each unrolled iteration's
+exit passes that iteration's value. Conservatively limited to values
+whose outside uses sit in one exit destination fed only by loop blocks.
+
+Gates: break-loop SV reproducer SAT SUCCESS; deseq rule fires on the
+real module (2 drives, 0 aborts); ibex core.mlir byte-identical;
+cv64a6 sequential +348 bits = the recovered process's yielded widths.
+---
+ lib/Dialect/LLHD/Transforms/Deseq.cpp       | 48 ++++++++++++++++
+ lib/Dialect/LLHD/Transforms/UnrollLoops.cpp | 63 +++++++++++++++++++++
+ 2 files changed, 111 insertions(+)
+
+diff --git a/lib/Dialect/LLHD/Transforms/Deseq.cpp b/lib/Dialect/LLHD/Transforms/Deseq.cpp
+index c922417cd..f26f63caf 100644
+--- a/lib/Dialect/LLHD/Transforms/Deseq.cpp
++++ b/lib/Dialect/LLHD/Transforms/Deseq.cpp
+@@ -1269,6 +1269,53 @@ bool Deseq::matchDriveClockAndReset(
+     if (resetIt == valueTable.end())
+       continue;
+ 
++    // A table whose entries ALL map to one identical known value v -- the
++    // reset entry included -- where every non-reset entry only fires on a
++    // clock edge (its AND-mask contains the clock-edge literals; extra
++    // literals such as an unknown enable or either reset level only narrow
++    // it) is a constant-v register regardless of the table's exact shape.
++    // A register that loads v on EVERY clock edge and resets to v is
++    // observationally identical: narrower entries merely write v less
++    // often, and what the register holds in between is already v (same
++    // power-up caveat the clock-equals-reset rule below accepts). This
++    // must run BEFORE the clockWhileReset dispatch: cv64a6's
++    // issue_read_operands `is_zcmt_o` spells the shape as
++    // {clockEdge&resetActive -> v, resetEdge -> v, clockEdge&xEnable -> v},
++    // whose first entry IS clockWhileReset, steering the specific-pattern
++    // path below into a refusal.
++    if (!resetIt->second.isUnknown()) {
++      auto v = resetIt->second;
++      bool allSameAndClocked = llvm::all_of(valueTable, [&](auto &pair) {
++        if (pair.second.isUnknown() || !(pair.second == v))
++          return false;
++        if (pair.first == reset)
++          return true;
++        return (pair.first.andTerms & clockEdge) == clockEdge;
++      });
++      if (allSameAndClocked) {
++        drive.reset.reset = triggers[resetIdx].getProjected();
++        drive.reset.value = v.value;
++        drive.reset.activeHigh = !negReset;
++
++        drive.clock.clock = triggers[clockIdx].getProjected();
++        drive.clock.risingEdge = !negClock;
++        drive.clock.value = v.value;
++
++        LLVM_DEBUG({
++          llvm::dbgs() << "  - Matched " << (negClock ? "neg" : "pos")
++                       << "edge clock ";
++          drive.clock.clock.printAsOperand(llvm::dbgs(), OpPrintingFlags());
++          llvm::dbgs() << " -> " << v
++                       << " (all table entries equal reset value)\n";
++          llvm::dbgs() << "  - Matched active-" << (negReset ? "low" : "high")
++                       << " reset ";
++          drive.reset.reset.printAsOperand(llvm::dbgs(), OpPrintingFlags());
++          llvm::dbgs() << " -> " << v << "\n";
++        });
++        return true;
++      }
++    }
++
+     auto clockWhileResetIt = llvm::find_if(
+         valueTable, [&](auto &pair) { return pair.first == clockWhileReset; });
+     if (clockWhileResetIt == valueTable.end()) {
+@@ -1320,6 +1367,7 @@ bool Deseq::matchDriveClockAndReset(
+           return true;
+         }
+       }
++
+       continue;
+     }
+ 
+diff --git a/lib/Dialect/LLHD/Transforms/UnrollLoops.cpp b/lib/Dialect/LLHD/Transforms/UnrollLoops.cpp
+index a20189b7a..b04a5afee 100644
+--- a/lib/Dialect/LLHD/Transforms/UnrollLoops.cpp
++++ b/lib/Dialect/LLHD/Transforms/UnrollLoops.cpp
+@@ -290,6 +290,69 @@ bool Loop::match() {
+       arg.replaceAllUsesWith(common);
+     }
+ 
++    // LCSSA-style live-out threading. A loop-defined value used after the
++    // loop is real (not just phi noise) when the code asks something about
++    // the state the loop ended in -- the canonical idiom is checking the
++    // induction variable after a break-able loop (`if (i == N)`: fell off
++    // the end vs. broke early; CVA6's PMP match loop does exactly this).
++    // Such a use is fine to unroll IF the value can be handed out along
++    // every exit edge instead: append it to each branch into the exit
++    // destination and rewrite the destination's uses to a fresh block
++    // argument. Each cloned iteration's exit branch then passes that
++    // iteration's value -- exactly the break semantics. Conservatively
++    // limited to values whose every outside use sits DIRECTLY in one
++    // destination block, all of whose predecessors are loop blocks
++    // terminating in a BranchOpInterface; anything else still falls
++    // through to the failMatch below. Pure phi threading: safe even if
++    // the overall match later fails for another reason.
++    {
++      SmallVector<std::pair<Value, Block *>> toThread;
++      auto gatherThreadable = [&](Value value) {
++        SmallVector<OpOperand *> outside;
++        for (auto &use : value.getUses())
++          if (!bodySet.contains(use.getOwner()->getBlock()))
++            outside.push_back(&use);
++        if (outside.empty())
++          return true;
++        Block *dest = outside.front()->getOwner()->getBlock();
++        for (auto *use : outside)
++          if (use->getOwner()->getBlock() != dest)
++            return false;
++        for (Block *pred : dest->getPredecessors())
++          if (!bodySet.contains(pred) ||
++              !isa<BranchOpInterface>(pred->getTerminator()))
++            return false;
++        toThread.push_back({value, dest});
++        return true;
++      };
++      bool threadable = true;
++      for (auto *block : bodyList) {
++        for (auto arg : block->getArguments())
++          threadable &= gatherThreadable(arg);
++        for (auto &op : *block)
++          for (auto result : op.getResults())
++            threadable &= gatherThreadable(result);
++      }
++      if (threadable) {
++        for (auto [value, dest] : toThread) {
++          BlockArgument newArg =
++              dest->addArgument(value.getType(), value.getLoc());
++          llvm::SmallPtrSet<Block *, 4> seenPreds;
++          for (Block *pred : dest->getPredecessors()) {
++            if (!seenPreds.insert(pred).second)
++              continue;
++            auto branch = cast<BranchOpInterface>(pred->getTerminator());
++            for (unsigned i = 0, e = branch->getNumSuccessors(); i != e; ++i)
++              if (branch->getSuccessor(i) == dest)
++                branch.getSuccessorOperands(i).append(ValueRange{value});
++          }
++          value.replaceUsesWithIf(newArg, [&](OpOperand &use) {
++            return use.getOwner()->getBlock() == dest;
++          });
++        }
++      }
++    }
++
+     for (auto *block : bodyList) {
+       auto checkUsers = [&](Value value) {
+         for (auto *user : value.getUsers())
+-- 
+2.52.0
+

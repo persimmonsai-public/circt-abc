@@ -1,0 +1,31 @@
+/* Hermetic liberty for map-compressor-cells tests: one full adder and one
+   half adder, recognised by function (sum = a^b^ci, carry = majority). */
+library(adder_cells) {
+  cell(TFA) {
+    area : 0.16 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(CI) { direction : input ; }
+    pin(CO) {
+      direction : output ;
+      function : "(((A^B)&CI)|(A&B))" ;
+    }
+    pin(S) {
+      direction : output ;
+      function : "(A^B^CI)" ;
+    }
+  }
+  cell(THA) {
+    area : 0.08 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(CO) {
+      direction : output ;
+      function : "(A&B)" ;
+    }
+    pin(S) {
+      direction : output ;
+      function : "(A^B)" ;
+    }
+  }
+}

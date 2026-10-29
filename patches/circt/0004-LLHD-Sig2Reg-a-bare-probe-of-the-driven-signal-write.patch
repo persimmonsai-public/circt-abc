@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Sat, 29 Aug 2026 05:58:33 -0700
+Subject: [PATCH 04/37] LLHD Sig2Reg: a bare probe of the driven signal writes
+ nothing
+
+tryNarrowFeeder handled array_inject chains, concats and mux trees, but not a
+feeder that is exactly llhd.prb of the signal being driven. That is a pure
+hold -- it writes nothing -- and treating it as unnarrowable poisoned the
+whole mux union, forcing the drive back to full width and making two drives
+of DISJOINT bits look identical.
+
+OpenC910's ct_fifo writes one bit of a 2-bit valid vector per entry and spells
+'no write this cycle' exactly that way:
+
+    %38 = comb.mux %34, %35, %37
+      %35 = comb.concat %32, %true        // bit 0 written
+      %37 = comb.mux %36, %33, %70
+         %70 = llhd.prb %fifo_entry_vld   // writes nothing
+      %32 = comb.extract %70 from 1       // pass-through of bit 1
+
+Restricted to a probe of THIS signal; a probe of any other signal is a real
+value being written and keeps its full-width interval. An all-empty union is
+also refused rather than emitting zero intervals, since dropping a drive
+outright would silently remove logic -- a failure mode this project has had to
+retract twice.
+
+OpenC910: refused signals 40 -> 15 (13 overlapping + 2 genuine latches),
+residual llhd ops 271 -> 85, modules holding LLHD 35 -> 10 of 503, dropped
+logic 6.0% -> 3.2% of IR ops.
+
+Also corrects a retracted reading: the earlier claim that the remaining
+failures showed 'two granularities that genuinely overlap' came from parsing
+the debug log without splitting per-signal blocks, so intervals from
+mst_penable_flop/mst_pwrite_flop were attributed to mst_pprot_flop. Parsed
+per-signal, 37 of 38 had every interval at the same offset and width.
+
+ibex unaffected: core.mlir, core_deagg.mlir, struct.mlir byte-identical.
+---
+ lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp | 25 +++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp b/lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp
+index 5b4624804..2716f8e84 100644
+--- a/lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp
++++ b/lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp
+@@ -253,6 +253,24 @@ tryNarrowFeeder(Value feeder, llhd::SignalOp sigOp, Value selfFeedback,
+                 unsigned depth = 0) {
+   feeder = unwrapClockEnable(feeder, selfFeedback);
+ 
++  // A feeder that is exactly a probe of the signal being driven is a pure
++  // hold: it writes nothing. Without this the arm poisons the whole mux
++  // union below and the drive falls back to full width, which is what made
++  // two drives of DISJOINT bits look identical. OpenC910's `ct_fifo` writes
++  // one bit of a 2-bit valid vector per entry and expresses "no write this
++  // cycle" exactly this way:
++  //
++  //     %38 = comb.mux %34, %35, %37
++  //       %35 = comb.concat %32, %true        // bit 0 written
++  //       %37 = comb.mux %36, %33, %70
++  //          %70 = llhd.prb %fifo_entry_vld   // <- writes nothing
++  //
++  // Restricted to a probe of THIS signal; a probe of any other signal is a
++  // real value being written and must keep its full-width interval.
++  if (auto probeOp = feeder.getDefiningOp<llhd::ProbeOp>())
++    if (probeOp.getSignal() == sigOp.getResult())
++      return SmallVector<NarrowedWrite>{};
++
+   if (auto narrowed = tryNarrowArrayInjectChain(feeder, sigOp))
+     return narrowed;
+   if (auto narrowed = tryNarrowBitConcatChain(feeder, sigOp))
+@@ -277,6 +295,13 @@ tryNarrowFeeder(Value feeder, llhd::SignalOp sigOp, Value selfFeedback,
+   if (!rhs)
+     return std::nullopt;
+ 
++  // An empty union means the drive provably writes nothing at all. Rather
++  // than emit zero intervals -- which would drop the drive and silently
++  // remove logic, a failure mode this project has had to retract twice --
++  // fall back to the conservative full-width answer.
++  if (lhs->empty() && rhs->empty())
++    return std::nullopt;
++
+   SmallVector<NarrowedWrite> merged(*lhs);
+   for (const auto &w : *rhs) {
+     bool identical = false;
+-- 
+2.52.0
+

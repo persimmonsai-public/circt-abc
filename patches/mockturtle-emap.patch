@@ -1,0 +1,101 @@
+# Local edits to lsils/mockturtle @ 0886ebfdd101ce1110daf3d60b96d72edd3143ea, needed by mapper/tools/emap-bridge.
+# Apply: git -C <mockturtle checkout> apply patches/mockturtle-emap.patch
+diff --git a/include/mockturtle/algorithms/emap.hpp b/include/mockturtle/algorithms/emap.hpp
+index 055d9b2..260667e 100644
+--- a/include/mockturtle/algorithms/emap.hpp
++++ b/include/mockturtle/algorithms/emap.hpp
+@@ -766,7 +766,12 @@ private:
+ 
+ public:
+   static constexpr float epsilon = 0.0005;
+-  static constexpr uint32_t max_cut_num = 20;
++  // Raised from 20 (2026-09-10): the cut set is a FIXED-capacity container,
++  // so emap segfaults for any cut_limit >= max_cut_num. That made the
++  // cut-limit lever untestable, and it is the lever that directly targets
++  // cells covered too narrowly (cuts with too few inputs). 33 admits ABC's
++  // customary 32.
++  static constexpr uint32_t max_cut_num = 33;
+   using cut_t = cut<CutSize, cut_enumeration_emap_cut<NInputs>>;
+   using cut_set_t = emap_cut_set<cut_t, max_cut_num>;
+   using cut_merge_t = typename std::array<cut_set_t*, Ntk::max_fanin_size + 1>;
+diff --git a/include/mockturtle/utils/tech_library.hpp b/include/mockturtle/utils/tech_library.hpp
+index 1669555..ed2fcd0 100644
+--- a/include/mockturtle/utils/tech_library.hpp
++++ b/include/mockturtle/utils/tech_library.hpp
+@@ -103,6 +103,16 @@ enum class classification_type : uint32_t
+ 
+ struct tech_library_params
+ {
++  /* PHYS-MAP: slack (in library time units) allowed when checking that a
++     single-output cell can stand in for a multi-output cell's pin delay.
++     The check below demands the single-output alternative be <= the
++     multi-output cell on EVERY pin; on a library whose XOR3 is marginally
++     slower than the full adder's sum pin, that rejects every two-output
++     adder over a difference smaller than the error of the NLDM extraction
++     the genlib is built from.
++     0.0 keeps the upstream behaviour exactly. */
++  float multioutput_delay_tolerance{ 0.0f };
++
+   /*! \brief Load large gates with more than 6 inputs */
+   bool load_large_gates{ true };
+ 
+@@ -134,13 +144,14 @@ namespace detail
+ template<uint32_t NumVars, uint32_t NumOutputs>
+ struct tuple_tt_hash
+ {
+-  inline std::size_t operator()( std::array<kitty::static_truth_table<NumVars, true>, NumOutputs> const& tts ) const
++  inline std::size_t operator()( std::array<kitty::static_truth_table<NumVars>, NumOutputs> const& tts ) const
+   {
+-    std::size_t seed = kitty::hash_block( tts[0]._bits );
+-
++    /* PHYS-MAP: kitty::hash iterates the word array, so this works for
++       NumVars > 6 where _bits is std::array<uint64_t,N>, not a scalar. */
++    kitty::hash<kitty::static_truth_table<NumVars>> h;
++    std::size_t seed = h( tts[0] );
+     for ( auto i = 1; i < NumOutputs; ++i )
+-      kitty::hash_combine( seed, kitty::hash_block( tts[i]._bits ) );
+-
++      kitty::hash_combine( seed, h( tts[i] ) );
+     return seed;
+   }
+ };
+@@ -184,6 +195,21 @@ class tech_library
+ private:
+   static constexpr float epsilon = 0.0005;
+   static constexpr uint32_t max_multi_outputs = 2;
++  /* PHYS-MAP NOTE: 6 caps Boolean matching at 6 variables; above that emap
++     falls back to STRUCTURAL (AIG-pattern) matching, which is incomplete --
++     a design can place hundreds of eight-input cells that way.  Raising this to 8 was
++     ATTEMPTED and does NOT compile: the code assumes a single-word truth table
++     (operator& on std::array<uint64_t,4> at ~line 828), tuple_tt_hash has no
++     >6-var specialisation, and emap.hpp hardcodes static_truth_table<6>.
++     PORTED AND TESTED 2026-09-09, result NULL -- reverted to 6.  The port is
++     six small edits (multi-word-safe kitty::hash and get_bit here and in
++     emap.hpp, plus 5 hardcoded static_truth_table<6> -> <8>), NOT the
++     multi-week job it looks like.  But it changed NOTHING on the library it
++     was tested on: mapping was byte-identical either way, because that
++     library holds only FOUR distinct 8-input functions (the 2-2-2-2 AND-OR
++     family) and structural matching over four patterns is already
++     complete.  emap's covering is not limited by
++     matching completeness -- do not redo this. */
+   static constexpr uint32_t truth_table_size = 6;
+   using supergates_list_t = std::vector<supergate<NInputs>>;
+   using TT = kitty::static_truth_table<truth_table_size>;
+@@ -810,7 +836,7 @@ private:
+         for ( auto i = 0; i < tts.size(); ++i )
+         {
+           static_tts[i] = kitty::extend_to<truth_table_size>( tts[i] );
+-          if ( ( static_tts[i]._bits & 1 ) == 1 )
++          if ( kitty::get_bit( static_tts[i], 0 ) == 1 )   /* PHYS-MAP: multi-word safe */
+           {
+             static_tts[i] = ~static_tts[i];
+             multi_sg[i].polarity |= 1 << NInputs; /* set flipped output polarity*/
+@@ -1025,7 +1051,7 @@ private:
+         if ( ( polarity >> i ) & 1 )
+           mo_pin_delay += _inv_delay;
+ 
+-        if ( pin_delay > mo_pin_delay )
++        if ( pin_delay > mo_pin_delay + _ps.multioutput_delay_tolerance )
+         {
+           valid = false;
+           break;

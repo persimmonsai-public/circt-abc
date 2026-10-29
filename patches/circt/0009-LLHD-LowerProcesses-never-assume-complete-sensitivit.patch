@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Sat, 29 Aug 2026 14:05:25 -0700
+Subject: [PATCH 09/37] LLHD LowerProcesses: never assume complete sensitivity
+ for an EDGE-sensitive process
+
+assume-complete-sensitivity (added here for OpenC910's older
+`always @(a or b)` style) skips allOperandsObserved(). For a CLOCKED process
+that check is the only thing left distinguishing it from combinational logic,
+so the option was letting clocked processes be lowered as combinational,
+which destroys their state. Silently: no error, no diagnostic, just a
+register that became a wire.
+
+Detection is cheap and exact, because the idiom is unmistakable -- the wait
+passes its OWN observed values as destination operands so the destination
+block arguments hold the pre-wait values, and the body compares them:
+
+    llhd.wait yield (...), (%clk, %rst), ^bb2(%clk, %rst)
+  ^bb2(%prevClk: i1, %prevRst: i1):
+    %a = comb.xor %prevClk, %true
+    %b = comb.and %a, %clk          // !prev && cur == posedge
+
+A level-sensitive always @(a or b) has no reason to carry an observed value
+across the wait, so the overlap alone separates them. No pattern-matching of
+the comparison needed.
+
+Measured damage this was doing:
+
+  CVA6 cv32a60x: 263 registers -> 260, and tc_sram's entire 64x25 memory
+    array folded to a constant output (9,410 B module -> 317 B). Deseq
+    declines that process and hwpf_stride's, so both reached this pass.
+  OpenC910: register count is unchanged (4,782 either way), which is why an
+    earlier check said it was unaffected -- but that check was incomplete.
+    Three modules (ct_ciu_ncq, ct_ebiu_write_channel,
+    ct_lsu_snoop_req_arbiter) have 7 further clocked signals that Deseq
+    declines with 'Aborting: unknown clock scheme'; those were being turned
+    into combinational logic. Not caused by the clock-gate cell overlay:
+    reproduced identically against the original pass-through cell.
+
+Cost of the guard: those processes now stay unlowered rather than being
+lowered wrongly. C910 goes from 0 to 3 modules holding LLHD until Deseq
+learns the clock scheme; CVA6 from 15 to 21 of 142. Correct-and-incomplete
+beats complete-and-wrong.
+---
+ .../LLHD/Transforms/LowerProcesses.cpp        | 43 ++++++++++++++++++-
+ 1 file changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/lib/Dialect/LLHD/Transforms/LowerProcesses.cpp b/lib/Dialect/LLHD/Transforms/LowerProcesses.cpp
+index 15ecba01b..de4abbe2b 100644
+--- a/lib/Dialect/LLHD/Transforms/LowerProcesses.cpp
++++ b/lib/Dialect/LLHD/Transforms/LowerProcesses.cpp
+@@ -42,6 +42,7 @@ struct Lowering {
+ 
+   bool canReRootAtWaitDest();
+   bool checkNoValuesLiveAcrossWait();
++  bool isEdgeSensitive();
+ 
+   ProcessOp processOp;
+   /// See the pass option of the same name.
+@@ -61,8 +62,12 @@ void Lowering::lower() {
+   markObservedValues();
+   // An incomplete sensitivity list means the process does not re-evaluate on
+   // every value it reads. Synthesis reads that as combinational logic anyway;
+-  // simulation does not. Only skip the check when the caller has opted in.
+-  if (!assumeCompleteSensitivity && !allOperandsObserved())
++  // simulation does not. Only skip the check when the caller has opted in --
++  // AND the process is not edge-sensitive, because for a clocked process
++  // `allOperandsObserved` is the only thing left that distinguishes it from
++  // combinational logic, and lowering it as combinational DESTROYS its state.
++  if (!allOperandsObserved() &&
++      (!assumeCompleteSensitivity || isEdgeSensitive()))
+     return;
+   LLVM_DEBUG(llvm::dbgs() << "Lowering process " << processOp.getLoc() << "\n");
+ 
+@@ -299,6 +304,40 @@ bool Lowering::canReRootAtWaitDest() {
+   return true;
+ }
+ 
++/// Detect a process that samples an edge rather than a level.
++///
++/// The idiom is unmistakable in the IR: the wait passes its OWN observed
++/// values along as destination operands, so the destination block arguments
++/// hold those values as they were *before* the wait, and the body compares
++/// them against the current ones:
++///
++///     llhd.wait yield (...), (%clk_i, %rst_ni), ^bb2(%clk_i, %rst_ni)
++///   ^bb2(%prevClk: i1, %prevRst: i1):
++///     %a = comb.xor %prevClk, %true
++///     %b = comb.and %a, %clk_i        // !prev && cur  == posedge
++///
++/// A level-sensitive `always @(a or b)` has no reason to carry an observed
++/// value across the wait, so testing for the overlap separates the two
++/// cheaply and without pattern-matching the comparison itself.
++///
++/// This matters only under `assume-complete-sensitivity`. Normally a clocked
++/// process is rejected by `allOperandsObserved` (its body reads state that is
++/// not in the sensitivity list) and left for `Deseq`; the option disables
++/// exactly that check. CVA6 is where it showed: `Deseq` declines `tc_sram`'s
++/// memory-array process and `hwpf_stride`'s, and lowering them as
++/// combinational folded a 64x25 array to a constant and dropped 3 of 4
++/// registers (263 -> 260 design-wide). OpenC910 is unaffected either way
++/// (4,782 registers with and without), because its `Deseq` patch converts
++/// every clocked process before this pass runs.
++bool Lowering::isEdgeSensitive() {
++  SmallDenseSet<Value> observed(waitOp.getObserved().begin(),
++                                waitOp.getObserved().end());
++  for (auto operand : waitOp.getDestOperands())
++    if (observed.contains(operand))
++      return true;
++  return false;
++}
++
+ /// Mark values the process observes that are defined outside the process.
+ void Lowering::markObservedValues() {
+   SmallVector<Value> worklist;
+-- 
+2.52.0
+

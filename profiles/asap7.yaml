@@ -1,0 +1,31 @@
+# ASAP7 library profile: everything the flow needs to know about the
+# library, beyond what it finds in the liberty itself.
+name: asap7
+# The liberties come from the ORFS image's asap7 platform (RVT, TT corner,
+# NLDM), the same list as the platform's TC_NLDM_LIB_FILES. They are
+# extracted and decompressed into the cache on first use and merged into one
+# file for the passes that take a single liberty.
+orfs:
+  platform: asap7
+  liberties:
+    - lib/NLDM/asap7sc7p5t_AO_RVT_TT_nldm_211120.lib.gz
+    - lib/NLDM/asap7sc7p5t_INVBUF_RVT_TT_nldm_220122.lib.gz
+    - lib/NLDM/asap7sc7p5t_OA_RVT_TT_nldm_211120.lib.gz
+    - lib/NLDM/asap7sc7p5t_SEQ_RVT_TT_nldm_220123.lib
+    - lib/NLDM/asap7sc7p5t_SIMPLE_RVT_TT_nldm_211120.lib.gz
+time_unit: ps
+# The integrated clock gate a design's clock-gating primitive is mapped to,
+# and its pin roles (the liberty marks them clock_gate_*_pin). ORFS's own
+# asap7 flow uses this cell for the same purpose (yoSys/cells_clkgate_R.v).
+icg:
+  cell: ICGx1_ASAP7_75t_R
+  clk: CLK
+  en: ENA
+  test_en: SE
+  out: GCLK
+# The platform's DONT_USE_CELLS.
+dont_use: ["*x1p*_ASAP7*", "*xp*_ASAP7*", "SDF*", "ICG*"]
+# Tie cells for constants, CELL:PIN (the platform's TIEHI/TIELO_CELL_AND_PORT).
+tie:
+  hi: TIEHIx1_ASAP7_75t_R:H
+  lo: TIELOx1_ASAP7_75t_R:L

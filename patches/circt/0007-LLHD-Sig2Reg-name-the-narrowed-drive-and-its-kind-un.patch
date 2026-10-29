@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Sat, 29 Aug 2026 12:48:07 -0700
+Subject: [PATCH 07/37] LLHD Sig2Reg: name the narrowed drive and its kind
+ under LLVM_DEBUG
+
+There was no way to answer 'which modules does each narrowing rule actually
+fire in', which is the first question a correctness check has to answer --
+picking modules to verify by grepping the RTL for a signal name got the
+attribution wrong twice. This prints the enclosing module, the signal, the
+range count, and WHICH of the three feeder shapes matched.
+
+Run it with --mlir-disable-threading: the module pass runs in parallel and
+the debug stream interleaves into unparseable garbage without it (an earlier
+tally taken with threading on reported 98 narrowings, all one kind; the real
+answer is 588 across three).
+
+On OpenC910: 249 combinational, 319 next, 20 reset-value, over 65 modules.
+---
+ lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp b/lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp
+index 3617e4172..7df031d73 100644
+--- a/lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp
++++ b/lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp
+@@ -462,6 +462,24 @@ public:
+                       selfFeedback = firregOp.getResult();
+                     }
+                     auto narrowed = tryNarrowFeeder(feeder, sigOp, selfFeedback);
++                    LLVM_DEBUG({
++                      if (narrowed) {
++                        auto parent =
++                            sigOp->getParentOfType<hw::HWModuleOp>();
++                        llvm::dbgs()
++                            << "  - narrowed "
++                            << (!firregOp ? "combinational"
++                                          : (firregOp.getNext() ==
++                                                     firregOp.getResult() &&
++                                             firregOp.getResetValue()
++                                                 ? "reset-value"
++                                                 : "next"))
++                            << " drive of @"
++                            << (parent ? parent.getModuleName() : "?") << "."
++                            << sigOp.getName().value_or("?") << " to "
++                            << narrowed->size() << " range(s)\n";
++                      }
++                    });
+                     if (narrowed) {
+                       bool isArray = isa<hw::ArrayType>(driveOp.getValue().getType());
+                       auto arrayTy = isArray ? cast<hw::ArrayType>(
+-- 
+2.52.0
+

@@ -1,0 +1,3 @@
+# The build context is an exported tree; nothing in it is build output.
+.git
+**/__pycache__

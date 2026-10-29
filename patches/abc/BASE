@@ -1,0 +1,17 @@
+# ABC base for the patch series in this directory.
+#
+# Upstream:  https://github.com/YosysHQ/abc, branch yosys-experimental
+# Base:      e026ed5380f3bdc3beea2ff9ffc23236fc549d5b
+#            ("Merge remote-tracking branch 'upstream/master' into yosys-experimental")
+#
+# The series is 14 commits, exported with
+#   git format-patch --zero-commit e026ed5380f3bdc3beea2ff9ffc23236fc549d5b..<branch>
+# and replaces the older loose patches/abc-*.patch files, which are all contained
+# in it. 0014 adds &nf -t under -l.
+#
+# Rebuild the branch:
+#   git clone https://github.com/YosysHQ/abc && cd abc
+#   git checkout -b phys-synth e026ed5380f3bdc3beea2ff9ffc23236fc549d5b
+#   git am /path/to/circt-abc/patches/abc/0*.patch
+
+e026ed5380f3bdc3beea2ff9ffc23236fc549d5b

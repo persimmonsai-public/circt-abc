@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Tue, 6 Oct 2026 09:39:35 -0700
+Subject: [PATCH 34/37] [ImportVerilog] Materialize nested unpacked-array
+ constants
+
+An unpacked-array parameter whose elements are themselves unpacked arrays
+(e.g. int unsigned Map [N-1:0][0:1]) read with a loop index inside a
+function failed with 'unknown name' / 'no rvalue generated for Parameter':
+materializeFixedSizeUnpackedArrayType handled one level of integer (or
+string) elements only. Materialize nested unpacked-array elements
+recursively and build the outer moore.array_create from them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/Conversion/ImportVerilog/Expressions.cpp  | 19 +++++++++++
+ .../param-nested-unpacked-array.sv            | 32 +++++++++++++++++++
+ 2 files changed, 51 insertions(+)
+ create mode 100644 test/Conversion/ImportVerilog/param-nested-unpacked-array.sv
+
+diff --git a/lib/Conversion/ImportVerilog/Expressions.cpp b/lib/Conversion/ImportVerilog/Expressions.cpp
+index 6857c75b3..cdcaeaa74 100644
+--- a/lib/Conversion/ImportVerilog/Expressions.cpp
++++ b/lib/Conversion/ImportVerilog/Expressions.cpp
+@@ -2913,6 +2913,25 @@ Value Context::materializeFixedSizeUnpackedArrayType(
+     return moore::ArrayCreateOp::create(builder, loc, arrayType, elemVals);
+   }
+ 
++  // Nested unpacked arrays (e.g. `int unsigned Map [N][2]`): materialize
++  // each element recursively and build the outer array from them.
++  if (auto *inner = astType.elementType.getCanonicalType()
++                        .as_if<slang::ast::FixedSizeUnpackedArrayType>()) {
++    SmallVector<Value> elemVals;
++    for (const auto &elem : constant.elements()) {
++      auto value = materializeFixedSizeUnpackedArrayType(elem, *inner, loc);
++      if (!value)
++        return {};
++      elemVals.push_back(value);
++    }
++    if (elemVals.empty())
++      return {};
++    auto arrType = moore::UnpackedArrayType::get(
++        getContext(), elemVals.size(),
++        cast<moore::UnpackedType>(elemVals.front().getType()));
++    return moore::ArrayCreateOp::create(builder, loc, arrType, elemVals);
++  }
++
+   // Check whether underlying type is an integer, if so, get bit width
+   unsigned bitWidth;
+   if (astType.elementType.isIntegral())
+diff --git a/test/Conversion/ImportVerilog/param-nested-unpacked-array.sv b/test/Conversion/ImportVerilog/param-nested-unpacked-array.sv
+new file mode 100644
+index 000000000..74ced1509
+--- /dev/null
++++ b/test/Conversion/ImportVerilog/param-nested-unpacked-array.sv
+@@ -0,0 +1,32 @@
++// RUN: circt-translate --import-verilog %s | FileCheck %s
++// RUN: circt-verilog --ir-hw %s | FileCheck %s --check-prefix=HW
++// REQUIRES: slang
++
++// A 2-D unpacked-array parameter read with a loop index inside a function
++// used to fail with "unknown name" / "no rvalue generated for Parameter":
++// the constant materializer only handled one level of integer elements.
++
++// CHECK-LABEL: moore.module private @Lut(
++// CHECK: moore.array_create {{.+}} -> uarray<2 x i32>
++// CHECK: moore.array_create {{.+}} -> uarray<2 x i32>
++// CHECK: moore.array_create {{.+}} : !moore.uarray<2 x i32>, !moore.uarray<2 x i32> -> uarray<2 x uarray<2 x i32>>
++module Lut #(
++  parameter int unsigned N = 1,
++  parameter int unsigned Map [N-1:0][0:1] = '{default: {32'd0, 32'd0}}
++) (output logic [7:0] m);
++  function automatic logic [7:0] build();
++    logic [7:0] ret = '0;
++    for (int unsigned k = 0; k < N; ++k)
++      ret[Map[k][0]] = Map[k][1];
++    return ret;
++  endfunction
++  localparam logic [7:0] Bits = build();
++  assign m = Bits;
++endmodule
++
++// Map entries {2,3} and {5,1} set bits 2 and 5 of the specialised Lut.
++// HW-LABEL: hw.module private @Lut(
++// HW: hw.constant 36 : i8
++module Top (output logic [7:0] m);
++  Lut #(.N(2), .Map('{'{32'd2, 32'd3}, '{32'd5, 32'd1}})) u (.m(m));
++endmodule
+-- 
+2.52.0
+

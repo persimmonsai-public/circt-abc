@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Tue, 1 Sep 2026 22:22:49 -0700
+Subject: [PATCH 06/14] =?UTF-8?q?scl:=20write=5Fplace=20=E2=80=94=20coordi?=
+ =?UTF-8?q?nates=20keyed=20by=20write=5Fverilog's=20gate=20order?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The incremental-placement hand-off: write_verilog names gates g<K> by
+Abc_NtkForEachNode order; iterating the same order here (immediately
+after write_verilog, same network) yields an exact instance<->coordinate
+map for the freshly written netlist. Unlocated nodes inherit the last
+located coordinate in topological order. Motivation, measured: repeater
+chains at interpolated coordinates were SCATTERED by a fresh
+global placement (any placement inside a chain's bbox is
+HPWL-equivalent) -- slew violations unchanged; repair-style
+passes require their positions to be honored, i.e. legalize-only
+placement seeded from these dumps.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ src/map/scl/scl.c      | 34 +++++++++++++++++++++++++++
+ src/map/scl/sclPlace.c | 53 ++++++++++++++++++++++++++++++++++++++++++
+ src/map/scl/sclSize.h  |  1 +
+ 3 files changed, 88 insertions(+)
+
+diff --git a/src/map/scl/scl.c b/src/map/scl/scl.c
+index 1a795d2c1..37277ece9 100644
+--- a/src/map/scl/scl.c
++++ b/src/map/scl/scl.c
+@@ -59,6 +59,7 @@ static int Scl_CommandResetConstr( Abc_Frame_t * pAbc, int argc, char ** argv );
+ static int Scl_CommandReadPlace  ( Abc_Frame_t * pAbc, int argc, char ** argv );
+ static int Scl_CommandDrcSize    ( Abc_Frame_t * pAbc, int argc, char ** argv );
+ static int Scl_CommandRepeater   ( Abc_Frame_t * pAbc, int argc, char ** argv );
++static int Scl_CommandWritePlace ( Abc_Frame_t * pAbc, int argc, char ** argv );
+ static int Scl_CommandPrintPlace ( Abc_Frame_t * pAbc, int argc, char ** argv );
+ static int Scl_CommandResetPlace ( Abc_Frame_t * pAbc, int argc, char ** argv );
+ 
+@@ -133,6 +134,7 @@ void Scl_Init( Abc_Frame_t * pAbc )
+     Cmd_CommandAdd( pAbc, "SCL mapping",  "read_place",    Scl_CommandReadPlace,   0 );
+     Cmd_CommandAdd( pAbc, "SCL mapping",  "drc_size",      Scl_CommandDrcSize,     1 );
+     Cmd_CommandAdd( pAbc, "SCL mapping",  "repeater",      Scl_CommandRepeater,    1 );
++    Cmd_CommandAdd( pAbc, "SCL mapping",  "write_place",   Scl_CommandWritePlace,  0 );
+     Cmd_CommandAdd( pAbc, "SCL mapping",  "print_place",   Scl_CommandPrintPlace,  0 );
+     Cmd_CommandAdd( pAbc, "SCL mapping",  "reset_place",   Scl_CommandResetPlace,  0 ); 
+ }
+@@ -2364,6 +2366,38 @@ usage:
+     return 1;
+ }
+ 
++int Scl_CommandWritePlace( Abc_Frame_t * pAbc, int argc, char ** argv )
++{
++    Abc_Ntk_t * pNtk = Abc_FrameReadNtk(pAbc);
++    int c;
++    Extra_UtilGetoptReset();
++    while ( ( c = Extra_UtilGetopt( argc, argv, "h" ) ) != EOF )
++    {
++        switch ( c )
++        {
++        case 'h':
++        default:
++            goto usage;
++        }
++    }
++    if ( argc != globalUtilOptind + 1 )
++        goto usage;
++    if ( pNtk == NULL )
++    {
++        fprintf( pAbc->Err, "There is no current network.\n" );
++        return 1;
++    }
++    Scl_PlaceWriteByGateOrder( pNtk, argv[globalUtilOptind] );
++    return 0;
++
++usage:
++    fprintf( pAbc->Err, "usage: write_place [-h] <file>\n" );
++    fprintf( pAbc->Err, "\t         writes coordinates keyed by write_verilog's g<K> gate order\n" );
++    fprintf( pAbc->Err, "\t         (call immediately after write_verilog, same network)\n" );
++    fprintf( pAbc->Err, "\t<file> : output file\n" );
++    return 1;
++}
++
+ int Scl_CommandReadPlace( Abc_Frame_t * pAbc, int argc, char ** argv )
+ {
+     Abc_Ntk_t * pNtk = Abc_FrameReadNtk(pAbc);
+diff --git a/src/map/scl/sclPlace.c b/src/map/scl/sclPlace.c
+index 2fd3c78cd..77c6d8589 100644
+--- a/src/map/scl/sclPlace.c
++++ b/src/map/scl/sclPlace.c
+@@ -396,6 +396,59 @@ void Scl_PlaceTransfer( Abc_Ntk_t * pNtkOld, Abc_Ntk_t * pNtkNew )
+     s_pSclPlace->pNtk = pNtkNew;
+ }
+ 
++/**Function*************************************************************
++
++  Synopsis    [Writes coordinates keyed by write_verilog's gate order.]
++
++  Description [write_verilog names gates g<K> by Abc_NtkForEachNode
++  order with Abc_Base10Log(node count) digits; iterating the SAME order
++  here (with no network change in between) gives an exact
++  instance-name <-> coordinate correspondence for the freshly written
++  netlist -- the piece an incremental (legalize-only) placement needs.
++  Unlocated nodes inherit the last located coordinate in topological
++  order (their driver's neighbourhood), so every gate gets a seed.]
++
++***********************************************************************/
++int Scl_PlaceWriteByGateOrder( Abc_Ntk_t * pNtk, char * pFileName )
++{
++    FILE * pFile;
++    Abc_Obj_t * pObj;
++    float x, y, lastX = 0, lastY = 0;
++    int i, Counter = 0, nDigits, nLocated = 0, fHave = 0;
++    if ( !Scl_PlaceIsRunning(pNtk) )
++    {
++        printf( "write_place: no placement loaded for the current network.\n" );
++        return 0;
++    }
++    pFile = fopen( pFileName, "wb" );
++    if ( pFile == NULL )
++    {
++        printf( "write_place: cannot open \"%s\".\n", pFileName );
++        return 0;
++    }
++    nDigits = Abc_Base10Log( Abc_NtkNodeNum(pNtk) );
++    fprintf( pFile, "# gate-order placement (write_verilog g<K> naming)\n" );
++    fprintf( pFile, "capacitance_per_um %g\n", Scl_PlaceCapPerUm() );
++    fprintf( pFile, "resistance_per_um %g\n", Scl_PlaceResPerUm() );
++    Abc_NtkForEachNode( pNtk, pObj, i )
++    {
++        if ( Scl_PlaceObjCoord( pNtk, Abc_ObjId(pObj), &x, &y ) )
++        {
++            lastX = x; lastY = y; fHave = 1; nLocated++;
++        }
++        else if ( !fHave )
++        {
++            Counter++;
++            continue; // no coordinate seen yet; caller seeds these
++        }
++        fprintf( pFile, "g%0*d %.3f %.3f\n", nDigits, Counter++, lastX, lastY );
++    }
++    fclose( pFile );
++    printf( "write_place: %d gates written (%d exactly located) to \"%s\".\n",
++            Counter, nLocated, pFileName );
++    return 1;
++}
++
+ void Scl_PlacePrint( Abc_Ntk_t * pNtk )
+ {
+     if ( s_pSclPlace == NULL )
+diff --git a/src/map/scl/sclSize.h b/src/map/scl/sclSize.h
+index 4e637f175..76b6aff0c 100644
+--- a/src/map/scl/sclSize.h
++++ b/src/map/scl/sclSize.h
+@@ -639,6 +639,7 @@ extern int           Scl_PlaceSetCentroidFromFanouts( Abc_Ntk_t * pNtk, Abc_Obj_
+ extern float         Scl_PlaceCapPerUm();
+ extern float         Scl_PlaceResPerUm();
+ extern void          Scl_PlacePrint( Abc_Ntk_t * pNtk );
++extern int           Scl_PlaceWriteByGateOrder( Abc_Ntk_t * pNtk, char * pFileName );
+ /*=== sclSize.c ===============================================================*/
+ extern Abc_Obj_t *   Abc_SclFindCriticalCo( SC_Man * p, int * pfRise );
+ extern Abc_Obj_t *   Abc_SclFindMostCriticalFanin( SC_Man * p, int * pfRise, Abc_Obj_t * pNode );
+-- 
+2.52.0
+

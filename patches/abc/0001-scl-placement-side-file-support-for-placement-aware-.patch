@@ -1,0 +1,662 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Tue, 1 Sep 2026 16:19:01 -0700
+Subject: [PATCH 01/14] scl: placement side-file support for placement-aware
+ sizing
+
+New read_place/print_place/reset_place commands (sclPlace.c): load
+net-name-keyed cell coordinates (ports as <name>@pin for die pins);
+Abc_SclAddWireLoad then uses exact HPWL wire caps instead of the
+fanout-count wire-load table (per-net fallback when a coordinate is
+missing), enabled even without a liberty wire_load group. Scl_Con
+(read_constr -n) boundary budgets now reach the Abc_Ntk STA: PI
+arrivals offset CI times, PO requireds seed CO-driver departures.
+Placement survives topo via Scl_PlaceTransfer (DupDfs drops node
+names). Also fixes read_constr's -n flag, which toggled fVerbose
+instead of the new-format switch, leaving the Scl_Con path dead.
+
+Units are SCL-internal (fF/um, kOhm/um); smoke-verified on a long
+single-sink net: the wire cap reaches the load, and upsize responds.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ src/map/scl/module.make |   1 +
+ src/map/scl/scl.c       | 107 ++++++++++++-
+ src/map/scl/sclLoad.c   |  15 +-
+ src/map/scl/sclPlace.c  | 346 ++++++++++++++++++++++++++++++++++++++++
+ src/map/scl/sclSize.c   |  36 +++++
+ src/map/scl/sclSize.h   |  11 ++
+ 6 files changed, 510 insertions(+), 6 deletions(-)
+ create mode 100644 src/map/scl/sclPlace.c
+
+diff --git a/src/map/scl/module.make b/src/map/scl/module.make
+index 3d50ff0c4..4762c5898 100644
+--- a/src/map/scl/module.make
++++ b/src/map/scl/module.make
+@@ -6,6 +6,7 @@ SRC +=  src/map/scl/scl.c \
+     src/map/scl/sclLibScl.c \
+     src/map/scl/sclLibUtil.c \
+     src/map/scl/sclLoad.c \
++    src/map/scl/sclPlace.c \
+     src/map/scl/sclSize.c \
+     src/map/scl/sclUpsize.c \
+     src/map/scl/sclUtil.c
+diff --git a/src/map/scl/scl.c b/src/map/scl/scl.c
+index f023680e2..a43529972 100644
+--- a/src/map/scl/scl.c
++++ b/src/map/scl/scl.c
+@@ -56,6 +56,9 @@ static int Scl_CommandReadConstr ( Abc_Frame_t * pAbc, int argc, char ** argv );
+ static int Scl_CommandWriteConstr( Abc_Frame_t * pAbc, int argc, char ** argv );
+ static int Scl_CommandPrintConstr( Abc_Frame_t * pAbc, int argc, char ** argv );
+ static int Scl_CommandResetConstr( Abc_Frame_t * pAbc, int argc, char ** argv );
++static int Scl_CommandReadPlace  ( Abc_Frame_t * pAbc, int argc, char ** argv );
++static int Scl_CommandPrintPlace ( Abc_Frame_t * pAbc, int argc, char ** argv );
++static int Scl_CommandResetPlace ( Abc_Frame_t * pAbc, int argc, char ** argv );
+ 
+ static inline Scl_Con_t * Scl_ConGetMan( Abc_Frame_t * pAbc )                    { return (Scl_Con_t *)pAbc->pAbcCon;                       }
+ static inline void        Scl_ConFreeMan( Abc_Frame_t * pAbc )                   { if ( pAbc->pAbcCon ) Scl_ConFree(Scl_ConGetMan(pAbc));   }
+@@ -124,7 +127,10 @@ void Scl_Init( Abc_Frame_t * pAbc )
+     Cmd_CommandAdd( pAbc, "SCL mapping",  "read_constr",   Scl_CommandReadConstr,  0 ); 
+     Cmd_CommandAdd( pAbc, "SCL mapping",  "write_constr",  Scl_CommandWriteConstr, 0 ); 
+     Cmd_CommandAdd( pAbc, "SCL mapping",  "print_constr",  Scl_CommandPrintConstr, 0 ); 
+-    Cmd_CommandAdd( pAbc, "SCL mapping",  "reset_constr",  Scl_CommandResetConstr, 0 ); 
++    Cmd_CommandAdd( pAbc, "SCL mapping",  "reset_constr",  Scl_CommandResetConstr, 0 );
++    Cmd_CommandAdd( pAbc, "SCL mapping",  "read_place",    Scl_CommandReadPlace,   0 );
++    Cmd_CommandAdd( pAbc, "SCL mapping",  "print_place",   Scl_CommandPrintPlace,  0 );
++    Cmd_CommandAdd( pAbc, "SCL mapping",  "reset_place",   Scl_CommandResetPlace,  0 ); 
+ }
+ void Scl_End( Abc_Frame_t * pAbc )
+ {
+@@ -1070,6 +1076,9 @@ int Scl_CommandTopo( Abc_Frame_t * pAbc, int argc, char ** argv )
+         Abc_Print( -1, "The command has failed.\n" );
+         return 1;
+     }
++    // carry a loaded placement across the dup (node names do not survive
++    // Abc_NtkDupDfs, so read_place before topo would otherwise go stale)
++    Scl_PlaceTransfer( pNtk, pNtkRes );
+     // replace the current network
+     Abc_FrameReplaceCurrentNetwork( pAbc, pNtkRes );
+     return 0;
+@@ -2024,7 +2033,7 @@ int Scl_CommandReadConstr( Abc_Frame_t * pAbc, int argc, char ** argv )
+         switch ( c )
+         {
+         case 'n':
+-            fVerbose ^= 1;
++            fUseNewFormat ^= 1;
+             break;
+         case 'v':
+             fVerbose ^= 1;
+@@ -2225,6 +2234,100 @@ usage:
+     return 1;
+ }
+ 
++/**Function*************************************************************
++
++  Synopsis    [Placement side-file commands (see sclPlace.c).]
++
++  Description []
++
++  SideEffects []
++
++  SeeAlso     []
++
++***********************************************************************/
++int Scl_CommandReadPlace( Abc_Frame_t * pAbc, int argc, char ** argv )
++{
++    Abc_Ntk_t * pNtk = Abc_FrameReadNtk(pAbc);
++    char * pFileName;
++    int c, fVerbose = 0;
++    Extra_UtilGetoptReset();
++    while ( ( c = Extra_UtilGetopt( argc, argv, "vh" ) ) != EOF )
++    {
++        switch ( c )
++        {
++        case 'v':
++            fVerbose ^= 1;
++            break;
++        case 'h':
++            goto usage;
++        default:
++            goto usage;
++        }
++    }
++    if ( argc != globalUtilOptind + 1 )
++        goto usage;
++    if ( pNtk == NULL )
++    {
++        fprintf( pAbc->Err, "There is no current network.\n" );
++        return 1;
++    }
++    pFileName = argv[globalUtilOptind];
++    if ( !Scl_PlaceReadFile( pNtk, pFileName, fVerbose ) )
++    {
++        fprintf( pAbc->Err, "Reading placement file \"%s\" failed.\n", pFileName );
++        return 1;
++    }
++    return 0;
++
++usage:
++    fprintf( pAbc->Err, "usage: read_place [-vh] <file>\n" );
++    fprintf( pAbc->Err, "\t         reads cell placement (net-name x_um y_um) for the current network;\n" );
++    fprintf( pAbc->Err, "\t         stime/upsize/dnsize/buffer then use HPWL wire caps instead of the\n" );
++    fprintf( pAbc->Err, "\t         fanout-count wire-load table\n" );
++    fprintf( pAbc->Err, "\t-v     : toggle printing verbose information [default = %s]\n", fVerbose? "yes": "no" );
++    fprintf( pAbc->Err, "\t-h     : prints the command summary\n" );
++    fprintf( pAbc->Err, "\t<file> : the name of a file to read\n" );
++    return 1;
++}
++
++int Scl_CommandPrintPlace( Abc_Frame_t * pAbc, int argc, char ** argv )
++{
++    int c;
++    Extra_UtilGetoptReset();
++    while ( ( c = Extra_UtilGetopt( argc, argv, "h" ) ) != EOF )
++    {
++        switch ( c )
++        {
++        case 'h':
++        default:
++            fprintf( pAbc->Err, "usage: print_place [-h]\n" );
++            fprintf( pAbc->Err, "\t         prints the loaded placement's summary\n" );
++            return 1;
++        }
++    }
++    Scl_PlacePrint( Abc_FrameReadNtk(pAbc) );
++    return 0;
++}
++
++int Scl_CommandResetPlace( Abc_Frame_t * pAbc, int argc, char ** argv )
++{
++    int c;
++    Extra_UtilGetoptReset();
++    while ( ( c = Extra_UtilGetopt( argc, argv, "h" ) ) != EOF )
++    {
++        switch ( c )
++        {
++        case 'h':
++        default:
++            fprintf( pAbc->Err, "usage: reset_place [-h]\n" );
++            fprintf( pAbc->Err, "\t         removes the loaded placement\n" );
++            return 1;
++        }
++    }
++    Scl_PlaceStop();
++    return 0;
++}
++
+ ////////////////////////////////////////////////////////////////////////
+ ///                       END OF FILE                                ///
+ ////////////////////////////////////////////////////////////////////////
+diff --git a/src/map/scl/sclLoad.c b/src/map/scl/sclLoad.c
+index f44d4df87..eb9acea5d 100644
+--- a/src/map/scl/sclLoad.c
++++ b/src/map/scl/sclLoad.c
+@@ -101,7 +101,12 @@ float Abc_SclFindWireLoad( Vec_Flt_t * vWireCaps, int nFans )
+ }
+ void Abc_SclAddWireLoad( SC_Man * p, Abc_Obj_t * pObj, int fSubtr )
+ {
+-    float Load = Abc_SclFindWireLoad( p->vWireCaps, Abc_ObjFanoutNum(pObj) );
++    float Load;
++    // placement-aware path: exact HPWL of this net when every member has a
++    // coordinate; falls back to the fanout-count wire-load table otherwise
++    // (including nets touched by objects created after read_place)
++    if ( !Scl_PlaceNetWireCap( p->pNtk, pObj, &Load ) )
++        Load = Abc_SclFindWireLoad( p->vWireCaps, Abc_ObjFanoutNum(pObj) );
+     Abc_SclObjLoad(p, pObj)->rise += fSubtr ? -Load : Load;
+     Abc_SclObjLoad(p, pObj)->fall += fSubtr ? -Load : Load;
+ }
+@@ -136,10 +141,12 @@ void Abc_SclComputeLoad( SC_Man * p )
+         pLoad->rise += pLoadPo->rise;
+         pLoad->fall += pLoadPo->fall;
+     }
+-    // add wire load
+-    if ( p->pWLoadUsed != NULL )
++    // add wire load (a loaded placement enables this even without a
++    // liberty wire_load group: HPWL supplies the model, the table is only
++    // the fallback and stays NULL-safe through Abc_SclFindWireLoad)
++    if ( p->pWLoadUsed != NULL || Scl_PlaceIsRunning(p->pNtk) )
+     {
+-        if ( p->vWireCaps == NULL )
++        if ( p->vWireCaps == NULL && p->pWLoadUsed != NULL )
+             p->vWireCaps = Abc_SclFindWireCaps( p->pWLoadUsed, Abc_NtkGetFanoutMax(p->pNtk) );
+         Abc_NtkForEachNode1( p->pNtk, pObj, i )
+             Abc_SclAddWireLoad( p, pObj, 0 );
+diff --git a/src/map/scl/sclPlace.c b/src/map/scl/sclPlace.c
+new file mode 100644
+index 000000000..254a76fb7
+--- /dev/null
++++ b/src/map/scl/sclPlace.c
+@@ -0,0 +1,346 @@
++/**CFile****************************************************************
++
++  FileName    [sclPlace.c]
++
++  SystemName  [ABC: Logic synthesis and verification system.]
++
++  PackageName [Standard-cell library representation.]
++
++  Synopsis    [Placement side-file support for placement-aware sizing.]
++
++  Author      [circt-abc project]
++
++  Affiliation [-]
++
++  Date        [Started 2026-09-02.]
++
++  Revision    []
++
++***********************************************************************/
++
++#include "sclSize.h"
++#include "misc/st/st.h"
++
++ABC_NAMESPACE_IMPL_START
++
++////////////////////////////////////////////////////////////////////////
++///                        DECLARATIONS                              ///
++////////////////////////////////////////////////////////////////////////
++
++// Placement annotation for the current network, loaded from a side file
++// produced by the flow's coordinate extractor. Keys are OUTPUT NET names
++// (the only identity that survives ABC's own write_verilog/read_verilog -m
++// round trip: instance names are discarded on read); values are cell
++// locations in microns. CI coordinates are keyed by the PI name, CO
++// coordinates by the PO name (die pin locations).
++//
++// File format (text, whitespace-separated):
++//   # comment
++//   capacitance_per_um <fF/um>
++//   resistance_per_um  <kOhm/um>
++//   <net-or-port-name> <x_um> <y_um>
++//   <port-name>@pin    <x_um> <y_um>     (die pin location; the plain name
++//                                         is the boundary cell's location)
++//
++// UNITS ARE ABC'S SCL-INTERNAL UNITS, NOT THE LIBERTY'S: the SCL layer
++// rescales liberty values to ps/fF/kOhm on load, and read_place values go
++// straight into SC_Pair loads. fF/um * um = fF on the NLDM load axis;
++// kOhm/um * fF/um keeps R*C in ps for a later Elmore term.
++
++#define SCL_PLACE_NOCOORD ((float)1e30)
++
++typedef struct Scl_Place_t_ Scl_Place_t;
++struct Scl_Place_t_
++{
++    char *      pFileName;
++    Abc_Ntk_t * pNtk;        // network the coordinates were resolved against
++    float       CapPerUm;    // fF per micron of estimated wire (SCL units)
++    float       ResPerUm;    // kOhm per micron (reserved for Elmore later)
++    Vec_Flt_t * vX;          // indexed by object Id; SCL_PLACE_NOCOORD if absent
++    Vec_Flt_t * vY;
++    int         nEntries;    // entries in the file
++    int         nMatched;    // entries resolved to a network object
++    int         nFallbacks;  // nets that fell back to the wire-load table
++};
++
++static Scl_Place_t * s_pSclPlace = NULL;
++
++////////////////////////////////////////////////////////////////////////
++///                     FUNCTION DEFINITIONS                         ///
++////////////////////////////////////////////////////////////////////////
++
++void Scl_PlaceStop()
++{
++    if ( s_pSclPlace == NULL )
++        return;
++    Vec_FltFreeP( &s_pSclPlace->vX );
++    Vec_FltFreeP( &s_pSclPlace->vY );
++    ABC_FREE( s_pSclPlace->pFileName );
++    ABC_FREE( s_pSclPlace );
++    s_pSclPlace = NULL;
++}
++
++int Scl_PlaceIsRunning( Abc_Ntk_t * pNtk )
++{
++    return s_pSclPlace != NULL && s_pSclPlace->pNtk == pNtk;
++}
++
++float Scl_PlaceCapPerUm() { return s_pSclPlace ? s_pSclPlace->CapPerUm : 0; }
++float Scl_PlaceResPerUm() { return s_pSclPlace ? s_pSclPlace->ResPerUm : 0; }
++
++int Scl_PlaceObjCoord( Abc_Ntk_t * pNtk, int Id, float * pX, float * pY )
++{
++    if ( !Scl_PlaceIsRunning(pNtk) )
++        return 0;
++    if ( Id >= Vec_FltSize(s_pSclPlace->vX) )
++        return 0; // object created after read_place (e.g. a new buffer)
++    *pX = Vec_FltEntry( s_pSclPlace->vX, Id );
++    *pY = Vec_FltEntry( s_pSclPlace->vY, Id );
++    return *pX != SCL_PLACE_NOCOORD && *pY != SCL_PLACE_NOCOORD;
++}
++
++void Scl_PlaceSetObjCoord( Abc_Ntk_t * pNtk, int Id, float X, float Y )
++{
++    if ( s_pSclPlace == NULL || s_pSclPlace->pNtk != pNtk )
++        return;
++    Vec_FltFillExtra( s_pSclPlace->vX, Id + 1, SCL_PLACE_NOCOORD );
++    Vec_FltFillExtra( s_pSclPlace->vY, Id + 1, SCL_PLACE_NOCOORD );
++    Vec_FltWriteEntry( s_pSclPlace->vX, Id, X );
++    Vec_FltWriteEntry( s_pSclPlace->vY, Id, Y );
++}
++
++/**Function*************************************************************
++
++  Synopsis    [HPWL-based wire cap for the net driven by pObj.]
++
++  Description [Returns 1 and fills *pCap with cap_per_um * HPWL over the
++  driver and all fanout locations. Returns 0 (caller falls back to the
++  fanout-count wire-load table) if placement is not loaded for this
++  network or any member of the net lacks a coordinate.]
++
++***********************************************************************/
++int Scl_PlaceNetWireCap( Abc_Ntk_t * pNtk, Abc_Obj_t * pObj, float * pCap )
++{
++    Abc_Obj_t * pFanout;
++    float x, y, xMin, xMax, yMin, yMax;
++    int i;
++    if ( !Scl_PlaceIsRunning(pNtk) )
++        return 0;
++    if ( !Scl_PlaceObjCoord( pNtk, Abc_ObjId(pObj), &x, &y ) )
++        { s_pSclPlace->nFallbacks++; return 0; }
++    xMin = xMax = x;
++    yMin = yMax = y;
++    Abc_ObjForEachFanout( pObj, pFanout, i )
++    {
++        if ( !Scl_PlaceObjCoord( pNtk, Abc_ObjId(pFanout), &x, &y ) )
++            { s_pSclPlace->nFallbacks++; return 0; }
++        xMin = Abc_MinFloat( xMin, x );
++        xMax = Abc_MaxFloat( xMax, x );
++        yMin = Abc_MinFloat( yMin, y );
++        yMax = Abc_MaxFloat( yMax, y );
++    }
++    *pCap = s_pSclPlace->CapPerUm * ( (xMax - xMin) + (yMax - yMin) );
++    return 1;
++}
++
++/**Function*************************************************************
++
++  Synopsis    [Reads a placement side file and resolves it to pNtk.]
++
++***********************************************************************/
++int Scl_PlaceReadFile( Abc_Ntk_t * pNtk, char * pFileName, int fVerbose )
++{
++    char Buffer[4096];
++    char * pToken, * pTokX, * pTokY;
++    FILE * pFile;
++    st__table * tName2Idx;
++    Vec_Flt_t * vFileX, * vFileY;
++    Vec_Ptr_t * vFileNames;
++    Abc_Obj_t * pObj;
++    char * pName;
++    int i, Idx, nLines = 0;
++    float CapPerUm = 0, ResPerUm = 0;
++
++    pFile = fopen( pFileName, "rb" );
++    if ( pFile == NULL )
++    {
++        printf( "Cannot open placement file \"%s\".\n", pFileName );
++        return 0;
++    }
++
++    // parse the file into name -> (x, y)
++    tName2Idx  = st__init_table( strcmp, st__strhash );
++    vFileX     = Vec_FltAlloc( 1000 );
++    vFileY     = Vec_FltAlloc( 1000 );
++    vFileNames = Vec_PtrAlloc( 1000 );
++    while ( fgets( Buffer, sizeof(Buffer), pFile ) )
++    {
++        nLines++;
++        pToken = strtok( Buffer, " \t\r\n" );
++        if ( pToken == NULL || pToken[0] == '#' )
++            continue;
++        if ( !strcmp(pToken, "capacitance_per_um") )
++        {
++            pTokX = strtok( NULL, " \t\r\n" );
++            if ( pTokX ) CapPerUm = atof( pTokX );
++            continue;
++        }
++        if ( !strcmp(pToken, "resistance_per_um") )
++        {
++            pTokX = strtok( NULL, " \t\r\n" );
++            if ( pTokX ) ResPerUm = atof( pTokX );
++            continue;
++        }
++        pTokX = strtok( NULL, " \t\r\n" );
++        pTokY = strtok( NULL, " \t\r\n" );
++        if ( pTokX == NULL || pTokY == NULL )
++        {
++            printf( "Line %d: expected \"<name> <x> <y>\"; skipping.\n", nLines );
++            continue;
++        }
++        if ( st__is_member( tName2Idx, pToken ) )
++            continue; // first entry wins
++        pName = Abc_UtilStrsav( pToken );
++        Vec_PtrPush( vFileNames, pName );
++        st__insert( tName2Idx, pName, (char *)(ABC_PTRINT_T)Vec_FltSize(vFileX) );
++        Vec_FltPush( vFileX, atof(pTokX) );
++        Vec_FltPush( vFileY, atof(pTokY) );
++    }
++    fclose( pFile );
++
++    if ( CapPerUm <= 0 )
++    {
++        printf( "Placement file \"%s\" has no positive capacitance_per_um; refusing to load.\n", pFileName );
++        st__free_table( tName2Idx );
++        Vec_PtrForEachEntry( char *, vFileNames, pName, i ) ABC_FREE( pName );
++        Vec_PtrFree( vFileNames );
++        Vec_FltFree( vFileX );
++        Vec_FltFree( vFileY );
++        return 0;
++    }
++
++    // resolve against the network: CIs and COs by their own name, nodes by
++    // their output net name (Abc_ObjName of the node in a logic network)
++    Scl_PlaceStop();
++    s_pSclPlace = ABC_CALLOC( Scl_Place_t, 1 );
++    s_pSclPlace->pFileName = Abc_UtilStrsav( pFileName );
++    s_pSclPlace->pNtk      = pNtk;
++    s_pSclPlace->CapPerUm  = CapPerUm;
++    s_pSclPlace->ResPerUm  = ResPerUm;
++    s_pSclPlace->vX = Vec_FltStartFull( Abc_NtkObjNumMax(pNtk) );
++    s_pSclPlace->vY = Vec_FltStartFull( Abc_NtkObjNumMax(pNtk) );
++    Vec_FltFill( s_pSclPlace->vX, Abc_NtkObjNumMax(pNtk), SCL_PLACE_NOCOORD );
++    Vec_FltFill( s_pSclPlace->vY, Abc_NtkObjNumMax(pNtk), SCL_PLACE_NOCOORD );
++    s_pSclPlace->nEntries = Vec_FltSize( vFileX );
++
++    Abc_NtkForEachObj( pNtk, pObj, i )
++    {
++        char * pObjName, * pVal;
++        char PinName[4200];
++        if ( !Abc_ObjIsNode(pObj) && !Abc_ObjIsCi(pObj) && !Abc_ObjIsCo(pObj) )
++            continue;
++        pObjName = Abc_ObjName( pObj );
++        if ( pObjName == NULL )
++            continue;
++        // a CI/CO and the net at the boundary share a name, but the die pin
++        // and the driving/driven cell are different locations -- port pins
++        // are keyed "<name>@pin" when the extractor distinguishes them
++        if ( (Abc_ObjIsCi(pObj) || Abc_ObjIsCo(pObj)) && strlen(pObjName) < 4096 )
++        {
++            sprintf( PinName, "%s@pin", pObjName );
++            if ( st__lookup( tName2Idx, PinName, &pVal ) )
++            {
++                Idx = (int)(ABC_PTRINT_T)pVal;
++                Vec_FltWriteEntry( s_pSclPlace->vX, i, Vec_FltEntry(vFileX, Idx) );
++                Vec_FltWriteEntry( s_pSclPlace->vY, i, Vec_FltEntry(vFileY, Idx) );
++                s_pSclPlace->nMatched++;
++                continue;
++            }
++        }
++        if ( st__lookup( tName2Idx, pObjName, &pVal ) )
++        {
++            Idx = (int)(ABC_PTRINT_T)pVal;
++            Vec_FltWriteEntry( s_pSclPlace->vX, i, Vec_FltEntry(vFileX, Idx) );
++            Vec_FltWriteEntry( s_pSclPlace->vY, i, Vec_FltEntry(vFileY, Idx) );
++            s_pSclPlace->nMatched++;
++        }
++        else if ( fVerbose && s_pSclPlace->nEntries - s_pSclPlace->nMatched < 20 )
++            printf( "read_place: no entry for %s object \"%s\" (id %d).\n",
++                    Abc_ObjIsNode(pObj) ? "node" : (Abc_ObjIsCi(pObj) ? "CI" : "CO"),
++                    pObjName, i );
++    }
++
++    if ( fVerbose || s_pSclPlace->nMatched == 0 )
++        printf( "read_place: %d file entries, %d matched of %d network objects (cap %.6f fF/um, res %.6f kOhm/um).\n",
++                s_pSclPlace->nEntries, s_pSclPlace->nMatched,
++                Abc_NtkObjNum(pNtk), CapPerUm, ResPerUm );
++
++    st__free_table( tName2Idx );
++    Vec_PtrForEachEntry( char *, vFileNames, pName, i ) ABC_FREE( pName );
++    Vec_PtrFree( vFileNames );
++    Vec_FltFree( vFileX );
++    Vec_FltFree( vFileY );
++    if ( s_pSclPlace->nMatched == 0 )
++    {
++        Scl_PlaceStop();
++        return 0;
++    }
++    return 1;
++}
++
++/**Function*************************************************************
++
++  Synopsis    [Transfers the placement across a network duplication.]
++
++  Description [Call right after a dup that set pCopy on the old network's
++  objects (e.g. Abc_NtkDupDfs in the `topo` command); node names do not
++  survive such dups, so read_place should run before them and be carried
++  across by this.]
++
++***********************************************************************/
++void Scl_PlaceTransfer( Abc_Ntk_t * pNtkOld, Abc_Ntk_t * pNtkNew )
++{
++    Vec_Flt_t * vXNew, * vYNew;
++    Abc_Obj_t * pObj;
++    int i;
++    if ( !Scl_PlaceIsRunning(pNtkOld) )
++        return;
++    vXNew = Vec_FltStart( Abc_NtkObjNumMax(pNtkNew) );
++    vYNew = Vec_FltStart( Abc_NtkObjNumMax(pNtkNew) );
++    Vec_FltFill( vXNew, Abc_NtkObjNumMax(pNtkNew), SCL_PLACE_NOCOORD );
++    Vec_FltFill( vYNew, Abc_NtkObjNumMax(pNtkNew), SCL_PLACE_NOCOORD );
++    Abc_NtkForEachObj( pNtkOld, pObj, i )
++    {
++        if ( pObj->pCopy == NULL || i >= Vec_FltSize(s_pSclPlace->vX) )
++            continue;
++        if ( Abc_ObjId(pObj->pCopy) >= (unsigned)Vec_FltSize(vXNew) )
++            continue;
++        Vec_FltWriteEntry( vXNew, Abc_ObjId(pObj->pCopy), Vec_FltEntry(s_pSclPlace->vX, i) );
++        Vec_FltWriteEntry( vYNew, Abc_ObjId(pObj->pCopy), Vec_FltEntry(s_pSclPlace->vY, i) );
++    }
++    Vec_FltFree( s_pSclPlace->vX );
++    Vec_FltFree( s_pSclPlace->vY );
++    s_pSclPlace->vX = vXNew;
++    s_pSclPlace->vY = vYNew;
++    s_pSclPlace->pNtk = pNtkNew;
++}
++
++void Scl_PlacePrint( Abc_Ntk_t * pNtk )
++{
++    if ( s_pSclPlace == NULL )
++    {
++        printf( "No placement is loaded.\n" );
++        return;
++    }
++    printf( "Placement \"%s\": %d entries, %d matched, %s network, "
++            "cap %.6f fF/um, res %.6f kOhm/um, %d table fallbacks since load.\n",
++            s_pSclPlace->pFileName, s_pSclPlace->nEntries, s_pSclPlace->nMatched,
++            s_pSclPlace->pNtk == pNtk ? "CURRENT" : "STALE (different)",
++            s_pSclPlace->CapPerUm, s_pSclPlace->ResPerUm, s_pSclPlace->nFallbacks );
++}
++
++////////////////////////////////////////////////////////////////////////
++///                       END OF FILE                                ///
++////////////////////////////////////////////////////////////////////////
++
++ABC_NAMESPACE_IMPL_END
+diff --git a/src/map/scl/sclSize.c b/src/map/scl/sclSize.c
+index a2ba65ee9..da67dd978 100644
+--- a/src/map/scl/sclSize.c
++++ b/src/map/scl/sclSize.c
+@@ -19,6 +19,8 @@
+ ***********************************************************************/
+ 
+ #include "sclSize.h"
++#include "misc/util/utilNam.h"
++#include "sclCon.h"
+ #include "map/mio/mio.h"
+ #include "misc/vec/vecWec.h"
+ #include "base/main/main.h"
+@@ -466,7 +468,19 @@ void Abc_SclTimeNtkRecompute( SC_Man * p, float * pArea, float * pDelay, int fRe
+     Abc_SclManCleanTime( p );
+     p->nEstNodes = 0;
+     Abc_NtkForEachCi( p->pNtk, pObj, i )
++    {
+         Abc_SclTimeNode( p, pObj, 0 );
++        // boundary budgets: read_constr input arrivals offset CI times
++        // (the Abc_Ntk STA otherwise starts every PI at 0; Scl_Con was
++        // consumed only by &nf before this)
++        if ( Scl_ConIsRunning() && Scl_ConHasInArrs() )
++        {
++            SC_Pair * pTime = Abc_SclObjTime( p, pObj );
++            float Arr = Scl_Int2Flt( Scl_ConGetInArr(i) );
++            pTime->rise += Arr;
++            pTime->fall += Arr;
++        }
++    }
+     Abc_NtkForEachNode1( p->pNtk, pObj, i )
+         Abc_SclTimeNode( p, pObj, 0 );
+     Abc_NtkForEachCo( p->pNtk, pObj, i )
+@@ -481,6 +495,28 @@ void Abc_SclTimeNtkRecompute( SC_Man * p, float * pArea, float * pDelay, int fRe
+     if ( fReverse )
+     {
+         p->nEstNodes = 0;
++        // boundary budgets: read_constr output requireds seed each CO
++        // driver's departure with (ReqMax - req_o), so a tightly
++        // constrained output carries proportionally less slack through
++        // the reverse pass (Abc_SclDeptFanin accumulates by max, so the
++        // seed acts as a lower bound)
++        if ( Scl_ConIsRunning() && Scl_ConHasOutReqs() )
++        {
++            int ReqMax = 0;
++            Abc_NtkForEachCo( p->pNtk, pObj, i )
++                ReqMax = Abc_MaxInt( ReqMax, Scl_ConGetOutReq(i) );
++            Abc_NtkForEachCo( p->pNtk, pObj, i )
++            {
++                int Req = Scl_ConGetOutReq( i );
++                if ( Req > 0 && Req < ReqMax )
++                {
++                    SC_Pair * pDept = Abc_SclObjDept( p, Abc_ObjFanin0(pObj) );
++                    float Off = Scl_Int2Flt( ReqMax - Req );
++                    pDept->rise = Abc_MaxFloat( pDept->rise, Off );
++                    pDept->fall = Abc_MaxFloat( pDept->fall, Off );
++                }
++            }
++        }
+         Abc_NtkForEachNodeReverse1( p->pNtk, pObj, i )
+             Abc_SclTimeNode( p, pObj, 1 );
+     }
+diff --git a/src/map/scl/sclSize.h b/src/map/scl/sclSize.h
+index 8466469c4..ee040916f 100644
+--- a/src/map/scl/sclSize.h
++++ b/src/map/scl/sclSize.h
+@@ -623,6 +623,17 @@ extern void          Abc_SclAddWireLoad( SC_Man * p, Abc_Obj_t * pObj, int fSubt
+ extern void          Abc_SclComputeLoad( SC_Man * p );
+ extern void          Abc_SclUpdateLoad( SC_Man * p, Abc_Obj_t * pObj, SC_Cell * pOld, SC_Cell * pNew );
+ extern void          Abc_SclUpdateLoadSplit( SC_Man * p, Abc_Obj_t * pBuffer, Abc_Obj_t * pFanout );
++/*=== sclPlace.c ===============================================================*/
++extern int           Scl_PlaceReadFile( Abc_Ntk_t * pNtk, char * pFileName, int fVerbose );
++extern void          Scl_PlaceStop();
++extern int           Scl_PlaceIsRunning( Abc_Ntk_t * pNtk );
++extern int           Scl_PlaceObjCoord( Abc_Ntk_t * pNtk, int Id, float * pX, float * pY );
++extern void          Scl_PlaceSetObjCoord( Abc_Ntk_t * pNtk, int Id, float X, float Y );
++extern int           Scl_PlaceNetWireCap( Abc_Ntk_t * pNtk, Abc_Obj_t * pObj, float * pCap );
++extern void          Scl_PlaceTransfer( Abc_Ntk_t * pNtkOld, Abc_Ntk_t * pNtkNew );
++extern float         Scl_PlaceCapPerUm();
++extern float         Scl_PlaceResPerUm();
++extern void          Scl_PlacePrint( Abc_Ntk_t * pNtk );
+ /*=== sclSize.c ===============================================================*/
+ extern Abc_Obj_t *   Abc_SclFindCriticalCo( SC_Man * p, int * pfRise );
+ extern Abc_Obj_t *   Abc_SclFindMostCriticalFanin( SC_Man * p, int * pfRise, Abc_Obj_t * pNode );
+-- 
+2.52.0
+

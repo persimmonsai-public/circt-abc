@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Wed, 2 Sep 2026 00:39:02 -0700
+Subject: [PATCH 07/14] scl: write_place must mirror write_verilog's instance
+ rules
+
+write_verilog names a gate g<Counter> only for nodes it instantiates:
+constant nodes become `assign` lines and the second output of a twin
+gate folds into the first's instance, neither bumping the counter.
+write_place counted every node and also skipped-and-counted leading
+unlocated nodes, so any group with constants or twins had every later
+key shifted (on a cv64a6 group, thousands of gates mis-keyed and
+thousands seeded at the die center, wrecking the incremental
+placement's timing). Now: identical skip predicates (local copies of the
+static ioWriteVerilog.c helpers), leading unlocated gates seeded from
+the first located coordinate, other unlocated gates from the centroid
+of their located fanins; refuses unmapped networks; reports the skip
+and seed counts. Verified: the keys equal the write_verilog gate
+sequence, and the skip count equals the measured drift.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/map/scl/sclPlace.c | 84 +++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 75 insertions(+), 9 deletions(-)
+
+diff --git a/src/map/scl/sclPlace.c b/src/map/scl/sclPlace.c
+index 77c6d8589..e5010645c 100644
+--- a/src/map/scl/sclPlace.c
++++ b/src/map/scl/sclPlace.c
+@@ -19,6 +19,7 @@
+ ***********************************************************************/
+ 
+ #include "sclSize.h"
++#include "map/mio/mio.h"
+ #include "misc/st/st.h"
+ 
+ ABC_NAMESPACE_IMPL_START
+@@ -409,43 +410,108 @@ void Scl_PlaceTransfer( Abc_Ntk_t * pNtkOld, Abc_Ntk_t * pNtkNew )
+   order (their driver's neighbourhood), so every gate gets a seed.]
+ 
+ ***********************************************************************/
++// mirrors of ioWriteVerilog.c's static skip rules: write_verilog names a
++// gate g<Counter> only for nodes it actually instantiates -- constant
++// nodes become `assign` lines and the second output of a twin gate is
++// folded into the first's instance -- neither bumps the counter. Any
++// divergence here mis-keys EVERY later gate of the group (measured on
++// cv64a6: thousands of keys shifted in one group, and thousands of gates
++// fell back to a die-center seed, wrecking its timing).
++static int Scl_PlaceNodesHaveSameFanins( Abc_Obj_t * pNode, Abc_Obj_t * pNode2 )
++{
++    Abc_Obj_t * pFanin;
++    int i;
++    if ( Abc_ObjFaninNum(pNode) != Abc_ObjFaninNum(pNode2) )
++        return 0;
++    Abc_ObjForEachFanin( pNode, pFanin, i )
++        if ( pFanin != Abc_ObjFanin(pNode2, i) )
++            return 0;
++    return 1;
++}
++static int Scl_PlaceIsPrevTwinNode( Abc_Obj_t * pNode )
++{
++    Abc_Obj_t * pPrev;
++    Mio_Gate_t * pGate = (Mio_Gate_t *)pNode->pData;
++    if ( pGate == NULL || Mio_GateReadTwin(pGate) == NULL || Abc_ObjId(pNode) == 0 )
++        return 0;
++    pPrev = Abc_NtkObj( pNode->pNtk, Abc_ObjId(pNode) - 1 );
++    if ( pPrev == NULL || !Abc_ObjIsNode(pPrev) )
++        return 0;
++    if ( Mio_GateReadTwin(pGate) != (Mio_Gate_t *)pPrev->pData )
++        return 0;
++    return Scl_PlaceNodesHaveSameFanins( pPrev, pNode );
++}
++static int Scl_PlaceIsConstGate( Abc_Obj_t * pObj )
++{
++    Mio_Gate_t * pGate = (Mio_Gate_t *)pObj->pData;
++    return Abc_ObjFaninNum(pObj) == 0 && pGate &&
++        (!strcmp(Mio_GateReadName(pGate), "_const0_") || !strcmp(Mio_GateReadName(pGate), "_const1_"));
++}
+ int Scl_PlaceWriteByGateOrder( Abc_Ntk_t * pNtk, char * pFileName )
+ {
+     FILE * pFile;
+-    Abc_Obj_t * pObj;
+-    float x, y, lastX = 0, lastY = 0;
+-    int i, Counter = 0, nDigits, nLocated = 0, fHave = 0;
++    Abc_Obj_t * pObj, * pFanin;
++    float x, y, lastX = 0, lastY = 0, fx, fy;
++    int i, k, Counter = 0, nDigits, nLocated = 0, nSkipped = 0, nFromFanin = 0;
+     if ( !Scl_PlaceIsRunning(pNtk) )
+     {
+         printf( "write_place: no placement loaded for the current network.\n" );
+         return 0;
+     }
++    if ( !Abc_NtkHasMapping(pNtk) )
++    {
++        printf( "write_place: the network is not mapped (gate order is undefined).\n" );
++        return 0;
++    }
+     pFile = fopen( pFileName, "wb" );
+     if ( pFile == NULL )
+     {
+         printf( "write_place: cannot open \"%s\".\n", pFileName );
+         return 0;
+     }
++    // seed for leading unlocated gates: the first located coordinate in
++    // gate order (so nothing ever falls back to a caller-chosen point)
++    Abc_NtkForEachNode( pNtk, pObj, i )
++        if ( Scl_PlaceObjCoord( pNtk, Abc_ObjId(pObj), &x, &y ) )
++        {
++            lastX = x; lastY = y;
++            break;
++        }
+     nDigits = Abc_Base10Log( Abc_NtkNodeNum(pNtk) );
+     fprintf( pFile, "# gate-order placement (write_verilog g<K> naming)\n" );
+     fprintf( pFile, "capacitance_per_um %g\n", Scl_PlaceCapPerUm() );
+     fprintf( pFile, "resistance_per_um %g\n", Scl_PlaceResPerUm() );
+     Abc_NtkForEachNode( pNtk, pObj, i )
+     {
++        if ( Scl_PlaceIsPrevTwinNode(pObj) || Scl_PlaceIsConstGate(pObj) )
++        {
++            nSkipped++;
++            continue; // write_verilog emits no g<K> instance for these
++        }
+         if ( Scl_PlaceObjCoord( pNtk, Abc_ObjId(pObj), &x, &y ) )
+         {
+-            lastX = x; lastY = y; fHave = 1; nLocated++;
++            lastX = x; lastY = y; nLocated++;
+         }
+-        else if ( !fHave )
++        else
+         {
+-            Counter++;
+-            continue; // no coordinate seen yet; caller seeds these
++            // unlocated: centroid of located fanins (its driver
++            // neighbourhood), else the last located gate in order
++            int nHave = 0; float sx = 0, sy = 0;
++            Abc_ObjForEachFanin( pObj, pFanin, k )
++                if ( Scl_PlaceObjCoord( pNtk, Abc_ObjId(pFanin), &fx, &fy ) )
++                {
++                    sx += fx; sy += fy; nHave++;
++                }
++            if ( nHave )
++            {
++                lastX = sx / nHave; lastY = sy / nHave; nFromFanin++;
++            }
+         }
+         fprintf( pFile, "g%0*d %.3f %.3f\n", nDigits, Counter++, lastX, lastY );
+     }
+     fclose( pFile );
+-    printf( "write_place: %d gates written (%d exactly located) to \"%s\".\n",
+-            Counter, nLocated, pFileName );
++    printf( "write_place: %d gates written (%d exactly located, %d seeded from fanins, %d non-instance nodes skipped) to \"%s\".\n",
++            Counter, nLocated, nFromFanin, nSkipped, pFileName );
+     return 1;
+ }
+ 
+-- 
+2.52.0
+

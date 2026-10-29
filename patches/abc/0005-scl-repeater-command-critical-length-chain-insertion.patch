@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Tue, 1 Sep 2026 21:53:53 -0700
+Subject: [PATCH 05/14] =?UTF-8?q?scl:=20repeater=20command=20=E2=80=94=20c?=
+ =?UTF-8?q?ritical-length=20chain=20insertion=20on=20placed=20nets?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The buffering engine decomposes fanout, never distance: a single-sink
+net spanning 500um gets at most one buffer at the sink, so
+wire-dominated nets stay outside NLDM characterization regardless of
+drive (slew violations on a large unrepaired design were
+unmoved by max-drive sizing). repeater [-L um] splits every located
+driver->sink edge longer than Lcrit with ceil(d/L)-1 chained buffers
+at interpolated coordinates; the buffer variant is chosen so
+max_out_cap covers one segment. Smoke: on a long single-sink net
+the placed-view delay and the worst cap drop severalfold, CEC
+equivalent. v1 limits: per-edge chains (no trunk sharing), unlocated
+PIs skipped, 16-stage cap.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ src/map/scl/scl.c     |  56 ++++++++++++++++++++
+ src/map/scl/sclDrc.c  | 117 ++++++++++++++++++++++++++++++++++++++++++
+ src/map/scl/sclSize.h |   1 +
+ 3 files changed, 174 insertions(+)
+
+diff --git a/src/map/scl/scl.c b/src/map/scl/scl.c
+index 1fa82a4b5..1a795d2c1 100644
+--- a/src/map/scl/scl.c
++++ b/src/map/scl/scl.c
+@@ -58,6 +58,7 @@ static int Scl_CommandPrintConstr( Abc_Frame_t * pAbc, int argc, char ** argv );
+ static int Scl_CommandResetConstr( Abc_Frame_t * pAbc, int argc, char ** argv );
+ static int Scl_CommandReadPlace  ( Abc_Frame_t * pAbc, int argc, char ** argv );
+ static int Scl_CommandDrcSize    ( Abc_Frame_t * pAbc, int argc, char ** argv );
++static int Scl_CommandRepeater   ( Abc_Frame_t * pAbc, int argc, char ** argv );
+ static int Scl_CommandPrintPlace ( Abc_Frame_t * pAbc, int argc, char ** argv );
+ static int Scl_CommandResetPlace ( Abc_Frame_t * pAbc, int argc, char ** argv );
+ 
+@@ -131,6 +132,7 @@ void Scl_Init( Abc_Frame_t * pAbc )
+     Cmd_CommandAdd( pAbc, "SCL mapping",  "reset_constr",  Scl_CommandResetConstr, 0 );
+     Cmd_CommandAdd( pAbc, "SCL mapping",  "read_place",    Scl_CommandReadPlace,   0 );
+     Cmd_CommandAdd( pAbc, "SCL mapping",  "drc_size",      Scl_CommandDrcSize,     1 );
++    Cmd_CommandAdd( pAbc, "SCL mapping",  "repeater",      Scl_CommandRepeater,    1 );
+     Cmd_CommandAdd( pAbc, "SCL mapping",  "print_place",   Scl_CommandPrintPlace,  0 );
+     Cmd_CommandAdd( pAbc, "SCL mapping",  "reset_place",   Scl_CommandResetPlace,  0 ); 
+ }
+@@ -2308,6 +2310,60 @@ usage:
+     return 1;
+ }
+ 
++int Scl_CommandRepeater( Abc_Frame_t * pAbc, int argc, char ** argv )
++{
++    Abc_Ntk_t * pNtkRes, * pNtk = Abc_FrameReadNtk(pAbc);
++    float LcritUm = 60;
++    int c, fVerbose = 0;
++    Extra_UtilGetoptReset();
++    while ( ( c = Extra_UtilGetopt( argc, argv, "Lvh" ) ) != EOF )
++    {
++        switch ( c )
++        {
++        case 'L':
++            if ( globalUtilOptind >= argc ) goto usage;
++            LcritUm = atof(argv[globalUtilOptind]);
++            globalUtilOptind++;
++            break;
++        case 'v':
++            fVerbose ^= 1;
++            break;
++        case 'h':
++        default:
++            goto usage;
++        }
++    }
++    if ( pNtk == NULL || !Abc_NtkHasMapping(pNtk) )
++    {
++        fprintf( pAbc->Err, "There is no current mapped network.\n" );
++        return 1;
++    }
++    if ( pAbc->pLibScl == NULL )
++    {
++        fprintf( pAbc->Err, "There is no Liberty library available.\n" );
++        return 1;
++    }
++    pNtkRes = Abc_SclRepeaterPerform( (SC_Lib *)pAbc->pLibScl, pNtk, LcritUm, fVerbose );
++    if ( pNtkRes == NULL )
++    {
++        fprintf( pAbc->Err, "Repeater insertion failed.\n" );
++        return 1;
++    }
++    // node names do not survive the dup; carry the placement across
++    Scl_PlaceTransfer( pNtk, pNtkRes );
++    Abc_FrameReplaceCurrentNetwork( pAbc, pNtkRes );
++    return 0;
++
++usage:
++    fprintf( pAbc->Err, "usage: repeater [-L float] [-vh]\n" );
++    fprintf( pAbc->Err, "\t         splits placed driver->sink edges longer than Lcrit\n" );
++    fprintf( pAbc->Err, "\t         with chained buffers at interpolated coordinates\n" );
++    fprintf( pAbc->Err, "\t-L num : critical length in um [default = 60]\n" );
++    fprintf( pAbc->Err, "\t-v     : verbose\n" );
++    fprintf( pAbc->Err, "\t-h     : help\n" );
++    return 1;
++}
++
+ int Scl_CommandReadPlace( Abc_Frame_t * pAbc, int argc, char ** argv )
+ {
+     Abc_Ntk_t * pNtk = Abc_FrameReadNtk(pAbc);
+diff --git a/src/map/scl/sclDrc.c b/src/map/scl/sclDrc.c
+index 160f0570b..41dbc0ec8 100644
+--- a/src/map/scl/sclDrc.c
++++ b/src/map/scl/sclDrc.c
+@@ -117,6 +117,123 @@ int Abc_SclDrcSizePerform( SC_Lib * pLib, Abc_Ntk_t * pNtk, float SlewLimit,
+     return nTotal;
+ }
+ 
++/**Function*************************************************************
++
++  Synopsis    [Critical-length repeater insertion on placed nets.]
++
++  Description [The buffering engine decomposes FANOUT, never DISTANCE: a
++  single-sink net spanning 500um gets at most one buffer at the sink, so
++  wire-dominated nets stay outside NLDM characterization no matter the
++  drive (measured: ~500k slew-limit violations on an unrepaired 2.25M-cell
++  design, unchanged by max-drive sizing). This pass walks every located
++  driver->sink edge and, where the Manhattan distance exceeds LcritUm,
++  splits the edge with ceil(d/Lcrit)-1 chained buffers at interpolated
++  coordinates (Scl_PlaceSetObjCoord), so subsequent placement-aware
++  sizing sees per-stage spans <= Lcrit. Optimal spacing is
++  sqrt(2*Rbuf*Cbuf/(r*c)). Far sinks of one driver
++  each get their own chain (v1; no trunk sharing). Requires read_place.]
++
++***********************************************************************/
++int Abc_SclInsertRepeaters( SC_Lib * pLib, Abc_Ntk_t * pNtk, float LcritUm,
++                            int fVerbose )
++{
++    SC_Cell * pBufClass, * pBufCell;
++    Abc_Obj_t * pObj, * pFanout, * pPrev, * pRep;
++    Vec_Int_t * vEdges;
++    float xd, yd, xs, ys, d;
++    int i, k, K, nAdded = 0, nEdges = 0, MaxStages = 16;
++    if ( !Scl_PlaceIsRunning(pNtk) )
++    {
++        printf( "repeater: no placement loaded (read_place first); nothing done.\n" );
++        return 0;
++    }
++    // mid-strength buffer: smallest variant of the buffer class whose
++    // max_out_cap covers one Lcrit segment of wire plus its own input cap
++    pBufClass = Abc_SclFindInvertor( pLib, 1 );
++    if ( pBufClass == NULL )
++    {
++        printf( "repeater: no buffer class in the library.\n" );
++        return 0;
++    }
++    {
++        float SegCap = LcritUm * Scl_PlaceCapPerUm()
++                     + SC_CellPinCapAve( pBufClass->pRepr );
++        SC_Cell * pTemp; int t;
++        pBufCell = pBufClass->pRepr->pPrev; // fallback: largest
++        SC_RingForEachCell( pBufClass->pRepr, pTemp, t )
++        {
++            SC_Pin * pPo = SC_CellPin( pTemp, pTemp->n_inputs );
++            if ( pPo->max_out_cap >= 1.5 * SegCap )
++            {
++                pBufCell = pTemp;
++                break;
++            }
++        }
++    }
++    // collect long edges first (insertion must not disturb iteration)
++    vEdges = Vec_IntAlloc( 1000 );
++    Abc_NtkForEachObj( pNtk, pObj, i )
++    {
++        if ( !Abc_ObjIsNode(pObj) && !Abc_ObjIsCi(pObj) )
++            continue;
++        if ( !Scl_PlaceObjCoord( pNtk, Abc_ObjId(pObj), &xd, &yd ) )
++            continue;
++        Abc_ObjForEachFanout( pObj, pFanout, k )
++        {
++            if ( Abc_ObjIsCo(pFanout) )
++                continue;
++            if ( !Scl_PlaceObjCoord( pNtk, Abc_ObjId(pFanout), &xs, &ys ) )
++                continue;
++            if ( Abc_AbsFloat(xs - xd) + Abc_AbsFloat(ys - yd) <= LcritUm )
++                continue;
++            Vec_IntPush( vEdges, Abc_ObjId(pObj) );
++            Vec_IntPush( vEdges, Abc_ObjId(pFanout) );
++        }
++    }
++    for ( i = 0; i < Vec_IntSize(vEdges); i += 2 )
++    {
++        pObj    = Abc_NtkObj( pNtk, Vec_IntEntry(vEdges, i) );
++        pFanout = Abc_NtkObj( pNtk, Vec_IntEntry(vEdges, i+1) );
++        Scl_PlaceObjCoord( pNtk, Abc_ObjId(pObj), &xd, &yd );
++        Scl_PlaceObjCoord( pNtk, Abc_ObjId(pFanout), &xs, &ys );
++        d = Abc_AbsFloat(xs - xd) + Abc_AbsFloat(ys - yd);
++        K = (int)(d / LcritUm); // ceil(d/Lcrit)-1 for d > Lcrit
++        K = Abc_MinInt( K, MaxStages );
++        if ( K < 1 )
++            continue;
++        nEdges++;
++        pPrev = pObj;
++        for ( k = 1; k <= K; k++ )
++        {
++            pRep = Abc_NtkCreateNodeBuf( pNtk, NULL );
++            Vec_IntSetEntry( pNtk->vGates, Abc_ObjId(pRep), pBufCell->Id );
++            Abc_ObjAddFanin( pRep, pPrev );
++            Scl_PlaceSetObjCoord( pNtk, Abc_ObjId(pRep),
++                xd + (xs - xd) * k / (K + 1), yd + (ys - yd) * k / (K + 1) );
++            pPrev = pRep;
++            nAdded++;
++        }
++        Abc_ObjPatchFanin( pFanout, pObj, pPrev );
++    }
++    Vec_IntFree( vEdges );
++    if ( pNtk->vPhases )
++        Vec_IntFillExtra( pNtk->vPhases, Abc_NtkObjNumMax(pNtk), 0 );
++    printf( "repeater: split %d long edge(s) with %d %s repeater(s) "
++            "(Lcrit %.1f um).\n", nEdges, nAdded, pBufCell->pName, LcritUm );
++    return nAdded;
++}
++
++Abc_Ntk_t * Abc_SclRepeaterPerform( SC_Lib * pLib, Abc_Ntk_t * pNtk,
++                                    float LcritUm, int fVerbose )
++{
++    Abc_Ntk_t * pNtkNew;
++    Abc_SclMioGates2SclGates( pLib, pNtk );
++    Abc_SclInsertRepeaters( pLib, pNtk, LcritUm, fVerbose );
++    Abc_SclSclGates2MioGates( pLib, pNtk );
++    pNtkNew = Abc_NtkDupDfs( pNtk );
++    return pNtkNew;
++}
++
+ ////////////////////////////////////////////////////////////////////////
+ ///                       END OF FILE                                ///
+ ////////////////////////////////////////////////////////////////////////
+diff --git a/src/map/scl/sclSize.h b/src/map/scl/sclSize.h
+index 69244659f..4e637f175 100644
+--- a/src/map/scl/sclSize.h
++++ b/src/map/scl/sclSize.h
+@@ -625,6 +625,7 @@ extern void          Abc_SclUpdateLoad( SC_Man * p, Abc_Obj_t * pObj, SC_Cell *
+ extern void          Abc_SclUpdateLoadSplit( SC_Man * p, Abc_Obj_t * pBuffer, Abc_Obj_t * pFanout );
+ /*=== sclDrc.c =================================================================*/
+ extern int           Abc_SclDrcSizePerform( SC_Lib * pLib, Abc_Ntk_t * pNtk, float SlewLimit, int fUseWireLoads, int nIters, int fVerbose );
++extern Abc_Ntk_t *   Abc_SclRepeaterPerform( SC_Lib * pLib, Abc_Ntk_t * pNtk, float LcritUm, int fVerbose );
+ /*=== sclPlace.c ===============================================================*/
+ extern int           Scl_PlaceReadFile( Abc_Ntk_t * pNtk, char * pFileName, int fVerbose );
+ extern void          Scl_PlaceStop();
+-- 
+2.52.0
+

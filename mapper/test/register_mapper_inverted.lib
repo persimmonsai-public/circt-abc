@@ -1,0 +1,42 @@
+/* Hermetic liberty for the register-mapper and clock-gate-inference
+   fallback shapes: flops that store and output the complement of D, an
+   async flop with both clear and preset, and an integrated clock gate whose
+   pins carry their roles (no pin_name_map). No pin is marked
+   `nextstate_type : data`. */
+library(inverted_cells) {
+  cell(TDFFQN) {
+    area : 0.29 ;
+    ff(IQN, IQNN) {
+      clocked_on : "CLK" ;
+      next_state : "!D" ;
+    }
+    pin(QN) { direction : output ; function : "IQN" ; }
+    pin(CLK) { direction : input ; clock : true ; }
+    pin(D) { direction : input ; }
+  }
+  cell(TDFFASRQN) {
+    area : 0.38 ;
+    ff(IQN, IQNN) {
+      clear : "!SETN" ;
+      clear_preset_var1 : L ;
+      clear_preset_var2 : L ;
+      clocked_on : "CLK" ;
+      next_state : "!D" ;
+      preset : "!RESETN" ;
+    }
+    pin(QN) { direction : output ; function : "IQN" ; }
+    pin(CLK) { direction : input ; clock : true ; }
+    pin(D) { direction : input ; }
+    pin(RESETN) { direction : input ; }
+    pin(SETN) { direction : input ; }
+  }
+  cell(TICG) {
+    area : 0.26 ;
+    clock_gating_integrated_cell : latch_posedge_precontrol ;
+    pin(IQ) { direction : internal ; }
+    pin(GCLK) { clock_gate_out_pin : true ; direction : output ; }
+    pin(CLK) { clock_gate_clock_pin : true ; direction : input ; }
+    pin(ENA) { clock_gate_enable_pin : true ; direction : input ; }
+    pin(SE) { clock_gate_test_pin : true ; direction : input ; }
+  }
+}

@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Wed, 2 Sep 2026 14:56:53 -0700
+Subject: [PATCH 10/14] &nf -l: honor -D as the required time; choice-class
+ loads; -P stage penalty
+
+Upstream &nf never reads pPars->DelayTarget (the -D switch): the only
+required-time source is MapDelayTarget, which -R sets. Every stock
+"&nf -D <n>" is therefore a delay-optimal mapping with zero-slack area
+recovery. In load-aware mode (-l) the delays are real picoseconds, so -D
+is now honored as the required time there; stock mode is untouched
+(byte-identity verified on g0).
+
+Also: -P <ps> per-stage penalty added to every pin delay in -l mode
+(wire RC / slew cost per logic level the load model lacks), and choice
+class siblings share the class maximum load (Gia_ObjRepr).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/aig/gia/gia.h   |  1 +
+ src/aig/gia/giaNf.c | 38 ++++++++++++++++++++++++++++++++++++--
+ src/base/abci/abc.c | 12 +++++++++++-
+ 3 files changed, 48 insertions(+), 3 deletions(-)
+
+diff --git a/src/aig/gia/gia.h b/src/aig/gia/gia.h
+index 72ccf1ea6..467467ec8 100644
+--- a/src/aig/gia/gia.h
++++ b/src/aig/gia/gia.h
+@@ -372,6 +372,7 @@ struct Jf_Par_t_
+     int            fCutGroup;
+     int            fUseLoads;      // load-aware delays: PD + LD*load per pin (PHYS-ABC P6)
+     float          MaxLoadF;       // load clamp (fF) for load-aware delays; high-fanout nets get buffered later
++    float          StagePenaltyPs; // per-stage delay added under -l: the wire RC + slew degradation every extra level costs post-route
+     int            fVerbose;
+     int            fVeryVerbose;
+     int            nLutSizeMax;
+diff --git a/src/aig/gia/giaNf.c b/src/aig/gia/giaNf.c
+index e2259eed1..0ae12b9db 100644
+--- a/src/aig/gia/giaNf.c
++++ b/src/aig/gia/giaNf.c
+@@ -110,6 +110,7 @@ struct Nf_Man_t_
+     Vec_Flt_t       vLoads;         // per-node output load estimate (fF), load-aware mode (PHYS-ABC P6)
+     Vec_Flt_t *     vWireCaps;      // wire cap by fanout count (fF), from the SC_Lib wire_load model
+     float           AvgCapF;        // average input pin cap of the library cells (fF)
++    int             StagePenaltyI;  // per-stage penalty (SCL_NUM-scaled ps), from pPars->StagePenaltyPs
+     float           AvgLDF;         // average load-delay slope of the library pins (ps/fF): the cost a pin's own cap imposes on its driver
+     int             iCur;           // current position
+     int             Iter;           // mapping iterations
+@@ -152,7 +153,7 @@ static inline float        Nf_ObjFlowRefs( Nf_Man_t * p, int i, int c )
+ // load it puts on its driver inside the same round (logical-effort view);
+ // without it the delay round picks maximal drives everywhere and the next
+ // round's recomputed loads explode.
+-static inline int          Nf_CellPinDelay( Nf_Man_t * p, Mio_Cell2_t * pC, int k, int iObj ) { return p->pPars->fUseLoads ? pC->iDelays[k] + (int)(pC->iLDs[k] * Vec_FltEntry(&p->vLoads, iObj)) + (int)(p->AvgLDF * pC->iCaps[k]) : pC->iDelays[k]; }
++static inline int          Nf_CellPinDelay( Nf_Man_t * p, Mio_Cell2_t * pC, int k, int iObj ) { return p->pPars->fUseLoads ? pC->iDelays[k] + (int)(pC->iLDs[k] * Vec_FltEntry(&p->vLoads, iObj)) + (int)(p->AvgLDF * pC->iCaps[k]) + p->StagePenaltyI : pC->iDelays[k]; }
+ static inline int          Nf_ObjRequired( Nf_Man_t * p, int i, int c )              { return Vec_IntEntry(&p->vRequired, Abc_Var2Lit(i,c));            }
+ static inline void         Nf_ObjSetRequired( Nf_Man_t * p,int i, int c, int f )     { Vec_IntWriteEntry(&p->vRequired, Abc_Var2Lit(i,c), f);           }
+ static inline void         Nf_ObjUpdateRequired( Nf_Man_t * p,int i, int c, int f )  { if (Nf_ObjRequired(p, i, c) > f) Nf_ObjSetRequired(p, i, c, f);  }
+@@ -440,6 +441,7 @@ Nf_Man_t * Nf_StoCreate( Gia_Man_t * pGia, Jf_Par_t * pPars )
+                 CapSum += p->pCells[iC].iCaps[k], LDSum += p->pCells[iC].iLDs[k], nPins++;
+         p->AvgCapF   = nPins ? (float)(CapSum / nPins / SCL_NUM) : 1.0f;
+         p->AvgLDF    = nPins ? (float)(LDSum / nPins / SCL_NUM) : 0.0f;
++        p->StagePenaltyI = (int)(pPars->StagePenaltyPs * SCL_NUM);
+         p->vWireCaps = pWL ? Abc_SclFindWireCaps( pWL, 64 ) : NULL;
+         if ( pPars->fVerbose )
+             printf( "Load-aware mapping: %d cells, average pin cap %.3f fF, average LD %.3f ps/fF, wire model %s.\n", p->nCells, p->AvgCapF, p->AvgLDF, pWL ? pWL->pName : "none" );
+@@ -1521,6 +1523,31 @@ void Nf_ManComputeLoads( Nf_Man_t * p )
+                 Vec_FltAddToEntry( &p->vLoads, i, Nf_ManWireCap(p, nFans) );
+         }
+     }
++    // choice classes (after &dch): every sibling implements the same function
++    // and whichever the mapper picks drives the SAME fanouts, so the class
++    // shares one load -- the max over its members. Without this the
++    // non-representative siblings sit at zero load and the mapper routes deep
++    // chains through "free" nodes (v1/v3: every group's depth doubled).
++    if ( Gia_ManHasChoices(p->pGia) )
++    {
++        Gia_ManForEachAnd( p->pGia, pObj, i )
++        {
++            int iRepr = Gia_ObjRepr( p->pGia, i );
++            if ( iRepr == GIA_VOID || iRepr == i )
++                continue;
++            float m = Abc_MaxFloat( Vec_FltEntry(&p->vLoads, i), Vec_FltEntry(&p->vLoads, iRepr) );
++            Vec_FltWriteEntry( &p->vLoads, i, m );
++            Vec_FltWriteEntry( &p->vLoads, iRepr, m );
++        }
++        // second sweep so the max reaches every member of a longer class
++        Gia_ManForEachAnd( p->pGia, pObj, i )
++        {
++            int iRepr = Gia_ObjRepr( p->pGia, i );
++            if ( iRepr == GIA_VOID || iRepr == i )
++                continue;
++            Vec_FltWriteEntry( &p->vLoads, i, Vec_FltEntry(&p->vLoads, iRepr) );
++        }
++    }
+     // clamp: nets beyond the library's characterized load get buffer trees downstream
+     if ( p->pPars->MaxLoadF > 0 )
+         Gia_ManForEachObj( p->pGia, pObj, i )
+@@ -2818,13 +2845,20 @@ void Nf_ManSetDefaultPars( Jf_Par_t * pPars )
+     pPars->nCutNumMax   =  NF_CUT_MAX;
+     pPars->MapDelayTarget = 0;
+     pPars->MaxLoadF     = 30.0;
++    pPars->StagePenaltyPs = 0.0;
+ }
+ Gia_Man_t * Nf_ManPerformMappingInt( Gia_Man_t * pGia, Jf_Par_t * pPars )
+ {
+     Gia_Man_t * pNew = NULL, * pCls;
+     Nf_Man_t * p; int i, Id;
++    // Upstream never reads pPars->DelayTarget (the "-D" switch): the only
++    // required-time source is MapDelayTarget, set by "-R".  In load-aware
++    // mode the delays are real picoseconds, so honor "-D" as the required
++    // time there (stock mode is left unchanged for byte-identity).
++    if ( pPars->fUseLoads && pPars->DelayTarget > 0 && pPars->MapDelayTarget == 0 )
++        pPars->MapDelayTarget = Scl_Flt2Int( (float)pPars->DelayTarget );
+     if ( Gia_ManHasChoices(pGia) || pGia->pManTime )
+-        pPars->fCoarsen = 0;     
++        pPars->fCoarsen = 0;
+     pCls = pPars->fCoarsen ? Gia_ManDupMuxes(pGia, pPars->nCoarseLimit) : pGia;
+     p = Nf_StoCreate( pCls, pPars );
+     if ( p == NULL )
+diff --git a/src/base/abci/abc.c b/src/base/abci/abc.c
+index 7c0758a97..538c05775 100644
+--- a/src/base/abci/abc.c
++++ b/src/base/abci/abc.c
+@@ -46887,7 +46887,7 @@ int Abc_CommandAbc9Nf( Abc_Frame_t * pAbc, int argc, char ** argv )
+     Gia_Man_t * pNew; int c;
+     Nf_ManSetDefaultPars( pPars );
+     Extra_UtilGetoptReset();
+-    while ( ( c = Extra_UtilGetopt( argc, argv, "KCFARLEDQMWZXakpqflvwh" ) ) != EOF )
++    while ( ( c = Extra_UtilGetopt( argc, argv, "KCFARLEDQMWZXPakpqflvwh" ) ) != EOF )
+     {
+         switch ( c )
+         {
+@@ -47039,6 +47039,15 @@ int Abc_CommandAbc9Nf( Abc_Frame_t * pAbc, int argc, char ** argv )
+         case 'q':
+             pPars->fPinQuick ^= 1;
+             break;
++        case 'P':
++            if ( globalUtilOptind >= argc )
++            {
++                Abc_Print( -1, "Command line switch \"-P\" should be followed by a floating point number.\n" );
++                goto usage;
++            }
++            pPars->StagePenaltyPs = (float)atof(argv[globalUtilOptind]);
++            globalUtilOptind++;
++            break;
+         case 'X':
+             if ( globalUtilOptind >= argc )
+             {
+@@ -47112,6 +47121,7 @@ usage:
+     Abc_Print( -2, "\t-f       : toggles filtering matches (useful with unit delay model) [default = %s]\n", pPars->fPinFilter? "yes": "no" );
+     Abc_Print( -2, "\t-l       : toggles load-aware delays PD + LD*load per pin (needs read_lib -l) [default = %s]\n", pPars->fUseLoads? "yes": "no" );
+     Abc_Print( -2, "\t-X num   : load clamp in fF for load-aware delays (0 = none) [default = %.1f]\n", pPars->MaxLoadF );
++    Abc_Print( -2, "\t-P num   : per-stage delay penalty in ps for load-aware delays (wire RC + slew per level) [default = %.1f]\n", pPars->StagePenaltyPs );
+     Abc_Print( -2, "\t-v       : toggles verbose output [default = %s]\n",                                   pPars->fVerbose? "yes": "no" );
+     Abc_Print( -2, "\t-w       : toggles very verbose output [default = %s]\n",                              pPars->fVeryVerbose? "yes": "no" );
+     Abc_Print( -2, "\t-h       : prints the command usage\n");
+-- 
+2.52.0
+

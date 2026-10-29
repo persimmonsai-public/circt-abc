@@ -1,0 +1,28 @@
+# CIRCT base for the patch series in this directory.
+#
+# Upstream:  https://github.com/llvm/circt, branch main
+# Base:      2b809f9a3a2783a7f9e91b4917c82d9a028550e9 (third_party/CIRCT_REV)
+#
+# The series is the local branch on third_party/circt (38 commits). It was
+# exported with
+#   git format-patch --zero-commit 2b809f9a3a2783a7f9e91b4917c82d9a028550e9..HEAD
+# and git am of the series on that base reproduces the local tree exactly
+# (tree fca0f15e4). It replaces the older loose patches/circt-*.patch files,
+# which it contains or supersedes, with one exception:
+#
+# patches/circt-createIncrement-i1-writeback-fix.patch is kept for its
+# hierarchical-value block-argument hunk, which is in neither the base nor
+# the series and is not applied. Its struct element-select hunk is upstream
+# by the base, and its i1 x++/x-- writeback hunk is 0038.
+#
+# 0001-0037 are the CIRCT every result up to 2026-10-28 was built with. 0038
+# (2026-10-28) fixes x++/x-- on 1-bit variables, which were silently
+# dropped; it changes the front-end output of any design using them, CVA6
+# among them (lsu_bypass's 1-bit FIFO pointers), so results built after it
+# are not comparable with earlier ones. To rebuild the earlier CIRCT, apply
+# 0001-0037 only.
+#
+# scripts/build-circt-from-source.sh applies it. By hand:
+#   git clone https://github.com/llvm/circt && cd circt
+#   git checkout -b circt-abc 2b809f9a3a2783a7f9e91b4917c82d9a028550e9
+#   git am /path/to/circt-abc/patches/circt/0*.patch

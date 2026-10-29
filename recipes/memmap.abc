@@ -1,0 +1,10 @@
+# ABC-ACCEL A2 memory-group recipe: map-only, no optimization.
+# For residuals dominated by flop-memory arrays (wt_dcache_mem /
+# cva6_icache tag+valid arrays on cv64a6's WT cache subsystem): even the
+# no-scorr tier ran 2h20+ without finishing -- deep AIG restructuring of
+# mux-decoded register arrays is where ABC's optimization stages drown,
+# and the logic is regular enough that optimization buys little anyway.
+# strash + dc2 for cheap cleanup, then straight to the mapper.
+strash; dc2
+&get -n; &dch; &nf -C 32 -D {period}; &put
+strash; &get -n; &nf -D {period}; &put

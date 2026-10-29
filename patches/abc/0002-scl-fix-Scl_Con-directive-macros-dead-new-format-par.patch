@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Tue, 1 Sep 2026 16:55:23 -0700
+Subject: [PATCH 02/14] scl: fix Scl_Con directive macros (dead new-format
+ parser)
+
+SCL_DIRECTIVE/SCL_DEF_DIRECTIVE stringified the macro ARGUMENT NAME
+(# suppresses expansion), so the parser matched literal
+".default_SCL_INPUT_ARR" and no documented directive ever parsed.
+ITEM is already a string macro; plain literal concatenation is what
+was intended. With this and the read_constr -n flag fix, boundary
+budgets actually reach &nf and the (new) sizing STA.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ src/map/scl/sclCon.h | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/map/scl/sclCon.h b/src/map/scl/sclCon.h
+index fe7776c12..cc7735a5e 100644
+--- a/src/map/scl/sclCon.h
++++ b/src/map/scl/sclCon.h
+@@ -56,8 +56,14 @@ struct Scl_Con_t_
+ #define SCL_OUTPUT_REQ   "output_required"
+ #define SCL_OUTPUT_LOAD  "output_load"
+ 
+-#define SCL_DIRECTIVE(ITEM)     "."#ITEM
+-#define SCL_DEF_DIRECTIVE(ITEM) ".default_"#ITEM
++// ITEM is itself a string macro (SCL_INPUT_ARR = "input_arrival" etc.), so
++// plain literal concatenation is what is wanted. The original "."#ITEM
++// stringified the ARGUMENT NAME (# suppresses macro expansion), so the
++// parser matched ".default_SCL_INPUT_ARR" -- no documented directive ever
++// parsed, making the whole new-format reader dead code (together with the
++// read_constr -n flag bug fixed in scl.c).
++#define SCL_DIRECTIVE(ITEM)     "." ITEM
++#define SCL_DEF_DIRECTIVE(ITEM) ".default_" ITEM
+ 
+ #define SCL_NUM          1000
+ #define SCL_INFINITY    (0x3FFFFFFF)
+-- 
+2.52.0
+

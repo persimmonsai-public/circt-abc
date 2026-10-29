@@ -1,0 +1,571 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Tue, 13 Oct 2026 10:51:00 -0700
+Subject: [PATCH 14/14] &nf -t: per-output required times under -l; -B/-G and
+ ABC_PHYSMAP_GATEMAP
+
+-t: each output's required time is its own arrival x (100+R)/100 instead
+of the global critical delay (Nf_ManSetOutputRequireds), so area recovery
+cannot deepen non-critical cones. Works with -l (load-aware delays).
+
+-B <rounds>: barycenter AIG placement; per-node wire caps from fanout-star
+HPWL, rescaled to the fanout model's mean (needs -l).
+-G <file>: per-node wire caps "<gia_obj_id> <cap_fF>" from a placement of
+a previous mapping (needs -l).
+ABC_PHYSMAP_GATEMAP=<file>: write_verilog emits "<instance> <gia_obj_id>"
+so a placement can be joined back to AIG nodes.
+
+All off unless requested.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/aig/gia/gia.h            |   2 +
+ src/aig/gia/giaNf.c          | 228 ++++++++++++++++++++++++++++++++++-
+ src/base/abci/abc.c          |  35 +++++-
+ src/base/abci/abcDar.c       |  17 +++
+ src/base/io/io.c             |  19 +++
+ src/base/io/ioWriteVerilog.c |  15 +++
+ 6 files changed, 310 insertions(+), 6 deletions(-)
+
+diff --git a/src/aig/gia/gia.h b/src/aig/gia/gia.h
+index 2dd21f07b..8f8004391 100644
+--- a/src/aig/gia/gia.h
++++ b/src/aig/gia/gia.h
+@@ -397,6 +397,8 @@ struct Jf_Par_t_
+     float *        pTimesArr;
+     float *        pTimesReq;
+     char *         ZFile;
++    char *         GFile;          // per-node wire caps from a real placement (PHYS-MAP): "<gia_obj_id> <cap_fF>"
++    int            nAigPlaceRounds; // PHYS-MAP-AIG: barycenter smoothing rounds for the cover-invariant AIG placement (0 = off)
+ };
+ 
+ static inline unsigned     Gia_ObjCutSign( unsigned ObjId )       { return (1 << (ObjId & 31));                                 }
+diff --git a/src/aig/gia/giaNf.c b/src/aig/gia/giaNf.c
+index 5f2d2a49d..a0e9bb4ab 100644
+--- a/src/aig/gia/giaNf.c
++++ b/src/aig/gia/giaNf.c
+@@ -104,12 +104,17 @@ struct Nf_Man_t_
+     Vec_Int_t       vMapRefs;       // mapping refs   (2x)
+     Vec_Flt_t       vFlowRefs;      // flow refs      (2x)
+     Vec_Int_t       vRequired;      // required times (2x)
++    Vec_Int_t *     vCoArr0;        // per-CO arrival of the FIRST (delay-optimal) mapping, for -t
+     Vec_Flt_t       vCutFlows;      // temporary cut area
+     Vec_Int_t       vCutDelays;     // temporary cut delay
+     Vec_Int_t       vBackup;        // backup literals
+     Vec_Flt_t       vLoads;         // per-node output load estimate (fF), load-aware mode (PHYS-ABC P6)
+     int             fFreezeLoads;   // load-aware mode: keep vLoads fixed (area-recovery rounds)
+     Vec_Flt_t *     vWireCaps;      // wire cap by fanout count (fF), from the SC_Lib wire_load model
++    Vec_Flt_t *     vNodeWireCap;   // PHYS-MAP: per-node wire cap (fF) measured from a real placement; -1 = unknown
++    Vec_Flt_t *     vPosX;          // PHYS-MAP-AIG: cover-invariant node coordinates from the AIG
++    Vec_Flt_t *     vPosY;
++    float           PosScale;       // fF per unit of normalised HPWL, calibrated once
+     float           AvgCapF;        // average input pin cap of the library cells (fF)
+     int             StagePenaltyI;  // per-stage penalty (SCL_NUM-scaled ps), from pPars->StagePenaltyPs
+     float           AvgLDF;         // average load-delay slope of the library pins (ps/fF): the cost a pin's own cap imposes on its driver
+@@ -386,6 +391,7 @@ void Nf_StoPrint( Nf_Man_t * p, int fVerbose )
+   SeeAlso     []
+ 
+ ***********************************************************************/
++void Nf_ManAigPlace( Nf_Man_t * p, int nRounds ); // PHYS-MAP-AIG, defined below
+ Nf_Man_t * Nf_StoCreate( Gia_Man_t * pGia, Jf_Par_t * pPars )
+ {
+     extern void Mf_ManSetFlowRefs( Gia_Man_t * p, Vec_Int_t * vRefs );
+@@ -446,6 +452,31 @@ Nf_Man_t * Nf_StoCreate( Gia_Man_t * pGia, Jf_Par_t * pPars )
+         p->vWireCaps = pWL ? Abc_SclFindWireCaps( pWL, 64 ) : NULL;
+         if ( pPars->fVerbose )
+             printf( "Load-aware mapping: %d cells, average pin cap %.3f fF, average LD %.3f ps/fF, wire model %s.\n", p->nCells, p->AvgCapF, p->AvgLDF, pWL ? pWL->pName : "none" );
++        // PHYS-MAP-AIG: cover-invariant positions derived from the AIG itself.
++        // Runs before the file loader so an explicit -G file still wins.
++        if ( pPars->nAigPlaceRounds > 0 )
++            Nf_ManAigPlace( p, pPars->nAigPlaceRounds );
++        // PHYS-MAP: per-node wire caps measured from a real placement of a
++        // previous mapping of this same AIG.  Lines are "<gia_obj_id> <cap_fF>";
++        // anything not listed keeps the fanout-count estimate.
++        if ( pPars->GFile )
++        {
++            FILE * pF = fopen( pPars->GFile, "r" );
++            if ( pF == NULL )
++                printf( "Cannot open placement wire-cap file \"%s\"; using the fanout model.\n", pPars->GFile );
++            else
++            {
++                int iObj, nRead = 0; float Cap;
++                p->vNodeWireCap = Vec_FltStart( Gia_ManObjNum(pGia) );
++                Vec_FltFill( p->vNodeWireCap, Gia_ManObjNum(pGia), (float)-1.0 );
++                while ( fscanf( pF, "%d %f", &iObj, &Cap ) == 2 )
++                    if ( iObj >= 0 && iObj < Gia_ManObjNum(pGia) )
++                        Vec_FltWriteEntry( p->vNodeWireCap, iObj, Cap ), nRead++;
++                fclose( pF );
++                printf( "PHYS-MAP: read %d per-node wire caps from \"%s\" (%.1f%% of %d objects).\n",
++                        nRead, pPars->GFile, 100.0*nRead/Gia_ManObjNum(pGia), Gia_ManObjNum(pGia) );
++            }
++        }
+     }
+     p->InvAreaW  = p->pCells[3].AreaW;
+     p->InvAreaF  = p->pCells[3].AreaF;
+@@ -461,8 +492,12 @@ void Nf_StoDelete( Nf_Man_t * p )
+     ABC_FREE( p->vMapRefs.pArray );
+     ABC_FREE( p->vFlowRefs.pArray );
+     ABC_FREE( p->vRequired.pArray );
++    Vec_IntFreeP( &p->vCoArr0 );
+     ABC_FREE( p->vLoads.pArray );
+     Vec_FltFreeP( &p->vWireCaps );
++    Vec_FltFreeP( &p->vNodeWireCap );
++    Vec_FltFreeP( &p->vPosX );
++    Vec_FltFreeP( &p->vPosY );
+     ABC_FREE( p->vCutSets.pArray );
+     ABC_FREE( p->vCutFlows.pArray );
+     ABC_FREE( p->vCutDelays.pArray );
+@@ -1475,13 +1510,152 @@ static inline float Nf_ManWireCap( Nf_Man_t * p, int nFans )
+         return 0;
+     return Vec_FltEntry( p->vWireCaps, Abc_MinInt(nFans, Vec_FltSize(p->vWireCaps)-1) );
+ }
++// PHYS-MAP-AIG.  A COVER-INVARIANT position estimate, computed from the AIG
++// alone -- the cheap analytic stand-in for LevelSyn's GNN (arXiv:2609.03594).
++//
++// Why not a real placement: a placement describes ONE netlist, and the mapper
++// then emits a different one, so measured coordinates stop applying (that
++// version was built and measured as a null result).  Positions
++// derived from the AIG are invariant across covers, which is exactly the
++// property the mapper needs and the reason the paper predicts rather than
++// measures.
++//
++//   x = Normalized Level Index, Level(v)/LevMax  (LevelSyn's NLI)
++//   y = barycenter smoothing over fanins+fanouts, PIs/POs spread as anchors
++//   cap(v) ~ HPWL of v's fanout star
++//
++// The result is scaled to PRESERVE the mean of the fanout-count model it
++// replaces, so this changes only the DISTRIBUTION of wire load, never the
++// total.  That isolates the hypothesis (the fanout model gets the mean about
++// right and the spread wrong: measured R^2 = 0.56 against a real placement)
++// and avoids inventing a die-size parameter.
++void Nf_ManAigPlace( Nf_Man_t * p, int nRounds )
++{
++    Gia_Man_t * pGia = p->pGia;
++    int nObj = Gia_ManObjNum(pGia);
++    Vec_Flt_t * vX = Vec_FltStart( nObj );
++    Vec_Flt_t * vY = Vec_FltStart( nObj );
++    Vec_Flt_t * vYn = Vec_FltStart( nObj );
++    Gia_Obj_t * pObj; int i, r, LevMax, nPi = Gia_ManPiNum(pGia), iPi = 0;
++    double SumH = 0, SumF = 0; int nUsed = 0;
++
++    LevMax = Gia_ManLevelNum( pGia );
++    if ( LevMax <= 0 ) LevMax = 1;
++    // x from the logic level; y seeded by PI order, then by fanin mean
++    Gia_ManForEachObj( pGia, pObj, i )
++    {
++        Vec_FltWriteEntry( vX, i, (float)Gia_ObjLevel(pGia, pObj) / LevMax );
++        if ( Gia_ObjIsPi(pGia, pObj) )
++            Vec_FltWriteEntry( vY, i, nPi > 1 ? (float)(iPi++) / (nPi - 1) : 0.5f );
++        else if ( Gia_ObjIsAnd(pObj) )
++            Vec_FltWriteEntry( vY, i, 0.5f * ( Vec_FltEntry(vY, Gia_ObjFaninId0(pObj, i))
++                                             + Vec_FltEntry(vY, Gia_ObjFaninId1(pObj, i)) ) );
++        else if ( Gia_ObjIsCo(pObj) )
++            Vec_FltWriteEntry( vY, i, Vec_FltEntry(vY, Gia_ObjFaninId0(pObj, i)) );
++    }
++    // barycenter smoothing over fanins and fanouts; PIs stay anchored
++    Gia_ManStaticFanoutStart( pGia );
++    for ( r = 0; r < nRounds; r++ )
++    {
++        Gia_ManForEachObj( pGia, pObj, i )
++        {
++            double Sum = 0; int nDeg = 0, iFan, k;
++            if ( Gia_ObjIsPi(pGia, pObj) ) { Vec_FltWriteEntry( vYn, i, Vec_FltEntry(vY, i) ); continue; }
++            if ( Gia_ObjIsAnd(pObj) )
++            {
++                Sum += Vec_FltEntry(vY, Gia_ObjFaninId0(pObj, i));
++                Sum += Vec_FltEntry(vY, Gia_ObjFaninId1(pObj, i));
++                nDeg += 2;
++            }
++            else if ( Gia_ObjIsCo(pObj) )
++            {
++                Sum += Vec_FltEntry(vY, Gia_ObjFaninId0(pObj, i));
++                nDeg++;
++            }
++            Gia_ObjForEachFanoutStaticId( pGia, i, iFan, k )
++            {
++                Sum += Vec_FltEntry(vY, iFan);
++                nDeg++;
++            }
++            Vec_FltWriteEntry( vYn, i, nDeg ? (float)(Sum / nDeg) : Vec_FltEntry(vY, i) );
++        }
++        ABC_SWAP( Vec_Flt_t *, vY, vYn );
++    }
++    // Calibrate ONE scalar: the mean normalised fanout-star HPWL is mapped onto
++    // AvgCapF, the library's own average input pin cap.  That fixes the UNIT of
++    // the wirelength term without needing a die size or an external wire-load
++    // model (a liberty may have no wire_load groups at all).
++    //
++    // The per-net wirelength itself is NOT computed here.  A node's AIG fanout
++    // is nearly unrelated to the fanout of the net it ends up driving --
++    // measured on this design, r = 0.067 (R^2 = 0.004) -- because mapping
++    // creates the nets.  Coordinates are cover-invariant; wirelength computed
++    // from them must not be, so it is accumulated per cover in
++    // Nf_ManComputeLoads over the current matches' cut leaves.
++    Gia_ManForEachAnd( pGia, pObj, i )
++    {
++        float xlo, xhi, ylo, yhi; int iFan, k, nFan = 0;
++        xlo = xhi = Vec_FltEntry(vX, i);
++        ylo = yhi = Vec_FltEntry(vY, i);
++        Gia_ObjForEachFanoutStaticId( pGia, i, iFan, k )
++        {
++            float x = Vec_FltEntry(vX, iFan), y = Vec_FltEntry(vY, iFan);
++            xlo = Abc_MinFloat(xlo, x); xhi = Abc_MaxFloat(xhi, x);
++            ylo = Abc_MinFloat(ylo, y); yhi = Abc_MaxFloat(yhi, y);
++            nFan++;
++        }
++        if ( nFan == 0 ) continue;
++        SumH += (xhi - xlo) + (yhi - ylo);
++        nUsed++;
++    }
++    Gia_ManStaticFanoutStop( pGia );
++    Vec_FltFreeP( &p->vPosX );
++    Vec_FltFreeP( &p->vPosY );
++    p->vPosX = vX; p->vPosY = vY;
++    p->PosScale = ( nUsed && SumH > 0 ) ? (float)(p->AvgCapF * nUsed / SumH) : 0;
++    printf( "PHYS-MAP-AIG: placed %d nodes, %d levels, %d rounds; scale %.4f fF per unit HPWL "
++            "(mean star HPWL %.4f -> AvgCap %.4f fF).\n",
++            nUsed, LevMax, nRounds, p->PosScale, SumH / Abc_MaxInt(nUsed,1), p->AvgCapF );
++    Vec_FltFree( vYn );
++    (void)SumF;
++}
++
++// PHYS-MAP.  The fanout-count wire-load model above explains only part of
++// real net HPWL: within the 2-pin class alone, measured nets span two orders
++// of magnitude.  When a placement of a previous mapping of
++// THIS SAME AIG is available, use its measured per-net cap for the node and
++// fall back to the fanout table only for nodes the placement does not cover.
++static inline float Nf_ManWireCapObj( Nf_Man_t * p, int iObj, int nFans )
++{
++    if ( p->vNodeWireCap && iObj >= 0 && iObj < Vec_FltSize(p->vNodeWireCap) )
++    {
++        float Cap = Vec_FltEntry( p->vNodeWireCap, iObj );
++        if ( Cap >= 0 )
++            return Cap;
++    }
++    return Nf_ManWireCap( p, nFans );
++}
+ void Nf_ManComputeLoads( Nf_Man_t * p )
+ {
+     Gia_Obj_t * pObj; int i, c, k, iVar, fCompl, nUsed = 0;
+     Vec_Int_t * vFans;
++    // PHYS-MAP-AIG: bounding box of each net's CONSUMERS under the current
++    // cover.  Cover-dependent by construction -- which is the whole point: the
++    // coordinates come from the AIG and never change, but which nodes share a
++    // net is decided by the mapping.
++    Vec_Flt_t * vBx0 = NULL, * vBx1 = NULL, * vBy0 = NULL, * vBy1 = NULL;
++    int fPos = ( p->vPosX && p->vPosY && p->PosScale > 0 );
+     if ( !p->pPars->fUseLoads || p->fFreezeLoads )
+         return;
+     vFans = Vec_IntStart( Gia_ManObjNum(p->pGia) );
++    if ( fPos )
++    {
++        int n = Gia_ManObjNum(p->pGia);
++        vBx0 = Vec_FltStart(n); vBx1 = Vec_FltStart(n);
++        vBy0 = Vec_FltStart(n); vBy1 = Vec_FltStart(n);
++        Vec_FltFill( vBx0, n,  1.0e9 ); Vec_FltFill( vBx1, n, -1.0e9 );
++        Vec_FltFill( vBy0, n,  1.0e9 ); Vec_FltFill( vBy1, n, -1.0e9 );
++    }
+     Vec_FltFill( &p->vLoads, Gia_ManObjNum(p->pGia), 0 );
+     if ( p->Iter == 0 )
+     {
+@@ -1489,7 +1663,7 @@ void Nf_ManComputeLoads( Nf_Man_t * p )
+         {
+             float Refs = Vec_FltEntry(&p->vFlowRefs, 2*i) + Vec_FltEntry(&p->vFlowRefs, 2*i+1);
+             int nFans = (int)(Refs + 0.5);
+-            Vec_FltWriteEntry( &p->vLoads, i, Refs * p->AvgCapF + Nf_ManWireCap(p, nFans) );
++            Vec_FltWriteEntry( &p->vLoads, i, Refs * p->AvgCapF + Nf_ManWireCapObj(p, i, nFans) );
+         }
+     }
+     else
+@@ -1509,6 +1683,14 @@ void Nf_ManComputeLoads( Nf_Man_t * p )
+             {
+                 Vec_FltAddToEntry( &p->vLoads, iVar, (float)pCell->iCaps[k] / SCL_NUM );
+                 Vec_IntAddToEntry( vFans, iVar, 1 );
++                if ( fPos )   // this match consumes iVar: extend iVar's net box
++                {
++                    float x = Vec_FltEntry(p->vPosX, i), y = Vec_FltEntry(p->vPosY, i);
++                    Vec_FltWriteEntry( vBx0, iVar, Abc_MinFloat(Vec_FltEntry(vBx0,iVar), x) );
++                    Vec_FltWriteEntry( vBx1, iVar, Abc_MaxFloat(Vec_FltEntry(vBx1,iVar), x) );
++                    Vec_FltWriteEntry( vBy0, iVar, Abc_MinFloat(Vec_FltEntry(vBy0,iVar), y) );
++                    Vec_FltWriteEntry( vBy1, iVar, Abc_MaxFloat(Vec_FltEntry(vBy1,iVar), y) );
++                }
+             }
+             nUsed++;
+         }
+@@ -1518,10 +1700,18 @@ void Nf_ManComputeLoads( Nf_Man_t * p )
+             if ( nFans == 0 ) // node not referenced by the previous mapping: keep the flow estimate
+             {
+                 float Refs = Vec_FltEntry(&p->vFlowRefs, 2*i) + Vec_FltEntry(&p->vFlowRefs, 2*i+1);
+-                Vec_FltWriteEntry( &p->vLoads, i, Refs * p->AvgCapF + Nf_ManWireCap(p, (int)(Refs + 0.5)) );
++                Vec_FltWriteEntry( &p->vLoads, i, Refs * p->AvgCapF + Nf_ManWireCapObj(p, i, (int)(Refs + 0.5)) );
++            }
++            else if ( fPos && Vec_FltEntry(vBx1, i) > -1.0e8 )
++            {
++                // net box = the driver's own position plus every consumer's
++                float x = Vec_FltEntry(p->vPosX, i), y = Vec_FltEntry(p->vPosY, i);
++                float h = ( Abc_MaxFloat(Vec_FltEntry(vBx1,i), x) - Abc_MinFloat(Vec_FltEntry(vBx0,i), x) )
++                        + ( Abc_MaxFloat(Vec_FltEntry(vBy1,i), y) - Abc_MinFloat(Vec_FltEntry(vBy0,i), y) );
++                Vec_FltAddToEntry( &p->vLoads, i, h * p->PosScale );
+             }
+             else
+-                Vec_FltAddToEntry( &p->vLoads, i, Nf_ManWireCap(p, nFans) );
++                Vec_FltAddToEntry( &p->vLoads, i, Nf_ManWireCapObj(p, i, nFans) );
+         }
+     }
+     // choice classes (after &dch): every sibling implements the same function
+@@ -1562,6 +1752,8 @@ void Nf_ManComputeLoads( Nf_Man_t * p )
+         printf( "Loads (round %d): %d mapped refs, mean %.2f fF, max %.2f fF\n", p->Iter, nUsed, Sum / Abc_MaxInt(1, Gia_ManAndNum(p->pGia)), Max );
+     }
+     Vec_IntFree( vFans );
++    Vec_FltFreeP( &vBx0 ); Vec_FltFreeP( &vBx1 );
++    Vec_FltFreeP( &vBy0 ); Vec_FltFreeP( &vBy1 );
+ }
+ void Nf_ManComputeMapping( Nf_Man_t * p )
+ {
+@@ -1632,7 +1824,35 @@ void Nf_ManSetOutputRequireds( Nf_Man_t * p, int fPropCompl )
+         iObj     = Gia_ObjFaninId0p(p->pGia, pObj);
+         fCompl   = Gia_ObjFaninC0(pObj);
+         Required = Nf_ObjMatchD(p, iObj, fCompl)->D;
+-        Required = p->pPars->fDoAverage ? Required * (100 + p->pPars->nRelaxRatio) / 100 : p->pPars->MapDelay;
++        // `-t`: budget this output against the arrival it had under the FIRST
++        // (delay-optimal) mapping, not against the arrival it has now.  The
++        // upstream expression re-reads the current arrival every iteration,
++        // so with a non-zero relaxation ratio the budget compounds -- the
++        // critical path nearly doubled in levels over the area-recovery rounds on
++        // ibex at -R 25, and ABC's own "Critical delay violation" line fired
++        // three times.  Freezing the baseline makes -R a one-shot percentage
++        // of the delay-optimal depth, which is what it reads as.
++        if ( p->pPars->fDoAverage )
++        {
++            if ( p->vCoArr0 == NULL )
++                p->vCoArr0 = Vec_IntAlloc( Gia_ManCoNum(p->pGia) );
++            Vec_IntFillExtra( p->vCoArr0, i + 1, 0 );
++            if ( p->Iter == 0 || Vec_IntEntry(p->vCoArr0, i) == 0 )
++                Vec_IntWriteEntry( p->vCoArr0, i, Required );
++            Required = Vec_IntEntry( p->vCoArr0, i ) * (100 + p->pPars->nRelaxRatio) / 100;
++            // Under load-aware delays (-l) the loads change between rounds,
++            // so the frozen baseline can sit below the arrival the CURRENT
++            // best match already has; Ela asserts `pM->D <= Required`. Never
++            // budget below the present arrival.
++            Required = Abc_MaxInt( Required, Nf_ObjMatchD(p, iObj, fCompl)->D );
++            // An explicit -D target is a budget every output may use: cones
++            // faster than the clock target may be relaxed up to it (that is
++            // free), but never toward an unrelated deep cone's arrival.
++            if ( p->pPars->MapDelayTarget > 0 )
++                Required = Abc_MaxInt( Required, p->pPars->MapDelayTarget );
++        }
++        else
++            Required = p->pPars->MapDelay;
+         // if external required time can be achieved, use it
+         if ( fUseConMan )
+         {
+diff --git a/src/base/abci/abc.c b/src/base/abci/abc.c
+index be1009803..de4bf7838 100644
+--- a/src/base/abci/abc.c
++++ b/src/base/abci/abc.c
+@@ -46887,7 +46887,7 @@ int Abc_CommandAbc9Nf( Abc_Frame_t * pAbc, int argc, char ** argv )
+     Gia_Man_t * pNew; int c;
+     Nf_ManSetDefaultPars( pPars );
+     Extra_UtilGetoptReset();
+-    while ( ( c = Extra_UtilGetopt( argc, argv, "KCFARLEDQMWZXPYakpqflvwh" ) ) != EOF )
++    while ( ( c = Extra_UtilGetopt( argc, argv, "KCFARLEDQMWZXPYGBakpqfltvwh" ) ) != EOF )
+     {
+         switch ( c )
+         {
+@@ -47018,6 +47018,26 @@ int Abc_CommandAbc9Nf( Abc_Frame_t * pAbc, int argc, char ** argv )
+             if ( pPars->nVerbLimit < 0 )
+                 goto usage;
+             break;
++        case 'B':
++            if ( globalUtilOptind >= argc )
++            {
++                Abc_Print( -1, "Command line switch \"-B\" should be followed by an integer.\n" );
++                goto usage;
++            }
++            pPars->nAigPlaceRounds = atoi(argv[globalUtilOptind]);
++            globalUtilOptind++;
++            if ( pPars->nAigPlaceRounds < 0 )
++                goto usage;
++            break;
++        case 'G':
++            if ( globalUtilOptind >= argc )
++            {
++                Abc_Print( -1, "Command line switch \"-G\" should be followed by a file name.\n" );
++                goto usage;
++            }
++            pPars->GFile = argv[globalUtilOptind];
++            globalUtilOptind++;
++            break;
+         case 'Z':
+             if ( globalUtilOptind >= argc )
+             {
+@@ -47074,6 +47094,9 @@ int Abc_CommandAbc9Nf( Abc_Frame_t * pAbc, int argc, char ** argv )
+         case 'f':
+             pPars->fPinFilter ^= 1;
+             break;
++        case 't':
++            pPars->fDoAverage ^= 1;
++            break;
+         case 'v':
+             pPars->fVerbose ^= 1;
+             break;
+@@ -47112,7 +47135,7 @@ usage:
+         sprintf(Buffer, "best possible" );
+     else
+         sprintf(Buffer, "%d", pPars->DelayTarget );
+-    Abc_Print( -2, "usage: &nf [-KCFARLEDQM num] [-Z file] [-akpqfvwh]\n" );
++    Abc_Print( -2, "usage: &nf [-KCFARLEDQM num] [-Z file] [-akpqftvwh]\n" );
+     Abc_Print( -2, "\t           performs technology mapping of the network\n" );
+     Abc_Print( -2, "\t-K num   : LUT size for the mapping (2 <= K <= %d) [default = %d]\n",                  pPars->nLutSizeMax, pPars->nLutSize );
+     Abc_Print( -2, "\t-C num   : the max number of priority cuts (1 <= C <= %d) [default = %d]\n",           pPars->nCutNumMax, pPars->nCutNum );
+@@ -47125,6 +47148,12 @@ usage:
+     Abc_Print( -2, "\t-Q num   : internal parameter impacting area of the mapping [default = %d]\n",         pPars->nReqTimeFlex );
+     Abc_Print( -2, "\t-M num   : the max number of matches to dump into a binary file [default = %d]\n",     pPars->nMaxMatches );
+     Abc_Print( -2, "\t-Z file  : the output file name to dump internal match info [default = unused]\n" );
++    Abc_Print( -2, "\t-B num   : barycenter rounds for a cover-invariant AIG placement; per-node wire caps\n" );
++    Abc_Print( -2, "\t           come from each node's fanout-star HPWL, rescaled to preserve the fanout\n" );
++    Abc_Print( -2, "\t           model's mean, so only the DISTRIBUTION changes (needs -l) [default = 0 = off]\n" );
++    Abc_Print( -2, "\t-G file  : per-node wire caps \"<gia_obj_id> <cap_fF>\" measured from a placement of a\n" );
++    Abc_Print( -2, "\t           previous mapping of this same AIG; overrides the fanout-count wire model\n" );
++    Abc_Print( -2, "\t           for the nodes listed (needs -l) [default = unused]\n" );
+     Abc_Print( -2, "\t-a       : toggles SAT-based area-oriented mapping (experimental) [default = %s]\n",   pPars->fAreaOnly? "yes": "no" );
+     Abc_Print( -2, "\t-k       : toggles coarsening the subject graph [default = %s]\n",                     pPars->fCoarsen? "yes": "no" );
+     Abc_Print( -2, "\t-p       : toggles pin permutation (more matches - better quality) [default = %s]\n",  pPars->fPinPerm? "yes": "no" );
+@@ -47134,6 +47163,8 @@ usage:
+     Abc_Print( -2, "\t-X num   : load clamp in fF for load-aware delays (0 = none) [default = %.1f]\n", pPars->MaxLoadF );
+     Abc_Print( -2, "\t-P num   : per-stage delay penalty in ps for load-aware delays (wire RC + slew per level) [default = %.1f]\n", pPars->StagePenaltyPs );
+     Abc_Print( -2, "\t-Y num   : extra delay rounds under the previous mapping's loads before loads are frozen for area recovery (-l) [default = %d]\n", pPars->nLoadRounds );
++    Abc_Print( -2, "\t-t       : each output's required time is its OWN arrival (x (100+R)/100) instead of the\n" );
++    Abc_Print( -2, "\t           global critical delay, so area recovery cannot deepen non-critical cones [default = %s]\n", pPars->fDoAverage? "yes": "no" );
+     Abc_Print( -2, "\t-v       : toggles verbose output [default = %s]\n",                                   pPars->fVerbose? "yes": "no" );
+     Abc_Print( -2, "\t-w       : toggles very verbose output [default = %s]\n",                              pPars->fVeryVerbose? "yes": "no" );
+     Abc_Print( -2, "\t-h       : prints the command usage\n");
+diff --git a/src/base/abci/abcDar.c b/src/base/abci/abcDar.c
+index e423f9e3d..d7a278f8a 100644
+--- a/src/base/abci/abcDar.c
++++ b/src/base/abci/abcDar.c
+@@ -1149,6 +1149,15 @@ static inline Abc_Obj_t * Abc_NtkFromCellRead( Abc_Ntk_t * p, Vec_Int_t * vCopyL
+     Abc_NtkFromCellWrite( vCopyLits, i, c, Abc_ObjId(pObjNew) );
+     return pObjNew;
+ }
++// PHYS-MAP: Abc object id -> the Gia object the cell came from.  Cannot live in
++// pObj->iTemp: that unions with pCopy, which later conversions overwrite.
++Vec_Int_t * g_vPhysMapGiaId = NULL;
++static inline void Abc_PhysMapRecord( Abc_Obj_t * pObjNew, int iGiaObj )
++{
++    if ( g_vPhysMapGiaId == NULL ) return;
++    Vec_IntFillExtra( g_vPhysMapGiaId, Abc_ObjId(pObjNew) + 1, -1 );
++    Vec_IntWriteEntry( g_vPhysMapGiaId, Abc_ObjId(pObjNew), iGiaObj );
++}
+ Abc_Ntk_t * Abc_NtkFromCellMappedGia( Gia_Man_t * p, int fUseBuffs )
+ {
+     int fFixDrivers = 1;
+@@ -1160,6 +1169,11 @@ Abc_Ntk_t * Abc_NtkFromCellMappedGia( Gia_Man_t * p, int fUseBuffs )
+     int i, k, iLit, iFanLit, nCells, fNeedConst[2] = {0}; 
+     Mio_Cell2_t * pCells = Mio_CollectRootsNewDefault2( 6, &nCells, 0 );
+     assert( Gia_ManHasCellMapping(p) );
++    if ( getenv("ABC_PHYSMAP_GATEMAP") )
++    {
++        Vec_IntFreeP( &g_vPhysMapGiaId );
++        g_vPhysMapGiaId = Vec_IntAlloc( 1000 );
++    }
+     // start network
+     pNtkNew = Abc_NtkAlloc( ABC_NTK_LOGIC, ABC_FUNC_MAP, 1 );
+     pNtkNew->pName = Extra_UtilStrsav(p->pName);
+@@ -1226,6 +1240,7 @@ Abc_Ntk_t * Abc_NtkFromCellMappedGia( Gia_Man_t * p, int fUseBuffs )
+                 Gia_CellForEachFanin( p, iLitNot, iFanLit, k )
+                     Abc_ObjAddFanin( pObjNew, Abc_NtkFromCellRead(pNtkNew, vCopyLits, Abc_Lit2Var(iFanLit), Abc_LitIsCompl(iFanLit)) );
+                 pObjNew->pData = Mio_LibraryReadGateByName( (Mio_Library_t *)pNtkNew->pManFunc, pCells[Gia_ObjCellId(p, iLitNot)].pName, NULL );
++                Abc_PhysMapRecord( pObjNew, Abc_Lit2Var(iLitNot) );
+                 Abc_NtkFromCellWrite( vCopyLits, Abc_Lit2Var(iLitNot), Abc_LitIsCompl(iLitNot), Abc_ObjId(pObjNew) );
+                 fSkip = 1;
+             }
+@@ -1238,6 +1253,7 @@ Abc_Ntk_t * Abc_NtkFromCellMappedGia( Gia_Man_t * p, int fUseBuffs )
+             pObjNew = Abc_NtkCreateNode( pNtkNew );
+             Abc_ObjAddFanin( pObjNew, Abc_NtkFromCellRead(pNtkNew, vCopyLits, Abc_Lit2Var(iLit), Abc_LitIsCompl(iLitNot)) );
+             pObjNew->pData = Mio_LibraryReadGateByName( (Mio_Library_t *)pNtkNew->pManFunc, pCells[3].pName, NULL );
++            Abc_PhysMapRecord( pObjNew, Abc_Lit2Var(iLit) );
+         }
+         else
+         {
+@@ -1246,6 +1262,7 @@ Abc_Ntk_t * Abc_NtkFromCellMappedGia( Gia_Man_t * p, int fUseBuffs )
+             Gia_CellForEachFanin( p, iLit, iFanLit, k )
+                 Abc_ObjAddFanin( pObjNew, Abc_NtkFromCellRead(pNtkNew, vCopyLits, Abc_Lit2Var(iFanLit), Abc_LitIsCompl(iFanLit)) );
+             pObjNew->pData = Mio_LibraryReadGateByName( (Mio_Library_t *)pNtkNew->pManFunc, pCells[Gia_ObjCellId(p, iLit)].pName, NULL );
++            Abc_PhysMapRecord( pObjNew, Abc_Lit2Var(iLit) );
+         }
+         assert( Vec_IntEntry(vCopyLits, iLit) == -1 );
+         Abc_NtkFromCellWrite( vCopyLits, Abc_Lit2Var(iLit), Abc_LitIsCompl(iLit), Abc_ObjId(pObjNew) );
+diff --git a/src/base/io/io.c b/src/base/io/io.c
+index 6d81d3a45..8be7f78e9 100644
+--- a/src/base/io/io.c
++++ b/src/base/io/io.c
+@@ -3968,6 +3968,25 @@ int IoCommandWriteVerilog( Abc_Frame_t * pAbc, int argc, char **argv )
+         Abc_Ntk_t * pNtkTemp = Abc_NtkToNetlist( pAbc->pNtkCur );
+         if ( !Abc_NtkHasAig(pNtkTemp) && !Abc_NtkHasMapping(pNtkTemp) )
+             Abc_NtkToAig( pNtkTemp );
++        // PHYS-MAP: Abc_NtkToNetlist duplicates and RENUMBERS every object, so the
++        // Gia-origin table recorded at &put is keyed to the pre-conversion ids.
++        // Translate it through pCopy, which the conversion sets on the original.
++        {
++            extern Vec_Int_t * g_vPhysMapGiaId;
++            if ( g_vPhysMapGiaId && getenv("ABC_PHYSMAP_GATEMAP") )
++            {
++                Vec_Int_t * vNew = Vec_IntAlloc( Abc_NtkObjNumMax(pNtkTemp) + 1 );
++                Abc_Obj_t * pObj; int i;
++                Vec_IntFill( vNew, Abc_NtkObjNumMax(pNtkTemp) + 1, -1 );
++                Abc_NtkForEachNode( pAbc->pNtkCur, pObj, i )
++                    if ( pObj->pCopy && (int)Abc_ObjId(pObj) < Vec_IntSize(g_vPhysMapGiaId)
++                         && (int)Abc_ObjId(pObj->pCopy) < Vec_IntSize(vNew) )
++                        Vec_IntWriteEntry( vNew, Abc_ObjId(pObj->pCopy),
++                                           Vec_IntEntry(g_vPhysMapGiaId, Abc_ObjId(pObj)) );
++                Vec_IntFree( g_vPhysMapGiaId );
++                g_vPhysMapGiaId = vNew;
++            }
++        }
+         Io_WriteVerilog( pNtkTemp, pFileName, fOnlyAnds, fNewInterface );
+         Abc_NtkDelete( pNtkTemp );
+     }
+diff --git a/src/base/io/ioWriteVerilog.c b/src/base/io/ioWriteVerilog.c
+index 4d3b06fcd..6b8633eb6 100644
+--- a/src/base/io/ioWriteVerilog.c
++++ b/src/base/io/ioWriteVerilog.c
+@@ -607,6 +607,12 @@ void Io_WriteVerilogObjects( FILE * pFile, Abc_Ntk_t * pNtk, int fOnlyAnds )
+     // write nodes
+     if ( Abc_NtkHasMapping(pNtk) )
+     {
++        // PHYS-MAP.  Emit "<instance-name> <gia-obj-id>" alongside the netlist so a
++        // placement of it can be joined back to the AIG nodes the mapper reasons
++        // about.  Written from inside this very loop, so the instance numbering
++        // and the skip rules below cannot drift from the netlist's own.
++        FILE * pFileMap = NULL;
++        { char * pEnv = getenv("ABC_PHYSMAP_GATEMAP"); if ( pEnv ) pFileMap = fopen( pEnv, "w" ); }
+         Length  = Mio_LibraryReadGateNameMax((Mio_Library_t *)pNtk->pManFunc);
+         nDigits = Abc_Base10Log( Abc_NtkNodeNum(pNtk) );
+         Counter = 0;
+@@ -637,6 +643,13 @@ void Io_WriteVerilogObjects( FILE * pFile, Abc_Ntk_t * pNtk, int fOnlyAnds )
+             }
+             else
+             {
++                if ( pFileMap )
++                {
++                    extern Vec_Int_t * g_vPhysMapGiaId;
++                    int iGia = ( g_vPhysMapGiaId && (int)Abc_ObjId(pObj) < Vec_IntSize(g_vPhysMapGiaId) )
++                             ? Vec_IntEntry( g_vPhysMapGiaId, Abc_ObjId(pObj) ) : -1;
++                    fprintf( pFileMap, "g%0*d %d\n", nDigits, Counter, iGia );
++                }
+                 fprintf( pFile, "  %-*s g%0*d", Length, Mio_GateReadName(pGate), nDigits, Counter++ );
+                 fprintf( pFile, "(" );
+                 for ( pGatePin = Mio_GateReadPins(pGate), i = 0; pGatePin; pGatePin = Mio_PinReadNext(pGatePin), i++ )
+@@ -656,6 +669,8 @@ void Io_WriteVerilogObjects( FILE * pFile, Abc_Ntk_t * pNtk, int fOnlyAnds )
+                 fprintf( pFile, ");\n" );
+             }
+         }
++        if ( pFileMap )
++            fclose( pFileMap );
+     }
+     else
+     {
+-- 
+2.52.0
+

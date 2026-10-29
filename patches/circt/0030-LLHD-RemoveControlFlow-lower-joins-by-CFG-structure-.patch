@@ -1,0 +1,535 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Fri, 4 Sep 2026 16:25:07 -0700
+Subject: [PATCH 30/37] [LLHD] RemoveControlFlow: lower joins by CFG structure,
+ not per-edge path predicates
+
+A join block's arguments were lowered as mux chains keyed by each incoming
+edge's path predicate (an OR of AND-of-branch-conditions), so a value that
+is identical along every arm of a nested `if` still depended structurally
+on the branch conditions (v&~g | v&g&r | v&g&~r, a tautology in g that
+canonicalize cannot fold). With g depending on that value elsewhere this
+closed combinational loops the RTL does not have: ibex's 135-op
+alu_operand_b -> stall_id -> lsu_req -> alu_op_b_mux_sel SCC, cv64a6's
+miss-unit lock_reqs -> lzc -> FSM loop, store_buffer/wbuffer, icache.
+
+StructuredJoin evaluates the dominator-to-join DAG forward: one mux per
+cond_br on its own condition, arms folded when equal, successors that
+cannot reach the join contribute no arm; drive enables use the same
+structured reach condition. Gates: reproducer SCC 1 -> 0 + Yosys miter;
+ibex SCC 1 -> 0 at every stage, flat core ops 7,071 -> 4,618, registers
+identical, RTL-vs-core BMC from reset depth 6 SUCCESS; cv64a6 on a
+regenerated raw 39 -> 0 SCCs; lit updated (+3 cases).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../LLHD/Transforms/RemoveControlFlow.cpp     | 348 +++++++++++-------
+ .../LLHD/Transforms/remove-control-flow.mlir  |  89 ++++-
+ 2 files changed, 298 insertions(+), 139 deletions(-)
+
+diff --git a/lib/Dialect/LLHD/Transforms/RemoveControlFlow.cpp b/lib/Dialect/LLHD/Transforms/RemoveControlFlow.cpp
+index ad96cb9a2..4904f7c00 100644
+--- a/lib/Dialect/LLHD/Transforms/RemoveControlFlow.cpp
++++ b/lib/Dialect/LLHD/Transforms/RemoveControlFlow.cpp
+@@ -98,58 +98,214 @@ struct Condition {
+     return comb::createOrFoldNot(builder, getValue().getLoc(), getValue());
+   }
+ 
++  bool operator==(const Condition &other) const { return pair == other.pair; }
++
++  /// `sel ? onTrue : onFalse` over conditions, folding every case in which
++  /// one arm is constant or both arms agree, so that a selector whose two
++  /// arms are equal drops out entirely.
++  static Condition select(Condition sel, Condition onTrue, Condition onFalse,
++                          OpBuilder &builder) {
++    if (sel.isTrue())
++      return onTrue;
++    if (sel.isFalse())
++      return onFalse;
++    if (onTrue == onFalse)
++      return onTrue;
++    if (onTrue.isTrue() && onFalse.isFalse())
++      return sel;
++    if (onTrue.isFalse() && onFalse.isTrue())
++      return sel.inverted(builder);
++    if (onTrue.isTrue())
++      return sel.orWith(onFalse, builder);
++    if (onTrue.isFalse())
++      return sel.inverted(builder).andWith(onFalse, builder);
++    if (onFalse.isTrue())
++      return sel.inverted(builder).orWith(onTrue, builder);
++    if (onFalse.isFalse())
++      return sel.andWith(onTrue, builder);
++    auto loc = sel.getValue().getLoc();
++    return builder.createOrFold<comb::MuxOp>(loc, sel.getValue(),
++                                             onTrue.getValue(),
++                                             onFalse.getValue());
++  }
++
+ private:
+   llvm::PointerIntPair<Value, 2> pair;
+ };
+ } // namespace
+ 
+-/// Compute the branch decisions that cause control to flow from the dominator
+-/// to the target block.
++//===----------------------------------------------------------------------===//
++// Structured Evaluation of a Join
++//===----------------------------------------------------------------------===//
++
++/// Both quantities this pass needs at a block -- the values its block
++/// arguments take, and the condition under which control reaches it -- are
++/// functions of the branch decisions taken between a dominator of the block
++/// and the block itself. There are two ways to build them.
+ ///
+-/// TODO: This eagerly aggregates all control flow decisions. It may be more
+-/// efficient to first determine which blocks lie in between dominator and
+-/// target, and then only check that we are not taking decisions that cause
+-/// control flow to *leave* that set of blocks.
+-static Condition getBranchDecisionsFromDominatorToTarget(
+-    OpBuilder &builder, Block *dominator, Block *target,
+-    SmallDenseMap<std::pair<Block *, Block *>, Condition> &decisions) {
+-  if (auto decision = decisions.lookup({dominator, target}))
+-    return decision;
+-
+-  SmallPtrSet<Block *, 8> visitedBlocks;
+-  visitedBlocks.insert(dominator); // stop at the dominator
+-  if (auto &decision = decisions[{dominator, dominator}]; !decision)
+-    decision = Condition(true);
+-
+-  // Traverse the blocks in inverse post order. This ensures that we are
+-  // visiting all of a block's predecessors before we visit the block itself.
+-  // This allows us to first compute the decision leading control flow to each
+-  // of the predecessors, such that the current block can then just combine the
+-  // predecessor decisions.
+-  for (auto *block : llvm::inverse_post_order_ext(target, visitedBlocks)) {
+-    auto merged = Condition(false);
+-    for (auto *pred : block->getPredecessors()) {
+-      auto predDecision = decisions.lookup({dominator, pred});
+-      assert(predDecision);
+-      if (pred->getTerminator()->getNumSuccessors() != 1) {
+-        auto condBr = cast<cf::CondBranchOp>(pred->getTerminator());
+-        if (condBr.getTrueDest() == condBr.getFalseDest()) {
+-          merged = merged.orWith(predDecision, builder);
+-        } else {
+-          auto cond = Condition(condBr.getCondition());
+-          if (condBr.getFalseDest() == block)
+-            cond = cond.inverted(builder);
+-          merged = merged.orWith(cond.andWith(predDecision, builder), builder);
+-        }
+-      } else {
+-        merged = merged.orWith(predDecision, builder);
+-      }
++/// The flat way (what this pass used to do): enumerate the incoming EDGES of
++/// the join, compute each edge's path predicate as an OR over all paths from
++/// the dominator, and chain per-edge muxes: mux(p1, v1, mux(p2, v2, ...)).
++/// Every path predicate mentions every branch condition on the path, so a
++/// value that is the SAME along several edges is rebuilt as a disjunction of
++/// the predicates that select it. For `req = 1; if (g) { if (r) a=..; else
++/// b=..; }` the join after the inner `if` sees `req` arrive along three
++/// edges with the same value, and the result is
++/// `v&~g | v&g&r | v&g&~r`: a tautology in g and r that no local
++/// canonicalization folds (it needs the knowledge that the three predicates
++/// partition the space). `req` then structurally depends on g even though
++/// it functionally does not, and when g is computed from req elsewhere the
++/// design acquires a combinational cycle the RTL never had (CVA6's
++/// store_buffer data_req/data_gnt, icache fetch_req, commit/csr; ibex's
++/// addr_incr_req_o vs lsu_req_i). Yosys, which does structured
++/// if-conversion in `proc_mux`, reports no such loop.
++///
++/// The structured way (this): walk the CFG forward from the dominator as
++/// the nested if/else it was lowered from. A conditional branch is ONE mux on
++/// its own condition whose arms are the values reaching the join through its
++/// two successors; an unconditional branch passes the value of its successor
++/// through; an edge into the join contributes the branch operands. Nested
++/// control flow becomes nested muxes, mux(g, mux(r, v, v), v), and the
++/// equal-arm fold that comb.mux already performs collapses each level whose
++/// arms agree, so the value above depends on nothing but v. A successor that
++/// cannot reach the join at all (control leaves the sub-region) contributes
++/// no arm: the branch is not a decision about the join's arguments, and the
++/// other arm is taken directly. This is also what makes the result minimal
++/// for the common case of a single predecessor whose branch either enters
++/// the block or skips it. Every block on a path from the dominator to the
++/// join is dominated by the dominator and the region is acyclic (checked up
++/// front), so the recursion is a DAG evaluation; results are memoised per
++/// block so shared sub-paths yield shared muxes.
++namespace {
++template <typename T>
++class StructuredJoin {
++public:
++  /// `leaf(operands)` maps an edge into `target` to the quantity being
++  /// evaluated; `absent()` is the quantity (as a `std::optional<T>`) for a
++  /// successor that does not reach `target`, where `std::nullopt` means the
++  /// arm is dropped and the branch passes its other arm through;
++  /// `select(cond, t, f)` combines the two arms of a conditional branch.
++  StructuredJoin(DominanceInfo &domInfo, Block *domBlock, Block *target)
++      : target(target) {
++    // Collect the blocks lying on some path from `domBlock` to `target`
++    // (both included) with a backward walk that stops at `domBlock`.
++    SmallVector<Block *> worklist{target};
++    between.insert(target);
++    while (!worklist.empty()) {
++      auto *block = worklist.pop_back_val();
++      if (block == domBlock)
++        continue;
++      for (auto *pred : block->getPredecessors())
++        if (domInfo.isReachableFromEntry(pred) && between.insert(pred).second)
++          worklist.push_back(pred);
+     }
+-    assert(merged);
+-    decisions.insert({{dominator, block}, merged});
+   }
+ 
+-  return decisions.lookup({dominator, target});
++  template <typename Leaf, typename Absent, typename Select>
++  T evaluate(Block *from, Leaf leaf, Absent absent, Select select) {
++    return evalBlock(from, leaf, absent, select);
++  }
++
++private:
++  template <typename Leaf, typename Absent, typename Select>
++  std::optional<T> evalEdge(Block *succ, ValueRange operands, Leaf &leaf,
++                            Absent &absent, Select &select) {
++    if (succ == target)
++      return leaf(operands);
++    if (!between.contains(succ))
++      return absent();
++    return evalBlock(succ, leaf, absent, select);
++  }
++
++  template <typename Leaf, typename Absent, typename Select>
++  T evalBlock(Block *block, Leaf &leaf, Absent &absent, Select &select) {
++    assert(block != target && between.contains(block));
++    if (auto it = memo.find(block); it != memo.end())
++      return it->second;
++
++    T result;
++    auto *terminator = block->getTerminator();
++    if (auto brOp = dyn_cast<cf::BranchOp>(terminator)) {
++      // The only successor of a block on a path to the target is itself on
++      // that path.
++      auto value = evalEdge(brOp.getDest(), brOp.getDestOperands(), leaf,
++                            absent, select);
++      assert(value && "successor of a block between dominator and target "
++                      "must reach the target");
++      result = std::move(*value);
++    } else {
++      auto condBrOp = cast<cf::CondBranchOp>(terminator);
++      auto onTrue = evalEdge(condBrOp.getTrueDest(),
++                             condBrOp.getTrueDestOperands(), leaf, absent,
++                             select);
++      auto onFalse = evalEdge(condBrOp.getFalseDest(),
++                              condBrOp.getFalseDestOperands(), leaf, absent,
++                              select);
++      assert((onTrue || onFalse) && "block between dominator and target must "
++                                    "reach the target");
++      if (onTrue && onFalse)
++        result = select(condBrOp.getCondition(), *onTrue, *onFalse);
++      else if (onTrue)
++        result = std::move(*onTrue);
++      else
++        result = std::move(*onFalse);
++    }
++    memo[block] = result;
++    return result;
++  }
++
++  Block *target;
++  SmallPtrSet<Block *, 8> between;
++  DenseMap<Block *, T> memo;
++};
++} // namespace
++
++/// Lower the block arguments of `target` to values: the branch operands
++/// arriving along each edge, combined by the branch structure between
++/// `domBlock` (which dominates `target`) and `target`.
++static SmallVector<Value> lowerJoinArguments(OpBuilder &builder,
++                                             DominanceInfo &domInfo,
++                                             Block *domBlock, Block *target) {
++  StructuredJoin<SmallVector<Value>> join(domInfo, domBlock, target);
++  return join.evaluate(
++      domBlock,
++      [](ValueRange operands) { return SmallVector<Value>(operands); },
++      // A successor that never reaches the join contributes no arm: the
++      // arguments' values are irrelevant when control goes that way.
++      []() -> std::optional<SmallVector<Value>> { return std::nullopt; },
++      [&](Value cond, const SmallVector<Value> &onTrue,
++          const SmallVector<Value> &onFalse) {
++        SmallVector<Value> result;
++        result.reserve(onTrue.size());
++        Condition sel(cond);
++        for (auto [t, f] : llvm::zip(onTrue, onFalse)) {
++          if (t == f || sel.isTrue())
++            result.push_back(t);
++          else if (sel.isFalse())
++            result.push_back(f);
++          else
++            result.push_back(
++                builder.createOrFold<comb::MuxOp>(t.getLoc(), cond, t, f));
++        }
++        return result;
++      });
++}
++
++/// Compute the condition under which control flowing out of `domBlock`
++/// (which dominates `target`) reaches `target`, structured by the branches
++/// in between so that a branch both of whose successors reach `target`
++/// contributes nothing.
++static Condition getReachCondition(OpBuilder &builder, DominanceInfo &domInfo,
++                                   Block *domBlock, Block *target) {
++  StructuredJoin<Condition> join(domInfo, domBlock, target);
++  return join.evaluate(
++      domBlock, [](ValueRange) { return Condition(true); },
++      // A successor that never reaches the target is a way of NOT reaching
++      // it: that arm is false, not dropped.
++      []() -> std::optional<Condition> { return Condition(false); },
++      [&](Value cond, Condition onTrue, Condition onFalse) {
++        return Condition::select(Condition(cond), onTrue, onFalse, builder);
++      });
+ }
+ 
+ //===----------------------------------------------------------------------===//
+@@ -456,8 +612,10 @@ void CFRemover::run() {
+ 
+   // Move operations into the entry block, replacing block arguments with
+   // multiplexers as we go. The block order guarantees that we visit a block's
+-  // predecessors before we visit the block itself.
+-  SmallDenseMap<std::pair<Block *, Block *>, Condition> decisionCache;
++  // predecessors before we visit the block itself, so by the time a block is
++  // merged every value its incoming branches carry, and every branch
++  // condition between its dominator and itself, is already defined in the
++  // entry block; only the (still intact) terminators are consulted.
+   auto *entryBlock = sortedBlocks.front();
+   for (auto *block : sortedBlocks) {
+     if (!domInfo.isReachableFromEntry(block))
+@@ -481,105 +639,29 @@ void CFRemover::run() {
+       llvm::dbgs() << "\n";
+     });
+ 
+-    // Convert the block arguments into multiplexers.
+-    SmallVector<Block *, 4> reachablePreds;
+-    for (auto *pred : block->getPredecessors())
+-      if (domInfo.isReachableFromEntry(pred))
+-        reachablePreds.push_back(pred);
+-
+-    llvm::stable_sort(reachablePreds, [&](Block *a, Block *b) {
+-      return a == domBlock && b != domBlock;
+-    });
+-
++    // Convert the block arguments into multiplexers nested by the branch
++    // structure between the dominator and this block (see StructuredJoin).
+     OpBuilder builder(entryBlock->getTerminator());
+-    SmallVector<Value> mergedArgs;
+-    SmallPtrSet<Block *, 4> seenPreds;
+-    for (auto *pred : reachablePreds) {
+-      // A block may be listed multiple times in the predecessors.
+-      if (!seenPreds.insert(pred).second)
+-        continue;
+-
+-      // Only consider values coming from reachable predecessors.
+-      if (!domInfo.isReachableFromEntry(pred))
+-        continue;
+-
+-      // Helper function to create a multiplexer between the current
+-      // `mergedArgs` and a new set of `args`, where the new args are picked if
+-      // `cond` is true and control flows from `domBlock` to `pred`. The
+-      // condition may be null, in which case the mux will directly use the
+-      // branch decisions that lead from `domBlock` to `pred`.
+-      auto mergeArgs = [&](ValueRange args, Condition cond, bool invCond) {
+-        if (mergedArgs.empty()) {
+-          mergedArgs = args;
+-          return;
+-        }
+-        auto decision = getBranchDecisionsFromDominatorToTarget(
+-            builder, domBlock, pred, decisionCache);
+-        if (cond) {
+-          if (invCond)
+-            cond = cond.inverted(builder);
+-          decision = decision.andWith(cond, builder);
+-        }
+-        for (auto [mergedArg, arg] : llvm::zip(mergedArgs, args)) {
+-          if (decision.isTrue())
+-            mergedArg = arg;
+-          else if (decision.isFalse())
+-            continue;
+-          else
+-            mergedArg = builder.createOrFold<comb::MuxOp>(
+-                arg.getLoc(), decision.materialize(builder, arg.getLoc()), arg,
+-                mergedArg);
+-        }
+-      };
+-
+-      // Handle the different terminators that we support.
+-      if (auto condBrOp = dyn_cast<cf::CondBranchOp>(pred->getTerminator())) {
+-        if (condBrOp.getTrueDest() == condBrOp.getFalseDest()) {
+-          // Both destinations lead to the current block. Insert a mux to
+-          // collapse the destination operands and then treat this as an
+-          // unconditional branch to the current block.
+-          LLVM_DEBUG(llvm::dbgs() << "  - Both from " << condBrOp << "\n");
+-          SmallVector<Value> mergedOperands;
+-          mergedOperands.reserve(block->getNumArguments());
+-          for (auto [trueArg, falseArg] :
+-               llvm::zip(condBrOp.getTrueDestOperands(),
+-                         condBrOp.getFalseDestOperands())) {
+-            mergedOperands.push_back(builder.createOrFold<comb::MuxOp>(
+-                trueArg.getLoc(), condBrOp.getCondition(), trueArg, falseArg));
+-          }
+-          mergeArgs(mergedOperands, Value{}, false);
+-        } else if (condBrOp.getTrueDest() == block) {
+-          // The branch leads to the current block if the condition is true.
+-          LLVM_DEBUG(llvm::dbgs() << "  - True from " << condBrOp << "\n");
+-          mergeArgs(condBrOp.getTrueDestOperands(), condBrOp.getCondition(),
+-                    false);
+-        } else {
+-          // The branch leads to the current block if the condition is false.
+-          LLVM_DEBUG(llvm::dbgs() << "  - False from " << condBrOp << "\n");
+-          mergeArgs(condBrOp.getFalseDestOperands(), condBrOp.getCondition(),
+-                    true);
+-        }
+-      } else {
+-        auto brOp = cast<cf::BranchOp>(pred->getTerminator());
+-        LLVM_DEBUG(llvm::dbgs() << "  - From " << brOp << "\n");
+-        mergeArgs(brOp.getDestOperands(), Value{}, false);
+-      }
++    if (block != entryBlock && block->getNumArguments() > 0) {
++      auto mergedArgs = lowerJoinArguments(builder, domInfo, domBlock, block);
++      assert(mergedArgs.size() == block->getNumArguments());
++      for (auto [blockArg, mergedArg] :
++           llvm::zip(block->getArguments(), mergedArgs))
++        blockArg.replaceAllUsesWith(mergedArg);
+     }
+-    for (auto [blockArg, mergedArg] :
+-         llvm::zip(block->getArguments(), mergedArgs))
+-      blockArg.replaceAllUsesWith(mergedArg);
+ 
+     // Fold the path condition from the entry block into the enable of every
+     // drive in this block: the drive used to execute only when control
+     // reached the block, and after the merge it executes always. The
+     // condition values materialize at the entry terminator, which precedes
+     // the spliced ops; the AND itself is built at the drive, after its
+-    // original enable's def.
++    // original enable's def. The condition is built by the same structured
++    // walk as the block arguments, so a branch both of whose arms reach the
++    // block does not appear in the enable.
+     if (block != entryBlock) {
+       SmallVector<DriveOp> drives(block->getOps<DriveOp>());
+       if (!drives.empty()) {
+-        auto decision = getBranchDecisionsFromDominatorToTarget(
+-            builder, entryBlock, block, decisionCache);
++        auto decision = getReachCondition(builder, domInfo, entryBlock, block);
+         if (!decision.isTrue()) {
+           for (auto driveOp : drives) {
+             OpBuilder driveBuilder(driveOp);
+diff --git a/test/Dialect/LLHD/Transforms/remove-control-flow.mlir b/test/Dialect/LLHD/Transforms/remove-control-flow.mlir
+index 5b2ca4d23..bc4f5c3e8 100644
+--- a/test/Dialect/LLHD/Transforms/remove-control-flow.mlir
++++ b/test/Dialect/LLHD/Transforms/remove-control-flow.mlir
+@@ -23,22 +23,99 @@ hw.module @Basic(in %a: i42, in %b: i42, in %c: i1) {
+     // CHECK-NOT: cf.cond_br
+     cf.cond_br %5, ^bb3(%4 : i42), ^bb4(%3 : i42)
+   ^bb3(%6: i42):
+-    // CHECK-NEXT: [[TMP6_COND:%.+]] = comb.and [[TMP0]], [[TMP5]]
+-    // CHECK-NEXT: [[TMP6:%.+]] = comb.mux [[TMP6_COND]], [[TMP4]], [[TMP2]]
++    // The join is lowered by branch structure: bb3 is entered from bb0's
++    // false arm or, via bb2, from bb0's true arm. The bb2 branch (on TMP5)
++    // does not select between the two values because its other arm never
++    // reaches bb3, so it does not appear in the mux.
++    // CHECK-NEXT: [[TMP6:%.+]] = comb.mux [[TMP0]], [[TMP4]], [[TMP2]]
+     // CHECK-NEXT: [[TMP7:%.+]] = comb.xor [[TMP1]], [[TMP6]]
+     %7 = comb.xor %1, %6 : i42
+     // CHECK-NOT: cf.br
+     cf.br ^bb4(%7 : i42)
+   ^bb4(%8: i42):
+-    // CHECK-NEXT: [[TMP8A:%.+]] = hw.constant true
+-    // CHECK-NEXT: [[TMP8B:%.+]] = comb.xor [[TMP5]], [[TMP8A]]
+-    // CHECK-NEXT: [[TMP8C:%.+]] = comb.and [[TMP0]], [[TMP8B]]
+-    // CHECK-NEXT: [[TMP8:%.+]] = comb.mux [[TMP8C]], [[TMP1]], [[TMP7]]
++    // CHECK-NEXT: [[TMP8A:%.+]] = comb.mux [[TMP5]], [[TMP7]], [[TMP1]]
++    // CHECK-NEXT: [[TMP8:%.+]] = comb.mux [[TMP0]], [[TMP8A]], [[TMP7]]
+     // CHECK-NEXT: llhd.yield [[TMP8]]
+     llhd.yield %8 : i42
+   }
+ }
+ 
++// A value assigned before a nested if that only assigns OTHER variables
++// arrives at the join unchanged along every edge under that if. Lowering by
++// per-edge path predicates rebuilt it as v&~g | v&g&r | v&g&~r, which made
++// it structurally depend on g and r (and closed a false combinational loop
++// whenever g was computed from it). Structured lowering yields `v` outright.
++// CHECK-LABEL: @NoDependenceOnBranchesThatDoNotChangeValue
++hw.module @NoDependenceOnBranchesThatDoNotChangeValue(in %v: i1, in %g: i1, in %r: i1, in %q: i2) {
++  // CHECK-NEXT: llhd.combinational
++  llhd.combinational -> i1, i2 {
++    %true = hw.constant true
++    %false = hw.constant false
++    %c1_i2 = hw.constant 1 : i2
++    %c-1_i2 = hw.constant -1 : i2
++    cf.cond_br %v, ^bb1, ^bb4(%false, %q : i1, i2)
++  ^bb1:
++    cf.cond_br %g, ^bb2, ^bb4(%true, %q : i1, i2)
++  ^bb2:
++    cf.cond_br %r, ^bb3(%c1_i2 : i2), ^bb3(%c-1_i2 : i2)
++  ^bb3(%inc: i2):
++    // CHECK: [[INC:%.+]] = comb.mux %r, %c1_i2, %c-1_i2
++    // CHECK-NEXT: [[SUM:%.+]] = comb.add %q, [[INC]]
++    %sum = comb.add %q, %inc : i2
++    cf.br ^bb4(%true, %sum : i1, i2)
++  ^bb4(%req: i1, %cnt: i2):
++    // CHECK-NEXT: [[CNT1:%.+]] = comb.mux %g, [[SUM]], %q
++    // CHECK-NEXT: [[CNT:%.+]] = comb.mux %v, [[CNT1]], %q
++    // CHECK-NEXT: llhd.yield %v, [[CNT]]
++    // CHECK-NOT: comb.and
++    // CHECK-NOT: comb.or
++    llhd.yield %req, %cnt : i1, i2
++  }
++}
++
++// A switch-like chain of conditional branches into one join becomes a
++// priority mux chain on the raw branch conditions, not on accumulated path
++// predicates.
++// CHECK-LABEL: @BranchChainIsPriorityMuxChain
++hw.module @BranchChainIsPriorityMuxChain(in %a: i1, in %b: i1, in %x: i8, in %y: i8, in %z: i8) {
++  // CHECK-NEXT: llhd.combinational
++  llhd.combinational -> i8 {
++    cf.cond_br %a, ^bb2(%x : i8), ^bb1
++  ^bb1:
++    cf.cond_br %b, ^bb2(%y : i8), ^bb2(%z : i8)
++  ^bb2(%0: i8):
++    // CHECK-NEXT: [[T1:%.+]] = comb.mux %b, %y, %z
++    // CHECK-NEXT: [[T0:%.+]] = comb.mux %a, %x, [[T1]]
++    // CHECK-NEXT: llhd.yield [[T0]]
++    llhd.yield %0 : i8
++  }
++}
++
++// The enable folded into a drive is built the same way: a branch both of
++// whose arms lead to the drive's block does not appear in it.
++// CHECK-LABEL: @DriveEnableIgnoresReconvergentBranches
++hw.module @DriveEnableIgnoresReconvergentBranches(in %a: i1, in %b: i1, in %d: i8) {
++  %c0_i8 = hw.constant 0 : i8
++  %sig = llhd.sig %c0_i8 : i8
++  // CHECK: [[T:%.+]] = llhd.constant_time
++  %t = llhd.constant_time <0ns, 0d, 1e>
++  // CHECK-NEXT: llhd.combinational
++  llhd.combinational {
++    cf.cond_br %a, ^bb1, ^bb4
++  ^bb1:
++    cf.cond_br %b, ^bb2, ^bb3
++  ^bb2:
++    cf.br ^bb3
++  ^bb3:
++    // CHECK-NEXT: llhd.drv %sig, %d after [[T]] if %a
++    // CHECK-NEXT: llhd.yield
++    llhd.drv %sig, %d after %t : i8
++    cf.br ^bb4
++  ^bb4:
++    llhd.yield
++  }
++}
++
+ // CHECK-LABEL: @SkipWhenSideEffectsPresent
+ hw.module @SkipWhenSideEffectsPresent() {
+   // CHECK-NEXT: llhd.combinational
+-- 
+2.52.0
+

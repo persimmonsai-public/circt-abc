@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Fri, 28 Aug 2026 20:28:42 -0700
+Subject: [PATCH 02/37] LLHD Deseq: recognise triggers behind a concatenated
+ observed value
+
+Deseq maps a clocked process to a register by finding its triggers among the
+wait's observed values. When any observed value is not i1 it takes a
+'projected clock' path that looks for i1 destination operands which are
+PROJECTIONS (extracts) of an observed value. Two gaps in that path:
+
+1. It drops the directly observed i1 values entirely. An
+   always @(posedge clk or negedge rst_b) whose clock arrives concatenated
+   still observes rst_b plainly, and losing it leaves too few triggers.
+
+2. The observed aggregate may be BUILT FROM the destination operands rather
+   than them being projections of it. OpenC910 gates each FIFO entry with its
+   own clock and the frontend observes them concatenated:
+
+     %3 = comb.concat %clk_out_1, %clk_out_0 : i1, i1
+     llhd.wait yield (...), (%3, %rst_b : i2, i1), ^bb2(%clk_out_0, %rst_b)
+
+   Observing the aggregate means a change to any operand wakes the process, so
+   an operand passed on to the body is as legitimate a trigger as a projection
+   would be.
+
+Both are now handled. On OpenC910 this takes unlowered processes from 190 to
+42 and creates 175 real registers (seq.firreg 4607 -> 4782); combined with the
+LowerProcesses change the design goes from 1441 unlowered processes and 10374
+residual llhd ops to 42 and 903.
+
+ibex is unaffected: its core.mlir, core_deagg.mlir and struct.mlir are all
+byte-identical, and so is the synthesised netlist.
+---
+ lib/Dialect/LLHD/Transforms/Deseq.cpp | 30 +++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/lib/Dialect/LLHD/Transforms/Deseq.cpp b/lib/Dialect/LLHD/Transforms/Deseq.cpp
+index 681b694e5..8d1cde735 100644
+--- a/lib/Dialect/LLHD/Transforms/Deseq.cpp
++++ b/lib/Dialect/LLHD/Transforms/Deseq.cpp
+@@ -444,6 +444,15 @@ bool Deseq::analyzeProcess() {
+     for (auto value : wait.getObserved())
+       triggers.insert(getValueField(value));
+   } else {
++    // A non-i1 observed value does not stop the directly observed i1 values
++    // from being triggers in their own right -- an `always @(posedge clk or
++    // negedge rst_b)` whose clock arrives concatenated still observes rst_b
++    // plainly. Without this the reset is dropped and the process ends up with
++    // too few triggers to lower.
++    for (auto value : wait.getObserved())
++      if (value.getType().isSignlessInteger(1))
++        triggers.insert(getValueField(value));
++
+     // Projected clock case: find i1 dest operands that are projections of
+     // observed values. These become our triggers.
+     for (auto operand : wait.getDestOperands()) {
+@@ -453,6 +462,27 @@ bool Deseq::analyzeProcess() {
+       // Check if this is a projection (fieldID != 0) of an observed value.
+       if (vf.fieldID != 0 && llvm::is_contained(wait.getObserved(), vf.value)) {
+         triggers.insert(vf);
++        continue;
++      }
++      // Mirror of the projection case: the observed value may instead be an
++      // aggregate BUILT FROM this operand rather than the operand being a
++      // projection of it. OpenC910 gates each FIFO entry with its own clock
++      // and the frontend observes them concatenated:
++      //
++      //   %3 = comb.concat %clk_out_1, %clk_out_0 : i1, i1
++      //   llhd.wait yield (...), (%3, %rst_b : i2, i1), ^bb2(%clk_out_0, %rst_b)
++      //
++      // Observing the aggregate means a change to any of its operands wakes
++      // the process, so an operand passed on to the body is as legitimate a
++      // trigger as a projection would be.
++      for (auto observed : wait.getObserved()) {
++        auto *defOp = observed.getDefiningOp();
++        if (!defOp || !isa<comb::ConcatOp, hw::ArrayCreateOp>(defOp))
++          continue;
++        if (llvm::is_contained(defOp->getOperands(), operand)) {
++          triggers.insert(vf);
++          break;
++        }
+       }
+     }
+   }
+-- 
+2.52.0
+

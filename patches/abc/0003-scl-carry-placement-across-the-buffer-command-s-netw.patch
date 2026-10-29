@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Tue, 1 Sep 2026 20:21:17 -0700
+Subject: [PATCH 03/14] scl: carry placement across the buffer command's
+ network dup
+
+Abc_SclBufferingPerform returns a fresh Abc_NtkDupDfs of the buffered
+network; like topo, that dup drops node names, so a loaded placement
+went stale. Scl_PlaceTransfer now rides the pCopy pointers; new
+buffers stay uncoordinated and fall back to the wire-load table in
+subsequent sizing.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ src/map/scl/scl.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/map/scl/scl.c b/src/map/scl/scl.c
+index a43529972..b108933fb 100644
+--- a/src/map/scl/scl.c
++++ b/src/map/scl/scl.c
+@@ -1266,6 +1266,11 @@ int Scl_CommandBuffer( Abc_Frame_t * pAbc, int argc, char ** argv )
+     }
+     // modify the current network
+     pNtkRes = Abc_SclBufferingPerform( pNtk, (SC_Lib *)pAbc->pLibScl, pPars );
++    // carry a loaded placement across the internal DupDfs (node names do
++    // not survive it); new buffers stay uncoordinated and fall back to the
++    // wire-load table in later sizing
++    if ( pNtkRes != NULL )
++        Scl_PlaceTransfer( pNtk, pNtkRes );
+     if ( pNtkRes == NULL )
+     {
+         Abc_Print( -1, "The command has failed.\n" );
+-- 
+2.52.0
+

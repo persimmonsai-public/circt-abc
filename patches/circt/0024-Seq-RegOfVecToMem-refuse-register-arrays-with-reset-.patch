@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Tue, 1 Sep 2026 13:32:31 -0700
+Subject: [PATCH 24/37] [Seq] RegOfVecToMem: refuse register arrays with reset
+ or preset
+
+FirMem carries no reset, so inferring a memory from a register array
+that has one silently DROPS the reset: after a reset RE-assertion the
+RTL reads 0 while the netlist reads stale data. SAT-provable mismatch
+(write -> reset -> read) on the fifo_v3-family mem_q arrays; invisible
+to shallow miters. Arrays without reset/preset still infer.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ lib/Dialect/Seq/Transforms/RegOfVecToMem.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/lib/Dialect/Seq/Transforms/RegOfVecToMem.cpp b/lib/Dialect/Seq/Transforms/RegOfVecToMem.cpp
+index b7c231e58..0d0e9f489 100644
+--- a/lib/Dialect/Seq/Transforms/RegOfVecToMem.cpp
++++ b/lib/Dialect/Seq/Transforms/RegOfVecToMem.cpp
+@@ -89,6 +89,17 @@ bool RegOfVecToMemPass::analyzeMemoryPattern(FirRegOp reg,
+   if (!isArrayType(reg.getType()))
+     return false;
+ 
++  // A register with a reset (or a power-on preset) must NOT become a
++  // seq.firmem: FirMem carries no reset, so the conversion would silently
++  // DROP the array's reset semantics. Concretely: an async-reset register
++  // file reads all-zero after a reset re-assertion in RTL, but the
++  // inferred memory would return whatever was last written -- a real,
++  // SAT-provable mismatch (found via CVA6's fifo_v3 mem_q, which resets
++  // to '0). Leave such arrays as registers; downstream register lowering
++  // handles them correctly.
++  if (reg.getReset() || reg.getPresetAttr())
++    return false;
++
+   ArrayGetOp readAccess;
+   ArrayInjectOp writeAccess;
+   comb::MuxOp writeMux;
+-- 
+2.52.0
+

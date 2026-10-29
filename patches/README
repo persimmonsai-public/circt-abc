@@ -1,0 +1,14 @@
+Patches to other projects. Each is offered under the license of the project
+it modifies, not under circt-abc's own license.
+
+circt/                                   llvm/circt, Apache-2.0 WITH LLVM-exception.
+                                         BASE names the commit; applied by
+                                         scripts/build-circt-from-source.sh.
+circt-createIncrement-i1-writeback-fix.patch
+                                         llvm/circt, Apache-2.0 WITH LLVM-exception.
+                                         Kept for its unapplied hunk; see circt/BASE.
+abc/                                     YosysHQ/abc, the Berkeley ABC license
+                                         (copyright.txt in ABC). BASE names the commit.
+mockturtle-emap.patch                    lsils/mockturtle, MIT. Its first line
+                                         names the commit.
+dreamplace-multirow-legalize.patch       limbo018/DREAMPlace, BSD-3-Clause.

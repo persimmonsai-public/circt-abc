@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Tue, 6 Oct 2026 09:35:49 -0700
+Subject: [PATCH 32/37] [LLHD] Handle packed-union member projections in
+ CombineDrives and Sig2Reg
+
+llhd.sig.struct_extract also projects members of a !hw.union signal; both
+passes type_cast the input to hw::StructType and asserted.
+
+CombineDrives: a union member aliases the whole union (members share bit
+0), so it is not a disjoint field; leave it untraced. Its drives then count
+as unknown uses of the parent, which keeps the parent from being completed
+with default values.
+
+Sig2Reg: a member of a hard packed union adds no bit offset; other union
+layouts (non-zero member offset) are declined.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/Dialect/LLHD/Transforms/CombineDrives.cpp |  8 +++++-
+ lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp   | 25 +++++++++++++++---
+ .../LLHD/Transforms/combine-drives.mlir       | 22 ++++++++++++++++
+ test/Dialect/LLHD/Transforms/sig2reg.mlir     | 26 +++++++++++++++++++
+ 4 files changed, 77 insertions(+), 4 deletions(-)
+
+diff --git a/lib/Dialect/LLHD/Transforms/CombineDrives.cpp b/lib/Dialect/LLHD/Transforms/CombineDrives.cpp
+index 35821d1ff..1d69f6cad 100644
+--- a/lib/Dialect/LLHD/Transforms/CombineDrives.cpp
++++ b/lib/Dialect/LLHD/Transforms/CombineDrives.cpp
+@@ -252,8 +252,14 @@ SignalSlice ModuleContext::traceProjectionImpl(Value value) {
+   }
+ 
+   if (auto op = value.getDefiningOp<SigStructExtractOp>()) {
+-    auto structType = hw::type_cast<hw::StructType>(
++    // A member of a packed union aliases the whole union (every member starts
++    // at bit 0), so it is not a disjoint field of an aggregate. Leave it
++    // untraced: its drives then count as unknown uses of the parent signal,
++    // which keeps the parent from being completed with default values.
++    auto structType = hw::type_dyn_cast<hw::StructType>(
+         cast<RefType>(op.getInput().getType()).getNestedType());
++    if (!structType)
++      return {};
+     auto input = traceProjection(op.getInput());
+     if (!input)
+       return {};
+diff --git a/lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp b/lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp
+index 228f0e3d3..aa7b6f637 100644
+--- a/lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp
++++ b/lib/Dialect/LLHD/Transforms/Sig2RegPass.cpp
+@@ -825,9 +825,28 @@ public:
+                   [&](llhd::SigStructExtractOp structOp) {
+                     if (!offset.isStatic())
+                       return failure();
+-                    auto structTy = hw::type_cast<hw::StructType>(
+-                        cast<llhd::RefType>(structOp.getInput().getType())
+-                            .getNestedType());
++                    auto nested = cast<llhd::RefType>(structOp.getInput().getType())
++                                      .getNestedType();
++                    // A packed-union member as wide as the union (a hard
++                    // packed union: every SV packed union) covers the whole
++                    // union, so it adds no offset. A narrower or offset member
++                    // (placed from the MSB, as ExportVerilog pads it) is
++                    // declined, not guessed.
++                    if (auto unionTy = hw::type_dyn_cast<hw::UnionType>(nested)) {
++                      if (!unionTy.getFieldIndex(structOp.getFieldAttr()))
++                        return failure();
++                      auto field =
++                          unionTy.getFieldInfo(structOp.getFieldAttr().getValue());
++                      if (field.offset != 0 ||
++                          hw::getBitWidth(field.type) != hw::getBitWidth(unionTy))
++                        return failure();
++                      for (auto *user : structOp->getUsers())
++                        stack.emplace_back(user, offset);
++                      return success();
++                    }
++                    auto structTy = hw::type_dyn_cast<hw::StructType>(nested);
++                    if (!structTy)
++                      return failure();
+                     auto index = structTy.getFieldIndex(structOp.getFieldAttr());
+                     if (!index)
+                       return failure();
+diff --git a/test/Dialect/LLHD/Transforms/combine-drives.mlir b/test/Dialect/LLHD/Transforms/combine-drives.mlir
+index ae2145331..78959d116 100644
+--- a/test/Dialect/LLHD/Transforms/combine-drives.mlir
++++ b/test/Dialect/LLHD/Transforms/combine-drives.mlir
+@@ -315,3 +315,25 @@ hw.module @SkipGapsOnUnknownUse(in %u: i42) {
+ }
+ 
+ func.func private @useSigI42(%arg0: !llhd.ref<i42>)
++
++// Drives to members of packed-union array elements: a union member aliases
++// the whole union, so it is left untraced (no crash), the member drives stay,
++// and the parent is not completed with its default value.
++// CHECK-LABEL: @UnionMemberDrives
++hw.module @UnionMemberDrives(in %i0 : !hw.struct<a: i4, b: i4>, in %i1 : i8) {
++  %true = hw.constant true
++  %false = hw.constant false
++  %t = llhd.constant_time <0ns, 0d, 1e>
++  %c0_i16 = hw.constant 0 : i16
++  %init = hw.bitcast %c0_i16 : (i16) -> !hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>
++  %o = llhd.sig %init : !hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>
++  %e0 = llhd.sig.array_get %o[%false] : <!hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>>
++  %x = llhd.sig.struct_extract %e0["x"] : <!hw.union<x: !hw.struct<a: i4, b: i4>, y: i8>>
++  // CHECK: llhd.drv {{%.+}}, %i0
++  llhd.drv %x, %i0 after %t : !hw.struct<a: i4, b: i4>
++  %e1 = llhd.sig.array_get %o[%true] : <!hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>>
++  %y = llhd.sig.struct_extract %e1["y"] : <!hw.union<x: !hw.struct<a: i4, b: i4>, y: i8>>
++  // CHECK: llhd.drv {{%.+}}, %i1
++  llhd.drv %y, %i1 after %t : i8
++  hw.output
++}
+diff --git a/test/Dialect/LLHD/Transforms/sig2reg.mlir b/test/Dialect/LLHD/Transforms/sig2reg.mlir
+index fb9cecf94..983a3434f 100644
+--- a/test/Dialect/LLHD/Transforms/sig2reg.mlir
++++ b/test/Dialect/LLHD/Transforms/sig2reg.mlir
+@@ -180,3 +180,29 @@ hw.module @RemoveDriveOnlySignals(in %d: i42, in %e: i1) {
+   llhd.drv %b, %d after %1 if %e : i42
+   // CHECK: hw.output
+ }
++
++// Packed-union members start at the union's bit 0: drives to members of two
++// array elements are promoted with element 0 in the low bits.
++// CHECK-LABEL: @UnionMembersPromoted
++// CHECK-NOT: llhd.sig
++// CHECK: [[X:%.+]] = hw.bitcast %i0 : (!hw.struct<a: i4, b: i4>) -> i8
++// CHECK: comb.concat %c0_i8, [[X]] : i8, i8
++// CHECK: [[C8:%.+]] = hw.constant 8 : i16
++// CHECK: [[Y:%.+]] = comb.concat %c0_i8, %i1 : i8, i8
++// CHECK: comb.shl [[Y]], [[C8]] : i16
++hw.module @UnionMembersPromoted(in %i0 : !hw.struct<a: i4, b: i4>, in %i1 : i8, out o : !hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>) {
++  %true = hw.constant true
++  %false = hw.constant false
++  %t = llhd.constant_time <0ns, 0d, 1e>
++  %c0_i16 = hw.constant 0 : i16
++  %init = hw.bitcast %c0_i16 : (i16) -> !hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>
++  %o = llhd.sig %init : !hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>
++  %e0 = llhd.sig.array_get %o[%false] : <!hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>>
++  %x = llhd.sig.struct_extract %e0["x"] : <!hw.union<x: !hw.struct<a: i4, b: i4>, y: i8>>
++  llhd.drv %x, %i0 after %t : !hw.struct<a: i4, b: i4>
++  %e1 = llhd.sig.array_get %o[%true] : <!hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>>
++  %y = llhd.sig.struct_extract %e1["y"] : <!hw.union<x: !hw.struct<a: i4, b: i4>, y: i8>>
++  llhd.drv %y, %i1 after %t : i8
++  %p = llhd.prb %o : !hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>
++  hw.output %p : !hw.array<2xunion<x: !hw.struct<a: i4, b: i4>, y: i8>>
++}
+-- 
+2.52.0
+

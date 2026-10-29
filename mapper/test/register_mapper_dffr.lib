@@ -1,0 +1,15 @@
+/* Hermetic liberty for register-mapper tests: one async-clear flop. */
+library(dffr_cells) {
+  cell(TDFFR) {
+    area : 0.25 ;
+    ff(IQ, IQN) {
+      clocked_on : "CK" ;
+      next_state : "D" ;
+      clear : "R" ;
+    }
+    pin(CK) { direction : input ; clock : true ; }
+    pin(D) { direction : input ; nextstate_type : data ; }
+    pin(R) { direction : input ; }
+    pin(Q) { direction : output ; function : "IQ" ; }
+  }
+}

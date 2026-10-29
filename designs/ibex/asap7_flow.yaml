@@ -1,0 +1,19 @@
+# ibex_top on ASAP7, through the whole flow and (with --pnr) stock ORFS.
+# Clock, I/O latency and P&R settings follow ORFS's own asap7/ibex design,
+# so a run is comparable with ORFS's default Yosys/ABC synthesis.
+design:
+  top_module: ibex_top
+  clock_period_ps: 1000
+  manifest: manifest.yaml
+pdk:
+  profile: ../../profiles/asap7.yaml
+pnr:
+  platform: asap7
+  clock_port: clk_i
+  clock_latency: 161.775
+  utilization: 40
+  set:
+    CORE_MARGIN: 2
+    PLACE_DENSITY_LB_ADDON: 0.20
+    ENABLE_DPO: 0
+    TNS_END_PERCENT: 100

@@ -1,0 +1,80 @@
+/* Hermetic liberty for map-shell-logic tests. NOR2 + INV (0.03 + 0.02) is
+   cheaper per cell than OR2 (0.04) but costlier and one level deeper as a
+   pair: the lookup must price the inverter of an inverted match. */
+library(shell_cells) {
+  cell(TINV) {
+    area : 0.02 ;
+    pin(A) {
+      direction : input ;
+    }
+    pin(Y) {
+      direction : output ;
+      function : "(!A)" ;
+    }
+  }
+  cell(TNOR2) {
+    area : 0.03 ;
+    pin(A) {
+      direction : input ;
+    }
+    pin(B) {
+      direction : input ;
+    }
+    pin(Y) {
+      direction : output ;
+      function : "(!(A|B))" ;
+    }
+  }
+  cell(TOR2) {
+    area : 0.04 ;
+    pin(A) {
+      direction : input ;
+    }
+    pin(B) {
+      direction : input ;
+    }
+    pin(Y) {
+      direction : output ;
+      function : "(A|B)" ;
+    }
+  }
+  cell(TNAND2) {
+    area : 0.03 ;
+    pin(A) {
+      direction : input ;
+    }
+    pin(B) {
+      direction : input ;
+    }
+    pin(Y) {
+      direction : output ;
+      function : "(!(A&B))" ;
+    }
+  }
+  cell(TAND2) {
+    area : 0.04 ;
+    pin(A) {
+      direction : input ;
+    }
+    pin(B) {
+      direction : input ;
+    }
+    pin(Y) {
+      direction : output ;
+      function : "(A&B)" ;
+    }
+  }
+  cell(TXNOR2) {
+    area : 0.05 ;
+    pin(A) {
+      direction : input ;
+    }
+    pin(B) {
+      direction : input ;
+    }
+    pin(Y) {
+      direction : output ;
+      function : "(!(A^B))" ;
+    }
+  }
+}

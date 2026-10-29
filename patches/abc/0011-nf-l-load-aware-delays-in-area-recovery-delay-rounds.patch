@@ -1,0 +1,238 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Wed, 2 Sep 2026 15:33:44 -0700
+Subject: [PATCH 11/14] &nf -l: load-aware delays in area recovery; delay
+ rounds under updated loads (-Y)
+
+Two defects behind the doubled depth of every load-aware mapping:
+
+1. Only the delay round used the load-aware pin delay; the five area-
+   recovery sites (Nf_ManSetMapRefsGate, Nf_MatchRef_rec, Nf_ManElaBest-
+   MatchOne, Nf_ManComputeArrival, Nf_ManUpdateStats) still used the raw
+   genlib pin delay, so required-time checks during area recovery saw
+   a fraction of the real per-stage delay and filled paths with cheap deep chains. All go
+   through Nf_CellPinDelay now (Nf_ManComputeArrival takes the root id).
+
+2. The round-0 loads are a flow estimate; the loads of the mapping it
+   produces differ, the mapping's arrivals then violate the required
+   times ("Critical delay violation") and MapDelay relaxes
+   to the violated value, giving area recovery far more slack than
+   intended. New -Y <n>
+   (default 2): re-run delay-oriented rounds under the previous mapping's
+   loads, then freeze the loads for the area rounds (fFreezeLoads); the
+   exact-area rounds keep their (Iter - nRounds) indexing.
+
+On a cv64a6 group the load-aware mapping went from nearly twice stock's
+logic depth to within about 10% of it at the same area (-Y 2 -P 25).
+Stock path byte-identical.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/aig/gia/gia.h   |  1 +
+ src/aig/gia/giaNf.c | 56 +++++++++++++++++++++++++++++++--------------
+ src/base/abci/abc.c | 14 +++++++++++-
+ 3 files changed, 53 insertions(+), 18 deletions(-)
+
+diff --git a/src/aig/gia/gia.h b/src/aig/gia/gia.h
+index 467467ec8..2dd21f07b 100644
+--- a/src/aig/gia/gia.h
++++ b/src/aig/gia/gia.h
+@@ -373,6 +373,7 @@ struct Jf_Par_t_
+     int            fUseLoads;      // load-aware delays: PD + LD*load per pin (PHYS-ABC P6)
+     float          MaxLoadF;       // load clamp (fF) for load-aware delays; high-fanout nets get buffered later
+     float          StagePenaltyPs; // per-stage delay added under -l: the wire RC + slew degradation every extra level costs post-route
++    int            nLoadRounds;    // under -l: extra delay-oriented rounds re-run with the loads of the previous mapping, after which loads are frozen for area recovery
+     int            fVerbose;
+     int            fVeryVerbose;
+     int            nLutSizeMax;
+diff --git a/src/aig/gia/giaNf.c b/src/aig/gia/giaNf.c
+index 0ae12b9db..5f2d2a49d 100644
+--- a/src/aig/gia/giaNf.c
++++ b/src/aig/gia/giaNf.c
+@@ -108,6 +108,7 @@ struct Nf_Man_t_
+     Vec_Int_t       vCutDelays;     // temporary cut delay
+     Vec_Int_t       vBackup;        // backup literals
+     Vec_Flt_t       vLoads;         // per-node output load estimate (fF), load-aware mode (PHYS-ABC P6)
++    int             fFreezeLoads;   // load-aware mode: keep vLoads fixed (area-recovery rounds)
+     Vec_Flt_t *     vWireCaps;      // wire cap by fanout count (fF), from the SC_Lib wire_load model
+     float           AvgCapF;        // average input pin cap of the library cells (fF)
+     int             StagePenaltyI;  // per-stage penalty (SCL_NUM-scaled ps), from pPars->StagePenaltyPs
+@@ -1478,7 +1479,7 @@ void Nf_ManComputeLoads( Nf_Man_t * p )
+ {
+     Gia_Obj_t * pObj; int i, c, k, iVar, fCompl, nUsed = 0;
+     Vec_Int_t * vFans;
+-    if ( !p->pPars->fUseLoads )
++    if ( !p->pPars->fUseLoads || p->fFreezeLoads )
+         return;
+     vFans = Vec_IntStart( Gia_ManObjNum(p->pGia) );
+     Vec_FltFill( &p->vLoads, Gia_ManObjNum(p->pGia), 0 );
+@@ -1669,7 +1670,7 @@ void Nf_ManSetMapRefsGate( Nf_Man_t * p, int iObj, int Required, Nf_Mat_t * pM )
+     Nf_CutForEachVarCompl( pCut, pM->Cfg, iVar, fCompl, k )
+     {
+         Nf_ObjMapRefInc( p, iVar, fCompl );
+-        Nf_ObjUpdateRequired( p, iVar, fCompl, Required - pCell->iDelays[k] );
++        Nf_ObjUpdateRequired( p, iVar, fCompl, Required - Nf_CellPinDelay(p, pCell, k, iObj) );
+     }
+     assert( Nf_CutSize(pCut) == (int)pCell->nFanins );
+     // update global stats
+@@ -1944,7 +1945,7 @@ word Nf_MatchRef_rec( Nf_Man_t * p, int i, int c, Nf_Mat_t * pM, int Required, V
+     pCut = Nf_CutFromHandle( Nf_ObjCutSet(p, i), pM->CutH );
+     Nf_CutForEachVarCompl( pCut, pM->Cfg, iVar, fCompl, k )
+     {
+-        ReqFanin = Required - Nf_ManCell(p, pM->Gate)->iDelays[k];
++        ReqFanin = Required - Nf_CellPinDelay(p, Nf_ManCell(p, pM->Gate), k, i);
+         if ( vBackup )
+             Vec_IntPush( vBackup, Abc_Var2Lit(iVar, fCompl) );
+         assert( Nf_ObjMapRefNum(p, iVar, fCompl) >= 0 );
+@@ -2013,7 +2014,7 @@ void Nf_ManElaBestMatchOne( Nf_Man_t * p, int iObj, int c, int * pCut, int * pCu
+         {
+             pMd     = &pBestF[iFanin]->M[fComplF][0];
+             assert( pMd->fBest );
+-            Delay = Abc_MaxInt( Delay, pMd->D + pC->iDelays[k] );
++            Delay = Abc_MaxInt( Delay, pMd->D + Nf_CellPinDelay(p, pC, k, iObj) );
+             if ( Delay > Required )
+                 break;
+         }
+@@ -2047,9 +2048,9 @@ void Nf_ManElaBestMatch( Nf_Man_t * p, int iObj, int c, Nf_Mat_t * pRes, int Req
+         Nf_ManElaBestMatchOne( p, iObj, c, pCut, pCutSet, pRes, Required );
+     }
+ }
+-int Nf_ManComputeArrival( Nf_Man_t * p, Nf_Mat_t * pM, int * pCutSet )
++int Nf_ManComputeArrival( Nf_Man_t * p, Nf_Mat_t * pM, int * pCutSet, int iObj )
+ {
+-    int Delay = 0; 
++    int Delay = 0;
+     Nf_Mat_t * pMfan;
+     int iVar, fCompl, k;
+     Mio_Cell2_t * pCell = Nf_ManCell( p, pM->Gate );
+@@ -2058,7 +2059,7 @@ int Nf_ManComputeArrival( Nf_Man_t * p, Nf_Mat_t * pM, int * pCutSet )
+     Nf_CutForEachVarCompl( pCut, pM->Cfg, iVar, fCompl, k )
+     {
+         pMfan = Nf_ObjMatchBest( p, iVar, fCompl );
+-        Delay = Abc_MaxInt( Delay, pMfan->D + pCell->iDelays[k] );
++        Delay = Abc_MaxInt( Delay, pMfan->D + Nf_CellPinDelay(p, pCell, k, iObj) );
+     }
+     //if ( pM->fCompl ) Delay += p->InvDelayI;
+     return Delay;
+@@ -2139,7 +2140,7 @@ void Nf_ManResetMatches( Nf_Man_t * p, int Round )
+         {
+             for ( c = 0; c < 2; c++ )
+             {
+-                Arrival = Nf_ManComputeArrival( p, pM[c], Nf_ObjCutSet(p, i) );
++                Arrival = Nf_ManComputeArrival( p, pM[c], Nf_ObjCutSet(p, i), i );
+                 //if ( Nf_ObjMapRefNum(p, i, c) )
+                 //    assert( Round || Arrival <= pM[c]->D );
+                 pM[c]->D = Arrival;
+@@ -2151,7 +2152,7 @@ void Nf_ManResetMatches( Nf_Man_t * p, int Round )
+             c = !pM[1]->fCompl;
+             assert( !pM[c]->fCompl );
+             assert( pM[!c]->fCompl );
+-            Arrival = Nf_ManComputeArrival( p, pM[c], Nf_ObjCutSet(p, i) );
++            Arrival = Nf_ManComputeArrival( p, pM[c], Nf_ObjCutSet(p, i), i );
+             //if ( Nf_ObjMapRefNum(p, i, c) )
+             //    assert( Round || Arrival <= pM[c]->D );
+             pM[c]->D = Arrival;
+@@ -2246,13 +2247,13 @@ void Nf_ManComputeMappingEla( Nf_Man_t * p )
+             Nf_CutForEachVarCompl( pCut, pMb->Cfg, iVar, fCompl, k )
+             {
+                 pM = Nf_ObjMatchBest( p, iVar, fCompl );
+-                assert( pM->D <= Required - pCell->iDelays[k] );
+-                Nf_ObjUpdateRequired( p, iVar, fCompl, Required - pCell->iDelays[k] );
++                assert( pM->D <= Required - Nf_CellPinDelay(p, pCell, k, i) );
++                Nf_ObjUpdateRequired( p, iVar, fCompl, Required - Nf_CellPinDelay(p, pCell, k, i) );
+                 if ( pM->fCompl )
+                 {
+                     pM = Nf_ObjMatchBest( p, iVar, !fCompl );
+-                    assert( pM->D <= Required - pCell->iDelays[k] - p->InvDelayI );
+-                    Nf_ObjUpdateRequired( p, iVar, !fCompl, Required - pCell->iDelays[k] - p->InvDelayI );
++                    assert( pM->D <= Required - Nf_CellPinDelay(p, pCell, k, i) - p->InvDelayI );
++                    Nf_ObjUpdateRequired( p, iVar, !fCompl, Required - Nf_CellPinDelay(p, pCell, k, i) - p->InvDelayI );
+                 }
+             }
+         }
+@@ -2846,6 +2847,7 @@ void Nf_ManSetDefaultPars( Jf_Par_t * pPars )
+     pPars->MapDelayTarget = 0;
+     pPars->MaxLoadF     = 30.0;
+     pPars->StagePenaltyPs = 0.0;
++    pPars->nLoadRounds  =  2;
+ }
+ Gia_Man_t * Nf_ManPerformMappingInt( Gia_Man_t * pGia, Jf_Par_t * pPars )
+ {
+@@ -2889,11 +2891,31 @@ Gia_Man_t * Nf_ManPerformMappingInt( Gia_Man_t * pGia, Jf_Par_t * pPars )
+ //            Nf_ObjPrepareCi( p, Id, Scl_Flt2Int(p->pGia->vInArrs ? Abc_MaxFloat(0.0, Vec_FltEntry(p->pGia->vInArrs, i)) : 0.0) );
+             Nf_ObjPrepareCi( p, Id, Scl_Flt2Int(p->pGia->vInArrs ? Vec_FltEntry(p->pGia->vInArrs, i) : 0.0) );
+     }
+-    for ( p->Iter = 0; p->Iter < p->pPars->nRounds; p->Iter++ )
+     {
+-        Nf_ManComputeMapping( p );
+-        Nf_ManSetMapRefs( p );
+-        Nf_ManPrintStats( p, (char *)(p->Iter ? "Area " : "Delay") );
++        // Load-aware mode: the round-0 loads are a flow estimate; the loads
++        // of the mapping that round produces are different, so the mapping's
++        // arrivals violate the required times computed for it and the mapper
++        // relaxes MapDelay to the violated value -- area recovery then fills
++        // every path with cheap deep chains (nearly doubling the depth). Instead,
++        // re-run delay-oriented rounds under the previous mapping's loads
++        // (nLoadRounds of them), then freeze the loads for area recovery.
++        int nLoadRounds = p->pPars->fUseLoads ? p->pPars->nLoadRounds : 0;
++        for ( p->Iter = 0; p->Iter < p->pPars->nRounds + nLoadRounds; p->Iter++ )
++        {
++            int fDelayRound = p->Iter <= nLoadRounds;
++            if ( p->pPars->fUseLoads && p->Iter > 0 && fDelayRound )
++            {
++                Vec_IntFill( &p->vRequired, Vec_IntSize(&p->vRequired), SCL_INFINITY );
++                p->pPars->MapDelay = 0;
++            }
++            if ( p->pPars->fUseLoads && p->Iter > nLoadRounds )
++                p->fFreezeLoads = 1;
++            Nf_ManComputeMapping( p );
++            Nf_ManSetMapRefs( p );
++            Nf_ManPrintStats( p, (char *)(fDelayRound ? "Delay" : "Area ") );
++        }
++        // the exact-area rounds index themselves by (Iter - nRounds)
++        p->Iter = p->pPars->nRounds;
+     }
+ 
+     p->fUseEla = 1;
+diff --git a/src/base/abci/abc.c b/src/base/abci/abc.c
+index 538c05775..be1009803 100644
+--- a/src/base/abci/abc.c
++++ b/src/base/abci/abc.c
+@@ -46887,7 +46887,7 @@ int Abc_CommandAbc9Nf( Abc_Frame_t * pAbc, int argc, char ** argv )
+     Gia_Man_t * pNew; int c;
+     Nf_ManSetDefaultPars( pPars );
+     Extra_UtilGetoptReset();
+-    while ( ( c = Extra_UtilGetopt( argc, argv, "KCFARLEDQMWZXPakpqflvwh" ) ) != EOF )
++    while ( ( c = Extra_UtilGetopt( argc, argv, "KCFARLEDQMWZXPYakpqflvwh" ) ) != EOF )
+     {
+         switch ( c )
+         {
+@@ -47048,6 +47048,17 @@ int Abc_CommandAbc9Nf( Abc_Frame_t * pAbc, int argc, char ** argv )
+             pPars->StagePenaltyPs = (float)atof(argv[globalUtilOptind]);
+             globalUtilOptind++;
+             break;
++        case 'Y':
++            if ( globalUtilOptind >= argc )
++            {
++                Abc_Print( -1, "Command line switch \"-Y\" should be followed by an integer.\n" );
++                goto usage;
++            }
++            pPars->nLoadRounds = atoi(argv[globalUtilOptind]);
++            globalUtilOptind++;
++            if ( pPars->nLoadRounds < 0 )
++                goto usage;
++            break;
+         case 'X':
+             if ( globalUtilOptind >= argc )
+             {
+@@ -47122,6 +47133,7 @@ usage:
+     Abc_Print( -2, "\t-l       : toggles load-aware delays PD + LD*load per pin (needs read_lib -l) [default = %s]\n", pPars->fUseLoads? "yes": "no" );
+     Abc_Print( -2, "\t-X num   : load clamp in fF for load-aware delays (0 = none) [default = %.1f]\n", pPars->MaxLoadF );
+     Abc_Print( -2, "\t-P num   : per-stage delay penalty in ps for load-aware delays (wire RC + slew per level) [default = %.1f]\n", pPars->StagePenaltyPs );
++    Abc_Print( -2, "\t-Y num   : extra delay rounds under the previous mapping's loads before loads are frozen for area recovery (-l) [default = %d]\n", pPars->nLoadRounds );
+     Abc_Print( -2, "\t-v       : toggles verbose output [default = %s]\n",                                   pPars->fVerbose? "yes": "no" );
+     Abc_Print( -2, "\t-w       : toggles very verbose output [default = %s]\n",                              pPars->fVeryVerbose? "yes": "no" );
+     Abc_Print( -2, "\t-h       : prints the command usage\n");
+-- 
+2.52.0
+

@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eugene Feinberg <uge@persimmons.ai>
+Date: Sat, 29 Aug 2026 14:30:40 -0700
+Subject: [PATCH 10/37] LLHD UnrollLoops: also unroll inside llhd.process, not
+ just llhd.combinational
+
+The pass only ever visited CombinationalOp, so a `for` loop in a CLOCKED
+process stayed folded. That has a real downstream cost rather than being
+merely a missed optimisation: Deseq cannot see through the loop to the
+drive's enable, so the enable stays an opaque unknown that appears as a
+common factor on EVERY term of the value table -- including the reset term,
+which matchDriveClockAndReset has no enable variant for (the clock has
+clockWithEnable; the reset has no counterpart). The drive is rejected as
+'unknown reset scheme', the process survives to LowerProcesses, and under
+assume-complete-sensitivity it was then lowered as combinational and its
+state destroyed (see e4713e808).
+
+So this fixes the cause rather than loosening the reset matcher, which would
+have meant accepting an enable on an ASYNC RESET path -- a stronger reset
+than the RTL asks for, and the last place to guess.
+
+The process's own wait-loop is not at risk: its back edge is an llhd.wait,
+not a cf.br, so it never presents the unique-latch constant-trip-count shape
+unrollLoops requires and is skipped like any other unanalyzable loop.
+
+Ordering matters and is not optional: --llhd-unroll-loops must run BEFORE
+--llhd-deseq to have this effect. With the old order (deseq first) OpenC910
+is unchanged at 4,782 registers / 38 residual llhd ops.
+
+OpenC910, unroll-before-deseq:
+  registers            4,782 -> 4,787   (5 recovered, previously destroyed)
+  residual llhd ops       38 -> 11
+  modules holding llhd     3 -> 1       (ct_ebiu_write_channel, whose loop
+                                         still does not unroll)
+CVA6 cv32a60x: 263 -> 264 registers, 389 -> 383 llhd ops, 21 -> 20 modules.
+
+ibex unaffected: core.mlir, core_deagg.mlir, struct.mlir byte-identical,
+netlist unchanged. Its own lowering script runs deseq before unroll, so the new
+ordering does not reach it.
+---
+ lib/Dialect/LLHD/Transforms/UnrollLoops.cpp | 33 +++++++++++++++------
+ 1 file changed, 24 insertions(+), 9 deletions(-)
+
+diff --git a/lib/Dialect/LLHD/Transforms/UnrollLoops.cpp b/lib/Dialect/LLHD/Transforms/UnrollLoops.cpp
+index 1af3f5691..94e951bfc 100644
+--- a/lib/Dialect/LLHD/Transforms/UnrollLoops.cpp
++++ b/lib/Dialect/LLHD/Transforms/UnrollLoops.cpp
+@@ -421,34 +421,49 @@ namespace {
+ struct UnrollLoopsPass
+     : public llhd::impl::UnrollLoopsPassBase<UnrollLoopsPass> {
+   void runOnOperation() override;
+-  void runOnOperation(CombinationalOp op);
+-  bool unrollLoops(CombinationalOp op);
++  void runOnOperation(Operation *op, Region &body);
++  bool unrollLoops(Operation *op, Region &body);
+ };
+ } // namespace
+ 
+ void UnrollLoopsPass::runOnOperation() {
+   for (auto op : getOperation().getOps<CombinationalOp>())
+-    runOnOperation(op);
++    runOnOperation(op, op.getBody());
++
++  // Also unroll inside `llhd.process`. A `for` loop in a CLOCKED process is
++  // otherwise left folded, and that has a real downstream cost: `Deseq`
++  // cannot see through the loop to the drive's enable, so the enable stays an
++  // opaque unknown that appears as a common factor on every term of the value
++  // table -- including the reset term, which `matchDriveClockAndReset` has no
++  // enable variant for. The drive is then rejected as an "unknown reset
++  // scheme" and the process survives to `LowerProcesses`.
++  //
++  // The process's own wait-loop is not at risk here: its back edge is an
++  // `llhd.wait`, not a `cf.br`, so it never presents the unique-latch,
++  // constant-trip-count shape `unrollLoops` requires, and is skipped like any
++  // other unanalyzable loop.
++  for (auto op : getOperation().getOps<ProcessOp>())
++    runOnOperation(op, op.getBody());
+ }
+ 
+-void UnrollLoopsPass::runOnOperation(CombinationalOp op) {
++void UnrollLoopsPass::runOnOperation(Operation *op, Region &body) {
+   // Unrolling a loop may open up opportunities to unroll its nested loops.
+   // Iterate until all possible loops are unrolled or the limit is reached.
+   for (unsigned i = 0; i < 16; ++i)
+-    if (!unrollLoops(op))
++    if (!unrollLoops(op, body))
+       break;
+ }
+ 
+-bool UnrollLoopsPass::unrollLoops(CombinationalOp op) {
++bool UnrollLoopsPass::unrollLoops(Operation *op, Region &body) {
+   // There's nothing to do if we only have a single block. MLIR even refuses to
+   // compute a dominator tree in that case.
+-  if (op.getBody().hasOneBlock())
++  if (body.hasOneBlock())
+     return false;
+ 
+   // Find the loops.
+-  LLVM_DEBUG(llvm::dbgs() << "Unrolling loops in " << op.getLoc() << "\n");
++  LLVM_DEBUG(llvm::dbgs() << "Unrolling loops in " << op->getLoc() << "\n");
+   DominanceInfo domInfo(op);
+-  CFGLoopInfo cfgLoopInfo(domInfo.getDomTree(&op.getBody()));
++  CFGLoopInfo cfgLoopInfo(domInfo.getDomTree(&body));
+ 
+   // We only support simple loops where there is a single back-edge to the
+   // header, and the latch block has a back-edge to a single header. Create a
+-- 
+2.52.0
+

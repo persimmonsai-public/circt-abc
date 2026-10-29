@@ -1,0 +1,32 @@
+/* Hermetic liberty for clock-gate-inference tests: one validated
+   posedge-precontrol integrated clock-gating cell, shaped like a real
+   library's ICG entry (pin_name_map + clock_gating_integrated_cell are what
+   LibertyLibrary's buildICGPattern keys on). No PDK data. */
+library(icg_cells) {
+  cell(TICG) {
+    pin_name_map(CK, E, SE, ECK);
+    area : 0.10 ;
+    clock_gating_integrated_cell : "latch_posedge_precontrol" ;
+    pin(CK) {
+      clock_gate_clock_pin : true ;
+      direction : input ;
+    }
+    pin(E) {
+      clock_gate_enable_pin : true ;
+      direction : input ;
+    }
+    pin(SE) {
+      clock_gate_test_pin : true ;
+      direction : input ;
+    }
+    pin(ECK) {
+      clock_gate_out_pin : true ;
+      direction : output ;
+      state_function : "(CK&ENL)" ;
+    }
+    pin(ENL) {
+      direction : internal ;
+      internal_node : ENL ;
+    }
+  }
+}
