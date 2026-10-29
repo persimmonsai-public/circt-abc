@@ -947,7 +947,10 @@ def opensta_compat_netlist(cfg: FlowConfig) -> Path | None:
 
 def orfs_pnr(cfg: FlowConfig) -> Path:
     """Run circt_flow.orfs_pnr on the OpenSTA-compatible netlist, configured
-    by the flow.yaml's `pnr:` section. Returns <out>/pnr/pnr_metrics.json."""
+    by the flow.yaml's `pnr:` section, on the tech pack's own ORFS platform
+    if it has one (`pnr.orfs_platform_dir`), or hand the netlist to the
+    pack's own P&R command (`pnr.command`, pack_pnr below). Returns
+    <out>/pnr/pnr_metrics.json."""
     from . import orfs_pnr as pnr_mod
 
     p = cfg.design.pnr
@@ -959,6 +962,8 @@ def orfs_pnr(cfg: FlowConfig) -> Path:
         raise FileNotFoundError(
             f"{cfg.openroad_netlist} was not produced (the sv2v step needs "
             "its docker image); ORFS reads that netlist, not the raw one")
+    if "command" in cfg.design.pack_pnr:
+        return pack_pnr(cfg)
     argv = [str(cfg.openroad_netlist), str(cfg.pnr_dir),
             "--top", cfg.design.top_module,
             "--platform", str(p.get("platform", "asap7")),
@@ -975,8 +980,62 @@ def orfs_pnr(cfg: FlowConfig) -> Path:
     if cfg.design.tie:
         argv += ["--tie-hi", cfg.design.tie["hi"],
                  "--tie-lo", cfg.design.tie["lo"]]
+    if "orfs_platform_dir" in cfg.design.pack_pnr:
+        argv += ["--platform-dir", str(cfg.design.pack_pnr["orfs_platform_dir"])]
     print(f"[circt_flow] ORFS P&R -> {cfg.pnr_dir}")
     rc = pnr_mod.main(argv)
     if rc != 0:
         raise subprocess.CalledProcessError(rc, ["orfs_pnr", *argv])
     return cfg.pnr_dir / "pnr_metrics.json"
+
+
+def pack_pnr(cfg: FlowConfig) -> Path:
+    """A tech pack's own P&R (`pnr.command`, doc/techpacks.md). The command
+    runs from the pack directory with
+
+        --netlist <pnr>/<top>.v --sdc <pnr>/constraint.sdc --top <top>
+        --out <pnr> --pack <pack dir>
+
+    appended. The netlist is the OpenSTA-compatible one with the profile's
+    tie cells on its constants; the SDC is the one the ORFS stage writes.
+    The command must write <out>/pnr_metrics.json with orfs_pnr.METRICS'
+    keys (any subset); the flow adds `status`."""
+    import json
+
+    from . import orfs_pnr as pnr_mod
+
+    p, out, top = cfg.design.pnr, cfg.pnr_dir.resolve(), cfg.design.top_module
+    out.mkdir(parents=True, exist_ok=True)
+    netlist, sdc = out / f"{top}.v", out / "constraint.sdc"
+    text = cfg.openroad_netlist.read_text()
+    if cfg.design.tie:
+        hi, lo = (tuple(cfg.design.tie[k].split(":", 1)) for k in ("hi", "lo"))
+        text, n = pnr_mod.tie_constants(text, hi, lo)
+        print(f"[circt_flow] {n} constant(s) tied with {hi[0]}/{lo[0]}")
+    netlist.write_text(text)
+    pnr_mod.write_sdc(sdc, top, str(p["clock_port"]),
+                      float(p.get("clock_period", cfg.design.clock_period_ps)),
+                      float(p.get("clock_latency", 0)))
+    metrics_path = out / "pnr_metrics.json"
+    metrics_path.unlink(missing_ok=True)
+    cmd = [*cfg.design.pack_pnr["command"], "--netlist", str(netlist),
+           "--sdc", str(sdc), "--top", top, "--out", str(out),
+           "--pack", str(cfg.design.pack_root)]
+    log = out / "pnr.log"
+    print(f"[circt_flow] tech pack P&R: {cmd[0]} -> {log}")
+    with open(log, "w") as fh:
+        rc = subprocess.run(cmd, cwd=cfg.design.pack_root, stdout=fh,
+                            stderr=subprocess.STDOUT).returncode
+    metrics = (json.loads(metrics_path.read_text())
+               if metrics_path.exists() else {})
+    unknown = sorted(set(metrics) - set(pnr_mod.METRICS) - {"status"})
+    if unknown:
+        print(f"[circt_flow] WARNING: pack P&R wrote unknown metric(s) "
+              f"{', '.join(unknown)}")
+    metrics["status"] = ("ok" if rc == 0 and metrics_path.exists()
+                         else f"pack P&R exited {rc}" if rc
+                         else "pack P&R wrote no pnr_metrics.json")
+    metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True) + "\n")
+    if metrics["status"] != "ok":
+        raise subprocess.CalledProcessError(rc or 1, cmd)
+    return metrics_path

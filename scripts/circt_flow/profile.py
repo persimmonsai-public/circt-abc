@@ -8,7 +8,17 @@ paths (`liberties:`) or from an ORFS image's platform directory
 decompressed into a cache on first use and merged into one file, since the
 mapper's passes take a single liberty.
 
-    python3 -m circt_flow.profile <profile.yaml>    # prepare and print it
+A tech pack (doc/techpacks.md) is a profile kept outside the repo, as
+<pack>/techpack.yaml with `schema: 1`: its paths are relative to the pack,
+`${VAR}` and `${VAR:-default}` expand from the environment, and it may add
+`flow:` defaults (FLOW_DEFAULTS), a `pnr:` section (a pack-local ORFS
+platform, or a P&R command of its own) and the leak audit's `deny_terms:`,
+`deny_exceptions:` and `public:`. A flow config names a
+profile either by path or by name; resolve() finds a name in the packs
+enclosing the flow config, then on CIRCT_ABC_TECH_PATH, then as a
+<name>-techpack checkout beside the repo, then in profiles/.
+
+    python3 -m circt_flow.profile <profile.yaml|name>    # prepare and print it
 """
 from __future__ import annotations
 
@@ -24,6 +34,15 @@ from typing import List, Optional
 import yaml
 
 from .orfs_pnr import DEFAULT_IMAGE, ORFS_ROOT
+
+REPO_PROFILES = Path(__file__).resolve().parent.parent.parent / "profiles"
+# The FlowConfig fields a pack's `flow:` section may default. Paths are
+# relative to the pack. `env` holds defaults for the flow's CIRCT_FLOW_*
+# pass knobs, applied only where the environment leaves them unset.
+FLOW_DEFAULTS = {"sv2v_docker_image": str, "abc_script_file": Path,
+                 "abc_read_lib_args": str, "enable_classical_resub": bool,
+                 "partitions": int, "env": dict}
+ENV_PREFIX = "CIRCT_FLOW_"
 
 
 def cache_root() -> Path:
@@ -41,6 +60,17 @@ class Profile:
     orfs_platform: Optional[str] = None
     # {"hi": "CELL:PIN", "lo": "CELL:PIN"}, for P&R's constant ties.
     tie: dict = field(default_factory=dict)
+    # Tech packs only: the pack directory, its `flow:` defaults (paths
+    # resolved), its `pnr:` section (orfs_platform_dir resolved, command
+    # expanded) and the leak audit's inputs: the extra strings it refuses,
+    # the names it lets through, and whether the pack is public (a public
+    # pack's names are not refused at all).
+    root: Optional[Path] = None
+    flow: dict = field(default_factory=dict)
+    pnr: dict = field(default_factory=dict)
+    deny_terms: List[str] = field(default_factory=list)
+    deny_exceptions: List[str] = field(default_factory=list)
+    public: bool = False
 
     @property
     def synth_libs(self) -> List[Path]:
@@ -136,26 +166,136 @@ def _extract_orfs(image: str, platform: str, rel: List[str],
     return want
 
 
+_VAR = re.compile(r"\$\{(\w+)(?::-([^}]*))?\}")
+
+
+def expand_vars(value: str) -> str:
+    """${VAR} / ${VAR:-default} from the environment. An unset ${VAR} with
+    no default is an error, not an empty string."""
+    def sub(m):
+        v = os.environ.get(m.group(1)) or m.group(2)
+        if v is None:
+            raise KeyError(f"{m.group(1)} is not set (needed by {value})")
+        return v
+    return _VAR.sub(sub, value)
+
+
+def expand(value: str, base: Path) -> Path:
+    """expand_vars, then relative to base."""
+    return base / expand_vars(value)
+
+
+def _pnr_section(d: dict, base: Path, path: Path) -> dict:
+    """A pack's `pnr:`: orfs_platform_dir (a directory, relative to the
+    pack) or command (argv; `./` and `../` words are relative to the pack,
+    every word has ${VAR} expanded), not both."""
+    p = dict(d.get("pnr") or {})
+    unknown = set(p) - {"orfs_platform_dir", "command"}
+    if unknown:
+        raise KeyError(f"{path}: pnr.{sorted(unknown)[0]} is not a pack "
+                       "P&R key; allowed: orfs_platform_dir, command")
+    if len(p) > 1:
+        raise ValueError(f"{path}: pnr: give orfs_platform_dir or command, "
+                         "not both")
+    if "orfs_platform_dir" in p:
+        p["orfs_platform_dir"] = expand(p["orfs_platform_dir"], base)
+    if "command" in p:
+        cmd = p["command"]
+        if isinstance(cmd, str) or not cmd:
+            raise ValueError(f"{path}: pnr.command must be a non-empty list")
+        p["command"] = [str(expand(w, base)) if w.startswith(("./", "../"))
+                        else expand_vars(str(w)) for w in cmd]
+    return p
+
+
+def resolve(ref: str, config_dir: Optional[Path] = None) -> Path:
+    """A profile reference from a flow config: a path (has a `/` or ends in
+    .yaml, relative to config_dir), or a name, looked up as the enclosing
+    pack of config_dir, then <dir>/<name>/techpack.yaml on
+    CIRCT_ABC_TECH_PATH, then a <name>-techpack or circt-abc-techpack-<name>
+    checkout beside this repo, then profiles/<name>.yaml in this repo."""
+    config_dir = config_dir or Path.cwd()
+    if "/" in ref or ref.endswith((".yaml", ".yml")):
+        return (config_dir / ref).resolve()
+    tried = []
+    for d in [config_dir, *config_dir.parents]:
+        pack = d / "techpack.yaml"
+        if pack.exists() and (yaml.safe_load(pack.read_text()) or {}).get(
+                "name") == ref:
+            return pack
+    for d in filter(None, os.environ.get("CIRCT_ABC_TECH_PATH", "").split(":")):
+        pack = Path(d) / ref / "techpack.yaml"
+        tried.append(str(pack))
+        try:
+            found = pack.is_file()
+        except OSError:  # an unreadable path entry is skipped, not fatal
+            found = False
+        if found:
+            return pack.resolve()
+    for sib in (f"{ref}-techpack", f"circt-abc-techpack-{ref}"):
+        sibling = REPO_PROFILES.parent.parent / sib / "techpack.yaml"
+        tried.append(str(sibling))
+        if sibling.is_file():
+            return sibling
+    repo = REPO_PROFILES / f"{ref}.yaml"
+    tried.append(str(repo))
+    if repo.exists():
+        return repo
+    raise FileNotFoundError(f"profile {ref!r} not found; tried the packs "
+                            f"enclosing {config_dir}, " + ", ".join(tried))
+
+
 def load(path: Path | str, image: Optional[str] = None) -> Profile:
     path = Path(path)
+    if not path.exists() and "/" not in str(path):
+        path = resolve(str(path))
     d = yaml.safe_load(path.read_text())
+    pack = d.get("schema") is not None
+    if pack and d["schema"] != 1:
+        raise ValueError(f"{path}: unsupported techpack schema {d['schema']}")
+    base = path.resolve().parent
     orfs = d.get("orfs")
     if orfs:
         image = image or os.environ.get("ORFS_IMAGE", DEFAULT_IMAGE)
         tag = image.rsplit(":", 1)[-1]
         dest = cache_root() / "orfs" / tag / orfs["platform"]
         libs = _extract_orfs(image, orfs["platform"], orfs["liberties"], dest)
+        if pack and not d.get("public"):
+            dest.chmod(0o700)  # derived liberties are the pack's data too
         merged = dest / f"{d['name']}_merged.lib"
         if not merged.exists():
             merge_liberties(libs, merged)
         liberties = [merged]
+    elif pack:
+        liberties = [expand(p, base) for p in d["liberties"]]
     else:
         liberties = [Path(os.path.expandvars(p)) for p in d["liberties"]]
+    flow = {}
+    for k, v in (d.get("flow") or {}).items():
+        if k not in FLOW_DEFAULTS:
+            raise KeyError(f"{path}: flow.{k} is not a pack default; "
+                           f"allowed: {', '.join(FLOW_DEFAULTS)}")
+        if FLOW_DEFAULTS[k] is Path:
+            v = expand(v, base)
+        elif k == "env":
+            bad = [e for e in v if not e.startswith(ENV_PREFIX)]
+            if bad:
+                raise KeyError(f"{path}: flow.env.{bad[0]} is not a "
+                               f"{ENV_PREFIX}* pass knob")
+            # The knobs test for "1"; a YAML boolean means the same.
+            v = {e: str(int(x)) if isinstance(x, bool) else str(x)
+                 for e, x in v.items()}
+        flow[k] = v
     return Profile(name=d["name"], liberties=liberties,
                    time_unit=d.get("time_unit", "ns"), icg=d["icg"],
                    dont_use=list(d.get("dont_use", [])),
                    orfs_platform=(orfs or {}).get("platform"),
-                   tie=dict(d.get("tie") or {}))
+                   tie=dict(d.get("tie") or {}),
+                   root=base if pack else None, flow=flow,
+                   pnr=_pnr_section(d, base, path) if pack else {},
+                   deny_terms=list(d.get("deny_terms", [])),
+                   deny_exceptions=list(d.get("deny_exceptions", [])),
+                   public=bool(d.get("public", False)))
 
 
 if __name__ == "__main__":

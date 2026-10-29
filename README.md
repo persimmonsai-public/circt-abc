@@ -41,10 +41,34 @@ under `out/ibex/pnr/`, summarised in `out/ibex/pnr/pnr_metrics.json`.
 | `mapper/` | the MLIR passes (`circt-abc-opt`), their lit tests, and `emap-bridge` |
 | `scripts/circt_flow/` | the flow driver: front end, stages, ORFS P&R stage |
 | `designs/` | design manifests (source, files, defines) and flow configs |
-| `profiles/` | library profiles: liberties, ICG and tie cells, dont_use |
+| `profiles/` | library profiles (ASAP7): liberties, ICG and tie cells, dont_use; other libraries come as tech packs |
+| `examples/techpack-template/` | a runnable tech pack on an invented library, to copy |
+| `doc/techpacks.md` | tech packs: format, lookup, P&R from a pack, the leak audit |
 | `patches/` | patches to CIRCT, ABC and mockturtle (see `patches/README`) |
 | `scripts/verify/` | equivalence checks: register-mapper miter, top-level miter |
 | `Dockerfile` | the circt-abc image |
+
+## Other technologies: tech packs
+
+A library the repository does not ship (a foundry PDK under NDA, say) plugs
+in as a **tech pack**: a directory outside this repository with a
+`techpack.yaml` (liberties, which may point into a PDK installed elsewhere,
+the clock-gate and tie cells, dont_use patterns, optional flow defaults) and
+the flow configs that use it. A flow config names the library,
+`pdk: {profile: <name>}`, and the flow finds it in the pack enclosing the
+config, on `CIRCT_ABC_TECH_PATH`, or as a `<name>-techpack` or
+`circt-abc-techpack-<name>` checkout beside this repository.
+`python3 -m circt_flow.techpack check <name>` validates one. A pack can also
+set defaults for the flow's knobs and bring its own place and route: an ORFS
+platform directory, or a command of its own.
+
+`examples/techpack-template/` is a complete pack on an invented library to
+copy as the start of yours, and the `circt-abc-techpack-asap7` repository,
+published beside this one, is the ASAP7 pack (the same profile as
+`profiles/asap7.yaml`). With the hook installed
+(`git config core.hooksPath scripts/git-hooks`), `techpack audit` refuses
+any commit that names a private pack's cells. The format, the lookup order,
+P&R from a pack and the audit are in [`doc/techpacks.md`](doc/techpacks.md).
 
 ## Building without Docker
 

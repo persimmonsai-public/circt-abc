@@ -1,0 +1,11 @@
+# ibex_top on the template library. The design comes from circt-abc's own
+# designs/ibex/manifest.yaml; a private design would put its manifest
+# beside this file and name it by path (manifest: manifest.yaml).
+design:
+  top_module: ibex_top
+  clock_period_ps: 1000
+  manifest: ibex
+pdk:
+  profile: template       # the pack this file is in
+pnr:
+  clock_port: clk_i

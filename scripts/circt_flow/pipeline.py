@@ -3,6 +3,8 @@ scripts/run_circt_native_synth.sh's linear stage sequence.
 """
 from __future__ import annotations
 
+import os
+
 from .config import FlowConfig
 from . import stages
 
@@ -15,7 +17,23 @@ def run(cfg: FlowConfig, pnr: bool = False) -> None:
     subprocess.CalledProcessError if any stage's subprocess exits non-zero.
     """
     cfg.validate_tools()
+    # A private pack's netlists name its cells: keep them out of the repo's
+    # working tree, where one `git add -f` would commit them.
+    if (cfg.design.pack_private
+            and cfg.out_dir.resolve().is_relative_to(cfg.root.resolve())
+            and os.environ.get("CIRCT_ABC_ALLOW_REPO_OUT") != "1"):
+        raise ValueError(
+            f"out_dir {cfg.out_dir} is inside {cfg.root} and the profile is "
+            "a private tech pack; write the run elsewhere (or set "
+            "CIRCT_ABC_ALLOW_REPO_OUT=1)")
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    # The pack's pass-knob defaults (flow.env): the stages read the
+    # CIRCT_FLOW_* knobs from the environment, so a knob the environment
+    # already sets keeps its value.
+    for k, v in cfg.design.flow_defaults.get("env", {}).items():
+        if k not in os.environ:
+            os.environ[k] = v
+            print(f"[circt_flow] tech pack default {k}={v}")
 
     print(
         f"[circt_flow] top={cfg.design.top_module} liberty={cfg.design.lib} "

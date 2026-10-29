@@ -33,7 +33,7 @@ ABC="$ROOT/third_party/yosys/build/yosys-abc"
 EMAP="$ROOT/mapper/build/bin/emap-bridge"
 LIB="${EMAP_LIB:?set EMAP_LIB to the liberty}"
 GENLIB="${EMAP_GENLIB:?set EMAP_GENLIB to its genlib}"
-CFG="${FLOW_CONFIG:-$ROOT/examples/ibex/ibex_flow.yaml}"
+CFG="${FLOW_CONFIG:?set FLOW_CONFIG to the design flow.yaml}"
 PERIOD="${CLOCK_PS:-2500}"
 
 for f in "$EMAP" "$GENLIB"; do

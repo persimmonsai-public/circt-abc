@@ -97,6 +97,7 @@ COPY third_party/CIRCT_REV third_party/CIRCT_REV
 COPY scripts scripts
 COPY designs designs
 COPY profiles profiles
+COPY examples examples
 COPY patches patches
 
 ENV ORFS_HOME=/OpenROAD-flow-scripts \

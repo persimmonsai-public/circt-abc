@@ -6,7 +6,7 @@
                         [--clock-latency <t>])
         [--platform asap7] [--utilization 40] [--place-density D]
         [--set VAR=VALUE ...] [--image openroad/orfs:<tag>] [--target finish]
-        [--tie-hi CELL:PIN --tie-lo CELL:PIN]
+        [--tie-hi CELL:PIN --tie-lo CELL:PIN] [--platform-dir <dir>]
 
 ORFS takes a pre-synthesised netlist through SYNTH_NETLIST_FILES: its synth
 step then copies the netlist to 1_2_yosys.v instead of running Yosys
@@ -21,6 +21,12 @@ metadata.json. The run directory is mounted at its own path, so every path
 in config.mk is the host path. With ORFS_HOME set (inside the circt-abc
 image, which is built on the ORFS image), ORFS runs in place instead of in
 a container.
+
+With --platform-dir, the platform comes from that directory instead of
+ORFS's own platforms/ (a tech pack's ORFS platform, doc/techpacks.md):
+config.mk sets PLATFORM_DIR, which ORFS's scripts/variables.mk takes ahead
+of its built-in platforms, and the directory is mounted read-only. ORFS
+itself is still unmodified.
 
 With --tie-hi/--tie-lo, every constant the netlist drives with a literal
 (`assign n = 1'h1;`, or a literal on an instance pin) is driven by a tie
@@ -135,9 +141,11 @@ def tie_constants(text: str, hi: tuple[str, str], lo: tuple[str, str]
 def write_config(path: Path, *, platform: str, top: str, netlist: Path,
                  sdc: Path, utilization: float,
                  place_density: float | None,
-                 extra: list[tuple[str, str]]) -> None:
+                 extra: list[tuple[str, str]],
+                 platform_dir: Path | None = None) -> None:
     lines = [
         f"export PLATFORM = {platform}",
+        *([f"export PLATFORM_DIR = {platform_dir}"] if platform_dir else []),
         f"export DESIGN_NAME = {top}",
         f"export DESIGN_NICKNAME = {top}",
         f"export SYNTH_NETLIST_FILES = {netlist}",
@@ -161,7 +169,8 @@ def write_config(path: Path, *, platform: str, top: str, netlist: Path,
 
 
 def run_orfs(image: str, run_dir: Path, config: Path,
-             targets: list[str], log: Path) -> int:
+             targets: list[str], log: Path,
+             platform_dir: Path | None = None) -> int:
     local = os.environ.get("ORFS_HOME")
     root = local or ORFS_ROOT
     make = (f"make -C {root}/flow DESIGN_CONFIG={config} "
@@ -173,7 +182,10 @@ def run_orfs(image: str, run_dir: Path, config: Path,
     else:
         cmd = ["docker", "run", "--rm",
                "-u", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp",
-               "-v", f"{run_dir}:{run_dir}", image, "bash", "-c", script]
+               "-v", f"{run_dir}:{run_dir}",
+               *(["-v", f"{platform_dir}:{platform_dir}:ro"]
+                 if platform_dir else []),
+               image, "bash", "-c", script]
     with open(log, "w") as fh:
         return subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT).returncode
 
@@ -208,6 +220,9 @@ def main(argv: list[str] | None = None) -> int:
                     "TIEHI_CELL_AND_PORT)")
     ap.add_argument("--tie-lo", metavar="CELL:PIN",
                     help="tie cell for constant 0")
+    ap.add_argument("--platform-dir", type=Path,
+                    help="the platform's directory, instead of ORFS's own "
+                    "platforms/<platform> (mounted read-only)")
     ap.add_argument("--target", default="finish",
                     help="ORFS make target to stop at (default finish)")
     a = ap.parse_args(argv)
@@ -216,6 +231,10 @@ def main(argv: list[str] | None = None) -> int:
         sys.exit(f"orfs_pnr: netlist not found: {a.netlist}")
     if a.sdc is None and (a.clock_port is None or a.clock_period is None):
         sys.exit("orfs_pnr: give --sdc, or --clock-port and --clock-period")
+    platform_dir = a.platform_dir.resolve() if a.platform_dir else None
+    if platform_dir and not (platform_dir / "config.mk").is_file():
+        sys.exit(f"orfs_pnr: {platform_dir} has no config.mk; not an ORFS "
+                 "platform directory")
     extra = []
     for s in a.set:
         k, sep, v = s.partition("=")
@@ -243,12 +262,13 @@ def main(argv: list[str] | None = None) -> int:
     config = run_dir / "config.mk"
     write_config(config, platform=a.platform, top=a.top, netlist=netlist,
                  sdc=sdc, utilization=a.utilization,
-                 place_density=a.place_density, extra=extra)
+                 place_density=a.place_density, extra=extra,
+                 platform_dir=platform_dir)
 
     log = run_dir / "orfs.log"
     print(f"[orfs_pnr] {a.image}: make {a.target} -> {log}")
     rc = run_orfs(a.image, run_dir, config, [a.target, "metadata-generate"],
-                  log)
+                  log, platform_dir)
     metrics = collect(run_dir, a.platform, a.top)
     metrics["status"] = "ok" if rc == 0 else f"orfs exited {rc}"
     (run_dir / "pnr_metrics.json").write_text(

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Refuse to commit a private technology's data (doc/techpacks.md).
+#
+# Two checks on what is staged:
+#   1. by path: library and layout files (liberty, LEF, GDS, tech files,
+#      genlibs) outside the hermetic test fixtures under mapper/test/ and
+#      the template pack's invented liberty;
+#   2. by content: `python3 -m circt_flow.techpack audit`, which refuses the
+#      cell names and deny_terms of every private tech pack installed here
+#      (on CIRCT_ABC_TECH_PATH, or checked out beside this repository).
+#
+# Install:  git config core.hooksPath scripts/git-hooks
+# Turn off the content check in a clone that may hold a pack's names:
+#           git config circt-abc.audit false
+# Override: git commit --no-verify
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$staged" ] && exit 0
+
+bad=$(printf '%s\n' "$staged" \
+  | grep -iE '\.(lib|db|lef|gds|gds2|oas|tf|captable|genlib)(\.gz)?$' \
+  | grep -vE '^(mapper/test/|examples/techpack-template/lib/)')
+if [ -n "$bad" ]; then
+  echo "pre-commit: refusing to commit library or layout files:" >&2
+  printf '  %s\n' $bad >&2
+  echo "A technology's files belong in its tech pack, outside this" >&2
+  echo "repository (doc/techpacks.md). A hermetic test liberty goes under" >&2
+  echo "mapper/test/." >&2
+  exit 1
+fi
+
+if [ "$(git config --bool circt-abc.audit)" != "false" ]; then
+  root=$(git rev-parse --show-toplevel)
+  if ! PYTHONPATH="$root/scripts" python3 -m circt_flow.techpack audit; then
+    echo >&2
+    echo "pre-commit: the staged diff names a private tech pack's cells or" >&2
+    echo "terms (above). Take them out, or, if this clone may hold them," >&2
+    echo "git config circt-abc.audit false" >&2
+    exit 1
+  fi
+fi
+exit 0

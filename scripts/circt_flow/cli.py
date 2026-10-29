@@ -8,7 +8,7 @@ Run from the scripts/ directory (or anywhere with scripts/ on
 PYTHONPATH), e.g.:
 
     cd circt-abc/scripts
-    python3 -m circt_flow ../examples/ibex/ibex_flow.yaml /tmp/out
+    python3 -m circt_flow ../designs/ibex/asap7_flow.yaml /tmp/out
 
 The same environment variables the bash script honors
 (CIRCT_ABC_OPT, CIRCT_OPT, ABC_BIN, ENABLE_CLASSICAL_RESUB,
@@ -71,8 +71,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--sv2v-docker-image",
         default=None,
         help="Docker image providing sv2v for the OpenSTA-compat "
-        "post-processing step (default: env SV2V_DOCKER_IMAGE, else "
-        "circt-abc).",
+        "post-processing step (default: env SV2V_DOCKER_IMAGE, else the "
+        "tech pack's flow.sv2v_docker_image, else circt-abc).",
     )
     p.add_argument(
         "--dont-touch",

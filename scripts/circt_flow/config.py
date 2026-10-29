@@ -17,7 +17,8 @@ Mirrors exactly what scripts/run_circt_native_synth.sh reads:
 Precedence for each overridable field, highest first:
     1. explicit constructor/CLI argument
     2. environment variable (bash-compatible name)
-    3. built-in default (matching the bash script's own default exactly)
+    3. the tech pack's `flow:` default, if the profile is a pack
+    4. built-in default
 """
 from __future__ import annotations
 
@@ -73,6 +74,15 @@ class DesignConfig:
     dont_use: List[str] = field(default_factory=list)
     # The profile's tie cells, {"hi": "CELL:PIN", "lo": "CELL:PIN"}.
     tie: dict = field(default_factory=dict)
+    # A tech pack's `flow:` defaults (profile.FLOW_DEFAULTS), applied below
+    # the environment and explicit arguments.
+    flow_defaults: dict = field(default_factory=dict)
+    # A tech pack's directory and its `pnr:` section (orfs_platform_dir or
+    # command), for the P&R stage.
+    pack_root: Optional[Path] = None
+    pack_pnr: dict = field(default_factory=dict)
+    # A pack that does not say `public: true`: its outputs are its data.
+    pack_private: bool = False
 
     @property
     def lib(self) -> str:
@@ -92,16 +102,26 @@ class DesignConfig:
             cfg = yaml.safe_load(f)
         here = Path(config_path).resolve().parent
         rel = lambda p: (here / p).resolve() if p else None
-        manifest = rel(cfg["design"].get("manifest"))
-        profile = rel(cfg["pdk"].get("profile"))
+        from . import profile as profile_mod
+        manifest = cfg["design"].get("manifest")
+        # A bare name is a design under this repo's designs/.
+        if manifest and "/" not in manifest and not manifest.endswith(".yaml"):
+            manifest = ROOT / "designs" / manifest / "manifest.yaml"
+        manifest = rel(manifest)
+        profile = cfg["pdk"].get("profile")
+        profile = profile_mod.resolve(profile, here) if profile else None
         dont_use: List[str] = []
         tie: dict = {}
+        flow_defaults: dict = {}
+        pack_root, pack_pnr, pack_private = None, {}, False
         if profile is not None:
-            from . import profile as profile_mod
             prof = profile_mod.load(profile)
             libs = [str(p) for p in prof.synth_libs]
             dont_use = prof.dont_use
             tie = prof.tie
+            flow_defaults = prof.flow
+            pack_root, pack_pnr = prof.root, prof.pnr
+            pack_private = prof.root is not None and not prof.public
         else:
             libs = list(cfg["pdk"]["synth_lib_tt"])
         return cls(
@@ -113,6 +133,10 @@ class DesignConfig:
             profile=profile,
             dont_use=dont_use,
             tie=tie,
+            flow_defaults=flow_defaults,
+            pack_root=pack_root,
+            pack_pnr=pack_pnr,
+            pack_private=pack_private,
         )
 
 
@@ -166,6 +190,8 @@ class FlowConfig:
     # first remap arm -- before P&R ever sees them).
     abc_keep_buffers: bool = False
     skip_unmappable: bool = False
+    # The image's own name: the circt-abc image carries sv2v (and sets
+    # SV2V, which wins over any image).
     sv2v_docker_image: str = "circt-abc"
     directives: DirectiveSet = field(default_factory=DirectiveSet)
 
@@ -222,6 +248,7 @@ class FlowConfig:
         out_dir = Path(out_dir)
 
         design = DesignConfig.from_yaml(config_path)
+        pack = design.flow_defaults
 
         resolved_circt_abc_opt = Path(
             circt_abc_opt
@@ -243,16 +270,18 @@ class FlowConfig:
         elif "ENABLE_CLASSICAL_RESUB" in env:
             resolved_enable_classical_resub = _env_bool(env["ENABLE_CLASSICAL_RESUB"])
         else:
-            resolved_enable_classical_resub = True
+            resolved_enable_classical_resub = pack.get(
+                "enable_classical_resub", True)
         resolved_sv2v_docker_image = (
             sv2v_docker_image
             if sv2v_docker_image is not None
-            else env.get("SV2V_DOCKER_IMAGE", "circt-abc")
+            else env.get("SV2V_DOCKER_IMAGE",
+                         pack.get("sv2v_docker_image", "circt-abc"))
         )
 
         resolved_partitions = (
             partitions if partitions is not None
-            else int(env.get("ABC_PARTITIONS", "1"))
+            else int(env.get("ABC_PARTITIONS", pack.get("partitions", 1)))
         )
         resolved_pool = (
             abc_pool_size if abc_pool_size is not None
@@ -276,10 +305,12 @@ class FlowConfig:
             partitions=resolved_partitions,
             abc_pool_size=resolved_pool,
             partition_workdir=resolved_partition_workdir,
-            abc_script_file=Path(abc_script_file) if abc_script_file else None,
+            abc_script_file=(Path(abc_script_file) if abc_script_file
+                             else pack.get("abc_script_file")),
             abc_read_lib_args=(
                 abc_read_lib_args if abc_read_lib_args is not None
-                else " ".join(f"-X {p}" for p in design.dont_use) or None),
+                else pack.get("abc_read_lib_args")
+                or " ".join(f"-X {p}" for p in design.dont_use) or None),
             abc_save_aig_dir=Path(abc_save_aig_dir) if abc_save_aig_dir else None,
             abc_use_datapath=bool(abc_use_datapath),
             abc_save_mapped_dir=Path(abc_save_mapped_dir) if abc_save_mapped_dir else None,

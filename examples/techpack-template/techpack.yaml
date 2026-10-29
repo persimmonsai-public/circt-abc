@@ -1,0 +1,49 @@
+# A tech pack template (doc/techpacks.md): copy this directory, ideally into
+# a private repository of its own, and replace the library with yours.
+# Its liberty is invented (lib/make_lib.py), so the template runs as it is:
+#
+#   python3 -m circt_flow.techpack check examples/techpack-template/techpack.yaml
+#   python3 -m circt_flow examples/techpack-template/designs/ibex/flow.yaml out/tpl --pnr
+schema: 1
+name: template
+# Relative to this directory, or ${VAR} / ${VAR:-default} from the
+# environment for a PDK installed elsewhere, e.g.
+#   - ${MYTECH_PDK}/lib/stdcell_tt.lib
+# The first liberty is the primary one.
+liberties:
+  - lib/template.lib
+time_unit: ns
+# The integrated clock gate (latch_posedge_precontrol) a design's
+# clock-gating primitive maps to, and its pins.
+icg: {cell: TICG, clk: CK, en: E, test_en: SE, out: ECK}
+# Cells ABC must not use (glob patterns), and the tie cells for constants.
+dont_use: []
+tie: {hi: "TTIEHI:H", lo: "TTIELO:L"}
+
+# The leak audit (`python3 -m circt_flow.techpack audit`, and the
+# pre-commit hook): installed on CIRCT_ABC_TECH_PATH, a private pack's
+# liberty cell and library names and these terms may not be committed to
+# circt-abc. deny_exceptions lets through names that are public anyway.
+# A pack whose content is all public says `public: true` instead.
+deny_terms: ["mytech"]
+deny_exceptions: []
+
+# Defaults for this technology, below a design's flow.yaml, the
+# environment and the command line. The allowed keys are
+# profile.FLOW_DEFAULTS; paths are relative to this directory.
+flow:
+  # abc_script_file: abc/recipe.abc
+  # sv2v_docker_image: circt-abc
+  # partitions: 1
+  # env:                        # the flow's CIRCT_FLOW_* pass knobs
+  #   CIRCT_FLOW_ADDER_ARCH: RIPPLE-CARRY
+
+# Place and route, one of:
+#   orfs_platform_dir: orfs-platform   # an ORFS platform directory (config.mk,
+#                                      # LEFs, ...), run by stock ORFS
+#   command: ["./pnr/run.py"]          # any other P&R; see pnr/run.py
+# Without either, --pnr runs ORFS on the built-in platform the design's
+# flow.yaml names. The template's library has no layout, so its command is
+# a stand-in that only reports the netlist's cell count and area.
+pnr:
+  command: ["./pnr/run.py"]
