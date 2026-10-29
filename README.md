@@ -65,7 +65,9 @@ platform directory, or a command of its own.
 `examples/techpack-template/` is a complete pack on an invented library to
 copy as the start of yours, and the `circt-abc-techpack-asap7` repository,
 published beside this one, is the ASAP7 pack (the same profile as
-`profiles/asap7.yaml`). With the hook installed
+`profiles/asap7.yaml`). `circt-abc-techpack-gt3`, also beside it, is the
+pack for GT3, an open 3-nm predictive PDK with no clock-gate or tie cell,
+and builds its own ORFS platform. With the hook installed
 (`git config core.hooksPath scripts/git-hooks`), `techpack audit` refuses
 any commit that names a private pack's cells. The format, the lookup order,
 P&R from a pack and the audit are in [`doc/techpacks.md`](doc/techpacks.md).

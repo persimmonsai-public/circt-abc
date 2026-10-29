@@ -15,12 +15,13 @@ Steps:
      (<cache>/src/<name>-<commit>), unless --src points at a checkout, which
      must be at that commit.
   2. The clock-gating primitive is written as a module instantiating the
-     profile's ICG cell, and that cell gets an empty-body declaration with
-     its liberty port list.
+     profile's ICG, and the ICG cell (or, for a composite ICG, each cell of
+     its netlist) gets an empty-body declaration with its liberty port
+     list.
   3. circt-verilog --ir-llhd elaborates the design. It stops before its own
      LLHD pipeline, whose behaviour drifts with every CIRCT commit; step 5
      is the explicit, pinned copy of it.
-  4. The ICG declaration's elaborated body is replaced by an extern
+  4. Each such declaration's elaborated body is replaced by an extern
      declaration (externalize_stub_cells.py): circt-verilog has no
      blackbox-module concept and would otherwise drive the output with a
      constant, cutting the clock to everything behind the gate.
@@ -31,6 +32,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -87,9 +89,12 @@ def fetch_source(design: dict, src: Path | None) -> Path:
 
 
 def clock_gate_files(design: dict, prof: profile_mod.Profile,
-                     out_dir: Path) -> list[Path]:
-    """The clock-gating primitive mapped onto the profile's ICG cell, and
-    an empty-body declaration of that cell with its liberty port list."""
+                     out_dir: Path) -> tuple[list[Path], list[str]]:
+    """The clock-gating primitive mapped onto the profile's ICG, and an
+    empty-body declaration, with its liberty port list, of every library
+    cell that takes: the ICG cell itself, or for a composite ICG
+    (`icg.netlist`) its netlist and each cell the netlist instantiates.
+    Returns the files and the names of the cells to externalize."""
     cg, icg = design["clock_gate"], prof.icg
     p = cg["ports"]
     wrapper = out_dir / f"{cg['module']}_{prof.name}.sv"
@@ -103,16 +108,33 @@ def clock_gate_files(design: dict, prof: profile_mod.Profile,
         f"    .{icg['clk']}({p['clk']}),\n    .{icg['en']}({p['en']}),\n"
         f"    .{icg['test_en']}({p['test_en']}),\n"
         f"    .{icg['out']}({p['out']})\n  );\nendmodule\n")
+    files = [wrapper]
+    if "netlist" in icg:
+        netlist = Path(icg["netlist"])
+        files.append(netlist)
+        text = re.sub(r"//[^\n]*|/\*.*?\*/", "", netlist.read_text(),
+                      flags=re.S)
+        words = set(re.findall(r"[A-Za-z_][A-Za-z0-9_$]*", text))
+        want = words - {icg["cell"]}
+    else:
+        want = {icg["cell"]}
     stubs = _load_script("gen_liberty_blackbox_stubs")
+    found: list[str] = []
     for lib in prof.liberties:
         for name, pins in stubs.parse_cells(
                 Path(lib).read_text(errors="ignore")):
-            if name == icg["cell"]:
-                stub = out_dir / f"{icg['cell']}_stub.sv"
+            if name in want and name not in found:
+                stub = out_dir / f"{name}_stub.sv"
                 stub.write_text(stubs.sv_stub(name, pins))
-                return [wrapper, stub]
-    sys.exit(f"frontend: ICG cell {icg['cell']} not in the profile's "
-             "liberties")
+                files.append(stub)
+                found.append(name)
+    if "netlist" not in icg and not found:
+        sys.exit(f"frontend: ICG cell {icg['cell']} not in the profile's "
+                 "liberties")
+    if "netlist" in icg and not found:
+        sys.exit(f"frontend: {icg['netlist']} instantiates no cell of the "
+                 "profile's liberties")
+    return files, found
 
 
 def run(manifest: Path, prof: profile_mod.Profile, out_dir: Path,
@@ -123,9 +145,11 @@ def run(manifest: Path, prof: profile_mod.Profile, out_dir: Path,
     root = fetch_source(design, src)
 
     files: list[Path] = []
+    cells: list[str] = []
     for f in design["files"]:
         if f == "@clock_gate":
-            files += clock_gate_files(design, prof, out_dir)
+            cg_files, cells = clock_gate_files(design, prof, out_dir)
+            files += cg_files
         else:
             files.append(root / f)
     missing = [str(f) for f in files if not f.is_file()]
@@ -143,8 +167,9 @@ def run(manifest: Path, prof: profile_mod.Profile, out_dir: Path,
         cmd += ["-I", root / i]
     _run(cmd + files + ["-o", raw])
 
-    _run([sys.executable, SCRIPTS / "externalize_stub_cells.py", raw,
-          prof.icg["cell"]])
+    if cells:
+        _run([sys.executable, SCRIPTS / "externalize_stub_cells.py", raw,
+              *cells])
 
     core = out_dir / f"{top}_core.mlir"
     _run([circt_opt, raw, *LLHD_PIPELINE, "-o", core])

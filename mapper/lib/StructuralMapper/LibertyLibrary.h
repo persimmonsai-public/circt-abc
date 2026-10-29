@@ -89,14 +89,14 @@ struct FFCellPattern {
   // `next_state : "!D"` and output-reads-STATE_N inversions): the mapper
   // drives D with the complement of the register's next value.
   bool dataInverted = false;
-  // A cell with both clear and preset used as a single-reset cell: the
-  // other async pin, held at its inactive level `tieValue`.
-  std::string tiePin;
-  bool tieValue = false;
+  // Async pins the shape does not use, each held at its inactive level: a
+  // cell with both clear and preset used as a single-reset cell ties the
+  // other one, and used as a no-reset cell ties both.
+  llvm::SmallVector<std::pair<std::string, bool>, 2> tiedPins;
 
   // Shapes that need an inverter or a tied pin; at equal cost a cell that
   // needs neither wins.
-  bool isFallback() const { return dataInverted || !tiePin.empty(); }
+  bool isFallback() const { return dataInverted || !tiedPins.empty(); }
 };
 
 // An integrated clock-gating cell extracted from the liberty file, for

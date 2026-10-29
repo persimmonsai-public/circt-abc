@@ -55,6 +55,10 @@ class Profile:
     name: str
     liberties: List[Path]
     time_unit: str
+    # {"cell", "clk", "en", "test_en", "out"}: the integrated clock gate a
+    # design's clock-gating primitive maps to. With "netlist" (a pack path),
+    # "cell" is a module of that structural Verilog file built from the
+    # library's own cells, for a library without an ICG cell.
     icg: dict
     dont_use: List[str] = field(default_factory=list)
     orfs_platform: Optional[str] = None
@@ -286,8 +290,13 @@ def load(path: Path | str, image: Optional[str] = None) -> Profile:
             v = {e: str(int(x)) if isinstance(x, bool) else str(x)
                  for e, x in v.items()}
         flow[k] = v
+    icg = dict(d["icg"])
+    if "netlist" in icg:
+        if not pack:
+            raise KeyError(f"{path}: icg.netlist needs a tech pack")
+        icg["netlist"] = expand(icg["netlist"], base)
     return Profile(name=d["name"], liberties=liberties,
-                   time_unit=d.get("time_unit", "ns"), icg=d["icg"],
+                   time_unit=d.get("time_unit", "ns"), icg=icg,
                    dont_use=list(d.get("dont_use", [])),
                    orfs_platform=(orfs or {}).get("platform"),
                    tie=dict(d.get("tie") or {}),

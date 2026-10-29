@@ -68,6 +68,13 @@ pnr:                             # optional; one of
   # command: ["./pnr/run.py"]
 ```
 
+A library with no integrated clock-gating cell gives a composite one
+instead: `icg: {netlist: icg/my_icg.v, cell: my_icg, clk: ..., en: ...,
+test_en: ..., out: ...}`, where the netlist is a structural Verilog module
+named `cell`, built from the library's own cells. The front end compiles it
+with the design and keeps each cell it instantiates as a library cell; the
+GT3 pack's falling-edge-flop gate is the example.
+
 Instead of `liberties:`, a pack may take them from an ORFS image's platform
 with `orfs: {platform, liberties}` as `profiles/asap7.yaml` does; they are
 extracted into the cache and merged into one file.
@@ -79,7 +86,9 @@ single-liberty passes read.
 
 `python3 -m circt_flow.techpack check <name|path>` loads a pack and checks
 that every liberty, `flow:` path and `pnr:` path exists and that the ICG and
-tie cells are cells of the liberties.
+tie cells are cells of the liberties. Tie cells are only used by P&R, so
+they may instead come from the pack's own ORFS platform (`lib/*.lib` under
+`orfs_platform_dir`), for a library that has none.
 
 ## Finding a pack
 
@@ -214,3 +223,7 @@ that keeps its own reports, say) turns the audit off with
   stand-in P&R command. Its `.lib` is exempt from the hook's path check.
 * `circt-abc-techpack-asap7` (public): ASAP7 from the ORFS image, with ibex
   configured as ORFS's own asap7/ibex design. `public: true`.
+* `circt-abc-techpack-gt3` (public): GT3, Georgia Tech's open 3-nm GAAFET
+  predictive PDK, read from a GT3 checkout. It shows a composite ICG, a
+  library whose one flop has both async pins, and an ORFS platform a pack
+  generates (buried power rail, abstract tie cells). `public: true`.

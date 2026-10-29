@@ -1,0 +1,25 @@
+/* Hermetic test liberty for register_mapper_async_only.mlir: a library
+   whose only flop has both an active-low clear and an active-low preset,
+   as in a library with no plain D flop. Invented cell, invented numbers. */
+library(async_only_cells) {
+  cell(TDFFASR) {
+    area : 0.18 ;
+    ff(IQ, IQN) {
+      clocked_on : "CLK" ;
+      next_state : "D" ;
+      clear : "!RN" ;
+      preset : "!SN" ;
+      clear_preset_var1 : H ;
+    }
+    pin(CLK) { direction : input ; clock : true ; }
+    pin(D) { direction : input ; nextstate_type : data ; }
+    pin(RN) { direction : input ; }
+    pin(SN) { direction : input ; }
+    pin(Q) { direction : output ; function : "IQ" ; }
+  }
+  cell(TINV) {
+    area : 0.03 ;
+    pin(A) { direction : input ; }
+    pin(Y) { direction : output ; function : "!A" ; }
+  }
+}

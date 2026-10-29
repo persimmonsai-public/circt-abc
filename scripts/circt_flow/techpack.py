@@ -7,7 +7,10 @@
 
 `check` resolves the pack the way a flow config would (profile.resolve),
 loads it, and verifies that every liberty and `flow:` and `pnr:` path
-exists and that the ICG and tie cells it names are cells of its liberties.
+exists and that the ICG and tie cells it names (for a composite ICG, the
+cells its netlist instantiates) are cells of its liberties; tie cells may
+instead be cells of the pack's ORFS platform (`lib/*.lib`), since only P&R
+uses them.
 Exit status 1 on any problem.
 
 `audit` refuses the names of every installed private pack: the packs on
@@ -66,11 +69,31 @@ def check(ref: str) -> list[str]:
         problems.append(f"pnr.command: {cmd[0]} is not executable")
     if not problems:
         cells = liberty_cells(prof.liberties)
-        want = [("icg", prof.icg["cell"])]
-        want += [(f"tie.{k}", v.split(":")[0]) for k, v in prof.tie.items()]
+        net = prof.icg.get("netlist")
+        if net is None:
+            want = [("icg", prof.icg["cell"])]
+        elif not Path(net).is_file():
+            want = []
+            problems.append(f"icg.netlist: {net} does not exist")
+        else:
+            text = Path(net).read_text()
+            if not re.search(r"\bmodule\s+" + re.escape(prof.icg["cell"])
+                             + r"\b", text):
+                problems.append(f"icg.netlist: {net} does not define "
+                                f"module {prof.icg['cell']}")
+            want = [("icg.netlist", c) for c in sorted(
+                set(re.findall(r"^\s*([A-Za-z_]\w*)\s+[A-Za-z_]\w*\s*\(",
+                               text, re.M)) - {"module"})]
         problems += [f"{what} cell {c} is not in the liberties"
                      for what, c in want if c not in cells]
         print(f"  {len(prof.liberties)} liberties, {len(cells)} cells")
+        # Tie cells are P&R's: a pack's own ORFS platform may supply them.
+        if pdir is not None:
+            cells |= liberty_cells(sorted(pdir.glob("lib/*.lib")))
+        problems += [f"tie.{k} cell {v.split(':')[0]} is not in the "
+                     "liberties" + (" or the ORFS platform's" if pdir else "")
+                     for k, v in prof.tie.items()
+                     if v.split(":")[0] not in cells]
     print(f"  pack root: {prof.root or '(repo profile)'}")
     for k, v in prof.flow.items():
         print(f"  flow.{k}: {v}")

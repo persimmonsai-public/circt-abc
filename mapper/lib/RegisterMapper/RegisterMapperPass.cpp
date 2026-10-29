@@ -27,8 +27,9 @@
 //      complement of D, and its one async-reset flop has both clear and
 //      preset) is mapped through LibertyLibrary's fallback shapes: D is
 //      driven with the complement of the next value (ABC absorbs the
-//      inverter into the logic feeding it), and the unused async pin is
-//      tied to its inactive level.
+//      inverter into the logic feeding it), and an unused async pin is
+//      tied to its inactive level (both of them, for a no-reset register
+//      on a library like GT3 whose one flop has clear and preset).
 //   3. Reassemble the N per-bit Q results into the register's original
 //      `data` result via a single MSB-first `comb.concat` (operand 0 =
 //      most-significant bit N-1, ..., last operand = bit 0 -- comb.concat's
@@ -106,8 +107,8 @@ struct RegisterMapperPass
       llvm::StringSet<> want{cell.clockPin, cell.dataPin};
       if (cell.hasReset)
         want.insert(cell.resetPin);
-      if (!cell.tiePin.empty())
-        want.insert(cell.tiePin);
+      for (const auto &tie : cell.tiedPins)
+        want.insert(tie.first);
       llvm::StringSet<> haveIn;
       bool outOk = false;
       for (auto port : ext.getPortList()) {
@@ -139,13 +140,14 @@ struct RegisterMapperPass
       ports.push_back(port);
     };
     // The call site wires operands by port name, in this declaration's
-    // input order (clock, data, [reset/set], [tied pin]).
+    // input order (clock, data, [reset/set], [tied pins]).
     addInput(cell.clockPin, 0);
     addInput(cell.dataPin, 1);
+    unsigned argNum = 2;
     if (cell.hasReset)
-      addInput(cell.resetPin, 2);
-    if (!cell.tiePin.empty())
-      addInput(cell.tiePin, 3);
+      addInput(cell.resetPin, argNum++);
+    for (const auto &tie : cell.tiedPins)
+      addInput(tie.first, argNum++);
 
     hw::PortInfo outPort;
     outPort.name = StringAttr::get(module.getContext(), cell.outputPin);
@@ -289,8 +291,8 @@ struct RegisterMapperPass
               : dBit;
       if (cellPat->hasReset)
         byPin[cellPat->resetPin] = resetOperand;
-      if (!cellPat->tiePin.empty())
-        byPin[cellPat->tiePin] = constant(cellPat->tieValue);
+      for (const auto &tie : cellPat->tiedPins)
+        byPin[tie.first] = constant(tie.second);
       SmallVector<Value, 4> operands;
       for (auto port : externOp.getPortList())
         if (port.dir == hw::ModulePort::Direction::Input)

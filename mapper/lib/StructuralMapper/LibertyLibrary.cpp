@@ -756,12 +756,16 @@ llvm::SmallVector<FFCellPattern, 2> buildFFPatterns(const RawCell &raw) {
     pat.resetActiveHigh = !ap.activeLow;
     pat.isSet = ap.toOne;
     for (const Async &other : asyncPins)
-      if (other.pin != ap.pin) {
-        pat.tiePin = other.pin.str();
-        pat.tieValue = other.activeLow; // inactive level
-      }
+      if (other.pin != ap.pin)
+        pat.tiedPins.push_back({other.pin.str(), other.activeLow});
     out.push_back(std::move(pat));
   }
+  // The no-reset shape too, every async pin at its inactive level: for a
+  // library whose only flops have async pins (GT3's one flop has both).
+  FFCellPattern none = base;
+  for (const Async &ap : asyncPins)
+    none.tiedPins.push_back({ap.pin.str(), ap.activeLow});
+  out.push_back(std::move(none));
   return out;
 }
 
