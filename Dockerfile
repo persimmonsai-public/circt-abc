@@ -92,6 +92,9 @@ COPY --from=build /src/sv2v /usr/local/bin/sv2v
 # ORFS's Yosys (it has read_slang built in) serves the CEC and miter scripts.
 RUN ln -s /OpenROAD-flow-scripts/tools/install/yosys/bin/yosys \
           third_party/yosys/build/yosys
+# ... and `yosys` on PATH: the ORFS base image also ships an older Yosys in
+# /usr/local/bin (0.67), which would otherwise shadow the release's 0.68.
+ENV PATH=/OpenROAD-flow-scripts/tools/install/yosys/bin:${PATH}
 
 COPY third_party/CIRCT_REV third_party/CIRCT_REV
 COPY scripts scripts
