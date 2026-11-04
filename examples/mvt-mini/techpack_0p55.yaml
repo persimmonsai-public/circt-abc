@@ -1,0 +1,13 @@
+# mvt-mini profile: 0.55 V, RVT/LVT/SLVT, RVT primary, tt corner
+# Invented library (lib/make_libs.py; run.sh generates it). Flow configs name it by path. Baseline arm at the low supply.
+schema: 1
+name: mvt_mini_0p55
+liberties:
+  - lib/mini_rvt_0p55v_tt.lib
+  - lib/mini_lvt_0p55v_tt.lib
+  - lib/mini_slvt_0p55v_tt.lib
+time_unit: ns
+icg: {cell: MICG_X1_R, clk: CK, en: E, test_en: SE, out: ECK}
+dont_use: []
+tie: {hi: "MTIEHI_R:H", lo: "MTIELO_R:L"}
+public: true

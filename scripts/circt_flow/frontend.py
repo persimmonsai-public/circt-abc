@@ -4,7 +4,8 @@
         [--src <checkout>]
 
 The manifest (designs/<name>/manifest.yaml) names the RTL source (a git
-repository at a pinned commit), the file list, include directories, defines,
+repository at a pinned commit, or `path:`, a directory relative to the
+manifest, for RTL kept beside it), the file list, include directories, defines,
 parameter overrides and the design's clock-gating primitive; the profile
 (profiles/<name>.yaml) names the ICG cell that primitive maps to. Output is
 <out_dir>/<top>_core.mlir: hw/comb/seq with `seq.firreg` still present, the
@@ -13,7 +14,7 @@ input of the flow's stage 1.
 Steps:
   1. The source is fetched at its commit into the cache
      (<cache>/src/<name>-<commit>), unless --src points at a checkout, which
-     must be at that commit.
+     must be at that commit. A `path:` source is used where it is.
   2. The clock-gating primitive is written as a module instantiating the
      profile's ICG, and the ICG cell (or, for a composite ICG, each cell of
      its netlist) gets an empty-body declaration with its liberty port
@@ -142,7 +143,10 @@ def run(manifest: Path, prof: profile_mod.Profile, out_dir: Path,
     design = yaml.safe_load(manifest.read_text())["design"]
     top = design["top"]
     out_dir.mkdir(parents=True, exist_ok=True)
-    root = fetch_source(design, src)
+    if "path" in design["source"]:
+        root = (manifest.parent / design["source"]["path"]).resolve()
+    else:
+        root = fetch_source(design, src)
 
     files: list[Path] = []
     cells: list[str] = []

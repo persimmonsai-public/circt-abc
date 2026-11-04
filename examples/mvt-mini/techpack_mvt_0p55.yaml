@@ -1,0 +1,25 @@
+# mvt-mini profile: 0.55 V, merged leakage-priced MVT liberty primary, tt corner
+# Invented library (lib/make_libs.py; run.sh generates it). Flow configs name it by path. ABC chooses the flavour per cell.
+schema: 1
+name: mvt_mini_mvt_0p55
+liberties:
+  # every flavour in one library, area := S*(area + W*leakage)
+  # (scripts/mvt/make_abc_lib.py): its areas are prices, not areas
+  - lib/mini_mvt_0p55v_tt_abc.lib
+  - lib/mini_rvt_0p55v_tt.lib
+  - lib/mini_lvt_0p55v_tt.lib
+  - lib/mini_slvt_0p55v_tt.lib
+time_unit: ns
+icg: {cell: MICG_X1_R, clk: CK, en: E, test_en: SE, out: ECK}
+dont_use: []
+tie: {hi: "MTIEHI_R:H", lo: "MTIELO_R:L"}
+# The threshold flavour in a cell name (MNAND2_X1_S), slowest first: the
+# flow's vt_swap stage (circt_flow/vtswap.py).
+vt_flavours:
+  tokens: [R, L, S]
+  re: '_([RLS])$'
+public: true
+flow:
+  # Per-cell delays and a real delay target for &nf: see abc/mvt.abc.
+  abc_read_lib_args: "-l"
+  abc_script_file: abc/mvt.abc

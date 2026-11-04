@@ -1,0 +1,9 @@
+# core_lv on profile ../../techpack_mvt_0p55.yaml.
+design:
+  top_module: core_lv
+  clock_period_ps: 1500
+  manifest: manifest.yaml
+pdk:
+  profile: ../../techpack_mvt_0p55.yaml
+pnr:
+  clock_port: clk_i

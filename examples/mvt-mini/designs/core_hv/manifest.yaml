@@ -1,0 +1,10 @@
+# core_hv, from this example's own RTL (a path source, not a git commit).
+design:
+  name: core_hv
+  top: core_hv
+  source:
+    path: ../../rtl
+  files:
+    - core_hv.sv
+constraints:
+  clock_port: clk_i

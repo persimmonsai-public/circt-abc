@@ -90,6 +90,562 @@ tie cells are cells of the liberties. Tie cells are only used by P&R, so
 they may instead come from the pack's own ORFS platform (`lib/*.lib` under
 `orfs_platform_dir`), for a library that has none.
 
+## Multi-Vt, multi-voltage: how the pieces fit
+
+A pack that lets synthesis choose threshold flavours (RVT/LVT/SLVT) and
+put power domains on their own supplies uses these, in this order:
+
+1. **Timed liberties.** ABC needs NLDM tables to tell flavours apart
+   (`read_lib -l`); a `_yosys`-style library without timing maps them all
+   alike. `scripts/mvt/slim_liberty.py` slims a foundry liberty to what
+   the flow needs.
+2. **A priced mapping library per rail** (`scripts/mvt/make_abc_lib.py`):
+   every flavour merged into one library whose areas are prices,
+   `S * (area + W * leakage)`, so area recovery prefers low-leakage cells
+   where there is slack. It leaves out `dont_use` cells (the mappers do not
+   read the attribute), except those `--keep` names (clock gates). It is
+   the rail's FIRST liberty; the real per-flavour libraries follow it.
+3. **Load-aware, target-driven ABC**: `flow.abc_read_lib_args: "-l"` and
+   an `abc_script_file` whose `&nf` runs with `-l -D {period}`
+   (`examples/mvt-mini/abc/mvt.abc`).
+4. **A calibrated target** (`flow.mapping_target`, "Modes and the mapping
+   target"): ABC's delay model can be far from STA's (optimistic by a
+   factor of two or more on some libraries), and with the target at the
+   period such a library maps everything at the slowest flavour.
+5. **Fanout buffering** (`flow.fanout_buffer`, "Fanout buffering"):
+   nets that leave an ABC partition reach STA unbuffered, and on a large
+   design their load, not the flavours, sets the worst path.
+6. **`vt_flavours:` and `vt_swap:`** ("Threshold-voltage swap"): after
+   synthesis, OpenSTA fixes failing paths with faster flavours (flops and
+   clock gates included, which the mappers always place at the slowest
+   flavour) and recovers leakage everywhere else.
+7. **Rails, power domains and corners** (below), with the UPF, level
+   shifters, per-mode SDCs and MCMM STA they bring.
+
+`examples/mvt-mini` is the public walk-through of all of it on an invented
+library; a pack for a foundry library applies the same pieces to it.
+
+## Rails (schema 2)
+
+A design whose blocks sit on different supplies needs one set of
+liberties per supply. The same cell names usually exist at every supply,
+so a netlist name never says which rail a cell is on; the rail is a
+property of where the cell sits. `schema: 2` describes the supplies as
+rails:
+
+```yaml
+schema: 2
+name: mytech
+icg: {cell: ICG_X1, clk: CK, en: E, test_en: SE, out: GCK}
+tie: {hi: "TIEHI:Z", lo: "TIELO:Z"}
+flow: {abc_script_file: abc/recipe.abc}  # pack defaults, every rail
+default_rail: VDD                 # where undeclared logic goes
+rails:
+  VDD:
+    voltage: 0.75
+    liberties: [lib/stdcell_0p75v.lib]  # first = the rail's primary one
+  VDD_LV:
+    voltage: 0.55
+    liberties: [lib/stdcell_0p55v.lib]
+    flow: {abc_read_lib_args: "-l"}     # per-rail flow overrides
+    # icg:, tie:, dont_use: may also be overridden per rail
+level_shifters:
+  liberties: [lib/level_shifters.lib]
+```
+
+There is no top-level `liberties:`; each rail lists its own, primary
+first, and its `flow:` is merged over the pack's key by key. Seen as a
+single-rail profile (a flow config without `power:`), a schema-2 pack is
+its default rail; `pdk.rail: <name>` in a flow config maps the whole design
+on another rail. A schema-1 pack is one implicit rail, named `default`.
+
+`techpack check` checks each rail on its own (its liberties and flow paths
+exist, its ICG and tie cells are cells of its own liberties) and the
+level-shifter liberties, and prints one line per rail. The audit refuses
+the names in every rail's liberties and the level shifters'.
+
+`level_shifters:` lists the liberties of the cells that
+`power.insert_level_shifters` (see Power domains) puts on signals crossing
+between rails. A cell qualifies when it has `is_level_shifter : true`, a
+`level_shifter_type` of `LH` (low to high), `HL` or `LH_HL`, one input and
+one output pin whose `function` is that input (no enable), and, when it
+gives them, an `input_voltage_range` / `output_voltage_range` that hold
+the two rails' voltages. The smallest-area qualifying cell is used. The
+level-shifter liberties have no corners: the same files are read at every
+corner.
+
+### Corners
+
+A schema-2 pack may also give each rail's liberties per process /
+temperature corner. A profile-level `corners:` block names the corners and
+their roles, and every rail lists every corner:
+
+```yaml
+corners:
+  names: [tt, ss, ff]
+  setup: ss          # the setup (mapping-delay) corner
+  leakage: ff        # the corner whose leakage prices the mapping library
+  hold: ff           # optional: the corner hold is checked at
+rails:
+  VDD:
+    voltage: 0.75
+    liberties: [lib/mapping_0p75v.lib, lib/stdcell_0p75v_ss.lib]
+    corners:
+      tt: [lib/stdcell_0p75v_tt.lib]
+      ss: [lib/stdcell_0p75v_ss.lib]
+      ff: [lib/stdcell_0p75v_ff.lib]
+```
+
+A rail's `liberties:` stay what the mapper reads, primary first. Left out,
+they are the setup corner's list. For a multi-Vt rail, the primary one is
+the priced liberty `scripts/mvt/make_abc_lib.py` merges. Given
+`--leakage-lib`, it takes the timing from the setup corner's libraries and
+the leakage it prices from the leakage corner's:
+
+```bash
+scripts/mvt/make_abc_lib.py lib/mapping_0p75v.lib lib/{rvt,lvt}_0p75v_ss.lib \
+  -W 0.002 -L lib/rvt_0p75v_ff.lib -L lib/lvt_0p75v_ff.lib
+```
+
+The mapping target's flop overhead (see "Modes and the mapping target"
+below) comes from the setup corner's flops. `techpack check` also checks
+every corner's liberties: they must exist and have the same cell names as
+the setup corner's, and each must hold every cell of the rail's mapping
+liberties, so a netlist mapped once can be timed at any corner. The STA stage
+(`--sta`, see Power domains) times every corner with that corner's
+liberties. The audit covers every corner's liberties. A pack without `corners:` has one
+implicit corner, the rail's liberties.
+
+`hold:` names the corner hold is checked at: vt_swap's hold guard times
+hold paths there, and the STA summary's `hold` entry reports it. Left
+out, it is the setup corner. Pick the fastest corner, which is not always
+the cold one: with temperature inversion (FinFET and GAA processes at low
+supply) the fast-process corner is fastest hot, so measure it: time a
+netlist's register-to-register hold at each fast corner and take the
+worst. A rail `corners:` without the
+pack-level block, a rail missing a corner, or `corners:` in a schema-1 pack
+is an error.
+
+## Power domains
+
+A flow config's `power:` section puts parts of the design on rails:
+
+```yaml
+pdk:
+  profile: mytech                  # a schema-2 pack
+power:
+  domains:
+    - {name: lv, rail: VDD_LV, instances: [u_core_lv]}   # instance paths,
+    - {name: aon, rail: VDD_AON, module: always_on}       # or a module
+```
+
+Everything else is on `default_rail`. An instance path is dot-separated
+from the top (`u_sub.u_core`); `module:` means every instance of that
+module. Unknown rails, unknown instances, an instance in two domains and
+nested domains are errors. A domain's module must not also be instantiated
+outside the domain or in another domain (a per-rail copy is not built yet);
+a module elaborated with different parameters is a different module, so
+two parameterizations may be on different rails.
+
+The flow then elaborates the design once (`<out>/hier/`), synthesizes each
+domain's module as its own top through the ordinary flow on its rail's
+liberties and flow defaults only (`<out>/domains/<name>/`, from a generated
+`flow.yaml` that can be re-run on its own), synthesizes the rest on the
+default rail with the domain modules as black boxes (`<out>/remainder/`),
+and stitches `<out>/1_synth/<top>.v`, a hierarchical netlist whose domain
+boundaries are module boundaries, plus the OpenSTA-compatible one.
+`<out>/power_domains.json` records, per domain, the rail and voltage, the
+instance paths, the module, the liberties (with the primary one's SHA-256)
+and ABC settings it was mapped with, its netlists, and a check that every
+cell it uses is a cell of its rail's liberties.
+
+With modes, each domain gets its own mapping target (see "Modes and the
+mapping target"). `examples/mvt-mini/`'s `mvt_top` is the worked example.
+Not done yet: `--pnr` and `--dont-touch`/`--dont-gate` with `power:`, a
+domain module also instantiated outside its domain, and nested domains.
+The domain name `top` is reserved for the top's own domain.
+
+### Power intent
+
+After stitching, the flow reads the OpenSTA form of the netlist
+(`<out>/1_synth/<top>_openroad.v`, which needs sv2v) and writes:
+
+* `<out>/power_intent.json`: every net of the top module whose driver and
+  some load are in different domains. A domain's side is an instance of
+  its module. Every other instance in the top, and the top's ports, are
+  the top's own domain on `default_rail`. Each crossing records the net,
+  the driver and loads, both domains and rails, and the rule from the
+  rails' voltages: `low_to_high`, `high_to_low`, or `same_voltage`, where
+  no shifter is needed.
+* `<out>/<top>.upf` (UPF 2.0, IEEE 1801-2009) contains:
+  * one supply port and net per rail, plus the ground (`power.ground`,
+    default `VSS`, which may not share a rail's name), with
+    `connect_supply_net`;
+  * a supply set per rail, `SS_<rail>`: its power net and the ground;
+  * `create_power_domain PD_TOP -include_scope` for the top's own domain,
+    and `PD_<name> -elements {<instances>}` per domain, each with
+    `-supply {primary SS_<rail>}`;
+  * `add_port_state` per supply with an all-on `create_pst` /
+    `add_pst_state`;
+  * `set_level_shifter` strategies that put every shifter in its
+    **receiving** domain, so a single-supply high-to-low cell is powered
+    by the low rail it drives. A crossing into a power domain is a
+    strategy on that domain's inputs with `-location self`. A crossing
+    into the top's own domain is a strategy on the driving domain's
+    outputs with `-location parent`. Each has `-input_supply_set` (the
+    driving rail's), `-output_supply_set` (the receiving rail's) and the
+    crossing ports in `-elements`.
+
+  Isolation, retention and power switches are not described: every
+  supply is always on.
+* `<out>/sdc/<mode>.sdc`, one per mode, for place and route: the mode's
+  SDC file as written, under a header. The `clock_period_ps` shorthand
+  becomes its clock with zero I/O delays.
+
+`power_domains.json` points at all of these under `intent`.
+
+The analysis needs every domain instance to be an instance of the top
+module. A domain nested inside a module of the remainder is refused, and
+so are `inout` ports and pins.
+
+### Level-shifter insertion
+
+```yaml
+power:
+  insert_level_shifters: true      # default false: P&R usually inserts them
+  domains: [...]
+```
+
+With it on, every crossing whose rule is not `same_voltage` gets one
+shifter per net and receiving domain, in the top module. The cell comes
+from the pack's `level_shifters` liberties for that direction and those
+voltages (see Rails). Its input is the driver's net, and its output, a new
+net `<net>_ls_<domain>`, feeds every load of that domain on the net.
+Instances are named `ls_<domain>_<net>`.
+
+* The shifted netlist replaces `<top>_openroad.v`, and the unshifted one
+  is kept as `<top>_unshifted_openroad.v`. `<top>.v`, the ExportVerilog
+  form, stays unshifted.
+* The flow then checks that the two netlists are the same circuit, with
+  every shifter read as a buffer. Every module but the top must be
+  byte-identical. In the top, the ports and the other instances must
+  match, and every input pin and output port must be driven by the same
+  source, following shifters. Every crossing that needs a shifter must
+  have one. A failure stops the run.
+* The UPF has no level-shifter strategies then. Each inserted shifter is
+  an element of the domain it drives into, so a high-to-low shifter into a
+  low-voltage domain is on that domain's supply, and the UPF lists the
+  instances in comments.
+* `connect_supply_net -pins` wires every inserted shifter's supply pins:
+  the input side to the driving rail, the output side to the receiving
+  rail, the ground to the ground. A pin's side comes from the liberty:
+  the power pin an input pin names in `related_power_pin` is on the input
+  side, the one an output pin names on the output side (a single-supply
+  cell's one rail is the output side), and `related_ground_pin` or a
+  ground `pg_type` marks the ground. This works on libraries whose
+  `pg_pin` groups were stripped, as long as the signal pins keep
+  `related_power_pin`. A shifter whose liberty names no supply pins gets
+  a warning and a `NOT CONNECTED` comment, never a guess.
+* Nothing is rewritten when no crossing needs a shifter.
+* A domain output that drives a top-level output port with no net in
+  between cannot be shifted. That case is refused, naming the net.
+* With the option off (the default), nothing is inserted and the netlists
+  are those of a run without it.
+
+### Static timing: `--sta` and `sta:`
+
+```yaml
+sta:                     # the section turns STA on; or pass --sta
+  enabled: true          # false keeps the settings with STA off (--sta wins)
+  corners: [tt, ss]      # default: every corner of the pack
+  modes: [func]          # default: every mode
+  chip: true             # power flows: also time the whole chip
+  boundary_budget: 0.5   # outside share of the period at domain boundaries
+  image: openroad/orfs:26Q3-277-gf9ec54a6d
+```
+
+A corner or mode that `corners:` / `modes:` names but the run lacks fails
+when the config loads, before synthesis.
+
+The stage runs OpenSTA from the ORFS image, or the binary `$OPENSTA`
+names, after synthesis. It writes `<out>/sta/summary.json` and prints a
+table of WNS/TNS (setup) per domain x corner x mode. Each view's SDC, Tcl
+and log are kept under `<out>/sta/`.
+
+A view fails the stage on an OpenSTA `Error`, and also on a warning that
+means the view is not the one asked for: a cell linked as a black box, an
+SDC object not found, or a constraint left with no objects (those
+constraints would otherwise be dropped silently). Other warnings are kept
+in the summary as `sta_warnings`.
+
+**Domains are timed separately.** OpenSTA binds a netlist cell to a
+liberty cell by name, and the same names exist on every rail and at every
+corner. One link of a mixed-rail netlist would therefore time every cell
+of a name with one rail's library. So each domain module is linked alone,
+`link_design <module>`, with its own rail's liberties at the corner. The
+domain's SDC is derived from the mode:
+
+* each mode clock whose port reaches a domain port (through the top's
+  nets, assigns and level shifters) is created on that port with the
+  mode's period, and the mode's other clocks are virtual;
+* a domain port that reaches a top-level port with a mode
+  `set_input_delay` / `set_output_delay` gets that delay, and one that
+  reaches a top-level port the mode leaves unconstrained gets 0;
+* every other boundary port, one that meets another domain or the top's
+  glue, gets `boundary_budget` (default 0.5) times the period of the
+  domain's own clock: the share left to the logic on the other side.
+  With 0.5, two domains that each pass their own view leave each other
+  half the period, so a direct path between them fits; the glue and
+  shifters in between are not counted.
+
+The top's own domain is linked with the domain modules as boundary cells:
+a generated liberty with their pins and no timing arcs. Its SDC is the
+mode's own plus 0 delays at the domain instances' pins.
+
+**The chip view times boundaries exactly.** The budget is an assumption,
+and the top's own view still uses 0 at the domain pins. The chip view
+(`chip: true`, power flows only) times the real paths. It copies the stitched netlist with every cell renamed after
+its rail (`<rail>__<cell>`) and each rail's liberties at the corner with
+the same renaming (`<out>/sta/libs/<corner>/<rail>/`). It then times the
+whole design, cross-domain paths and inserted shifters included, with the
+mode's own SDC. Each endpoint is attributed to the domain it sits in.
+
+**Hold.** Every view also records its worst hold slack by path class:
+`hold_r2r_ns` (register to register), `hold_in_ns` (from inputs) and
+`hold_out_ns` (to outputs). The summary's `hold` entry is the worst of
+each over the views at the pack's hold corner, and the table prints it.
+In a power flow with a chip view, only the chip views count: a domain
+view's boundary delays are assumptions (a port the mode leaves
+unconstrained gets 0 there, which fails hold by the flop's hold time),
+while the chip view times the real paths.
+
+```
+[sta] hold at ff (chip view, ideal clocks): worst +0.0050; reg-to-reg +0.0120, from inputs +0.0200, to outputs +0.0050
+```
+
+The I/O classes are only as real as the mode's `-min` I/O delays. An
+input delay of 0 straight into a flop fails hold by the flop's hold time.
+Give inputs a `set_input_delay -min` of an upstream flop's clock-to-Q at
+the hold corner. When several bits of a domain port carry different `-min`
+delays, the domain view takes the smallest.
+
+Limits:
+
+* the summary's WNS/TNS are setup timing, and hold is timed with ideal
+  clocks: a check of the netlist and the constraints, not signoff;
+* a clock that reaches a domain through logic other than level shifters
+  is not traced, so that domain's own view is unclocked (with a warning);
+* the level-shifter liberties have one corner, read at every corner;
+* without corners, a rail's mapping liberties are used. Those may include
+  a priced merged liberty, whose cells duplicate the real ones; OpenSTA
+  binds the first library it read that has the cell.
+
+A flow without `power:` gets one view per corner and mode, the top on its
+rail. Neither the netlist nor any other output changes when STA is off.
+
+### Fanout buffering: `flow.fanout_buffer` and `fanout_buffer:`
+
+```yaml
+# in the pack (or a rail's flow:)
+flow:
+  fanout_buffer: {cell: BUF_X4, input: A, output: Y, max_fanout: 16}
+# in a flow config: override any key, or turn it off
+fanout_buffer: {max_fanout: 32}      # or: fanout_buffer: false
+```
+
+ABC maps each partition on its own and never sees a net that leaves it,
+and the register and clock-gate logic outside ABC buffers nothing either,
+so a flop or gate driving hundreds of pins across partitions reaches STA
+with its whole load on one output. On a large design those nets, not the
+logic, set the worst path, and the vt_swap stage, which only changes
+flavours, cannot fix them: it moves cells faster chasing a load it cannot
+change.
+
+When the pack (or the flow config) sets a buffer cell, a single-domain
+run buffers its flat OpenSTA netlist after synthesis, before vt_swap and
+STA (`circt_flow/fanout.py`): every net driven by one cell output with
+more than `max_fanout` cell input pins, none of them a clock pin
+(`clock : true`; clock trees are CTS's), gets a balanced tree of the
+buffer cell. Loads are grouped in instance-name order, so pins of one
+hierarchy branch share a buffer, a stand-in for placement. The driver
+keeps its net, so ports and `assign`s that read it are untouched. Nets
+driven by a port are left alone. The unbuffered netlist is kept as
+`<top>_prebuf_openroad.v`, and `<out>/fanout.json` lists the counts and
+the largest nets. P&R's `repair_design` rebuilds the trees on a real
+placement; this stage exists so that timing before P&R, and the swap
+driven by it, see realistic loads.
+
+**In a power flow** the stage runs after the intent step (crossings, UPF,
+level shifters) and before vt_swap, on the stitched OpenSTA netlist, one
+module at a time with that module's rail's cells (the top and the glue on
+the default rail; one buffer cell for every rail, checked in each). A
+submodule's input port counts as a driver: a domain's flops sit in its
+module and ABC's logic in a `_residual` submodule, so a flop's net fans
+out through a port, and its tree is built on the load side, inside the
+submodule. The top's own inputs are left alone, as in a flat run. Nets
+that cross a domain boundary end on module ports, so the crossings and
+their level shifters stay as the intent step left them, and every buffer
+sits in a module of its domain (the UPF names module instances). A module
+under domains of two rails is not buffered (a warning says so).
+
+### Threshold-voltage swap: `--vt-swap` and `vt_swap:`
+
+```yaml
+# the tech pack: how a cell name carries its flavour, slowest first
+vt_flavours:
+  tokens: [R, L, SL]
+  re: '_(SL|R|L)_'           # one group: the token (default `_([A-Z]+)$`)
+
+# the flow config: the section turns the stage on; or pass --vt-swap
+vt_swap:
+  false_from: [rst_ni]       # ports whose paths are not timed
+  paths: 200                 # failing paths whose cells move per iteration
+  max_iter: 30
+  recover: true
+  margin_ps: 0               # setup slack to keep in hand for P&R
+```
+
+ABC chooses flavours on its own delay model, which can be far from the
+libraries' (by a factor of two or more on some libraries), and the
+register mapper and
+clock-gate inference always place the slowest flavour. The stage corrects
+both with real timing. It runs OpenSTA on the OpenSTA netlist after
+synthesis, before the STA stage, with the rail's setup-corner libraries
+(its mapping liberties when the pack has no corners, so such a pack must
+not list a priced library first) and the tightest mode's SDC plus
+`false_from:`:
+
+1. **Fix.** While the worst setup slack is below `margin_ps`, every
+   instance on the worst `paths` paths below it moves one flavour faster,
+   flops and clock gates included. An iteration that does not improve the
+   worst slack is undone and ends the loop (faster cells load their
+   drivers slightly more, which can hurt on long, heavily loaded paths).
+   Faster cells shorten hold paths too. When an iteration takes the worst
+   hold slack below `min(0, hold slack before the swap)`, its moved cells
+   on the failing hold paths go back and are frozen for the rest of the
+   swap (`held` in the record); if hold is still worse, the whole
+   iteration is undone. Hold is timed on the same SDC with ideal clocks
+   at the pack's hold corner (`corners.hold`; its libraries are read
+   with `read_liberty -min` and the setup corner's with `-max`, so one
+   OpenSTA session times both). This keeps the swap from creating
+   violations rather than signing hold off.
+2. **Recover.** Instances above the slowest flavour step one flavour
+   slower in batches of 256: a batch stays if the worst slack holds at
+   `min(margin_ps, slack after fixing)` (and, for a design the fix did not
+   close, the total negative slack at its value after fixing), otherwise
+   it is undone and
+   halved, down to single cells; passes repeat until nothing moves. Timing
+   updates then grow with the cells that must stay fast rather than with
+   every candidate (one update per cell is far too slow on a large
+   netlist).
+
+Flavours of one cell share area, footprint and pins, so the swap renames
+cell types and nothing else. The unswapped netlist is kept as
+`<top>_preswap_openroad.v`, and `<out>/vt_swap.json` lists every swap with
+the slack before and after. `scripts/mvt/vt_swap.py` runs the same swap on
+any netlist.
+
+**In a power flow** the stage runs after the intent step (crossings, UPF,
+level shifters) and before STA, on the **chip view** as the STA stage
+builds it: the whole stitched netlist with every cell renamed after its
+rail (`<rail>__<cell>`) and each rail's setup-corner libraries renamed the
+same way, timed with the mode's own SDC. Every path is exact, cross-domain
+ones and level shifters included. The tightest mode fixes and recovers;
+each other mode then fixes only. The changes go back into the stitched
+netlist with the prefixes stripped; a module under domains of two rails
+is not swapped (a warning says so).
+
+Swapping each domain alone in its own view was tried first and is not
+sound: the view misses the glue and shifters on the domain's inputs, so
+its recovery can leave a cross-domain path that passes in the domain's own
+view failing in the chip view.
+
+`examples/mvt-mini` shows the swap on its cores and power designs (its
+README has the numbers).
+
+## Modes and the mapping target
+
+`design.clock_period_ps` is the single-mode shorthand: one clock of that
+period on the design's clock port (`pnr.clock_port`, else the manifest's
+`constraints.clock_port`). A flow config may instead name one SDC file per
+mode:
+
+```yaml
+modes:
+  func:  func.sdc                 # relative to the flow config
+  turbo: {sdc: turbo.sdc}
+mapping_target:                   # optional; these are the defaults
+  flop_overhead: auto             # auto | <ps> | false
+  flop_cells: []                  # restrict `auto` to these flops
+  scale: 1.0                      # in (0, 2]
+```
+
+With `modes:`, `clock_period_ps` may be left out; it then defaults to the
+tightest clock of any mode. The SDC subset read is listed below. Anything
+else is printed as a warning and ignored:
+
+* `create_clock -period <p> [-name <n>] [get_ports <port>]` (or
+  `{<ports>}`); without `-name` the clock is named after its port; without
+  a port it is a virtual clock, which clocks no domain;
+* `set_input_delay` / `set_output_delay <d> -clock <n> [-max|-min] <ports>`
+  (not used for mapping; the STA stage maps them onto each domain's
+  boundary, see "Static timing");
+* `set_units -time ns|ps`. Otherwise SDC times are in the pack's
+  `time_unit`.
+
+`#` comments, `;` and `\` continuations are honoured. Tcl variables and
+expressions are not.
+
+**The mapping target.** With `modes:` or `mapping_target:`, ABC no longer
+gets the raw clock period as its delay target (`clock-period-ps`, the
+`{period}` of an `abc_script_file`, `&nf -D`). For each domain (the whole
+design without `power:`) it gets
+
+```
+target = floor(scale * (min over modes of the domain's clock period - flop overhead))
+```
+
+* A domain's clocks are the SDC clocks whose ports reach its instances'
+  ports in the elaborated hierarchy (directly, or through a
+  `seq.to_clock`/`from_clock`/`hw.wire`), or its `clocks:` list
+  (`- {name: hv, rail: VDD, instances: [u_hv], clocks: [clk_hv]}`). The
+  part of the design outside every domain gets every port clock.
+* `flop_overhead: auto` subtracts the worst clock-to-Q + setup over the
+  flops (cells with an `ff` group) of the domain's rail at the setup
+  corner. A pack without corners uses its mapping liberties. Clock-to-Q
+  is read at the smallest clock transition in its table and a load of 4x
+  the flop's largest input-pin capacitance (FO4, interpolated); setup at
+  the smallest transitions of its constraint table; each is the larger of
+  rise and fall. `flop_cells` restricts the search, for instance to the
+  flops the register mapper picks. A number subtracts that many ps, and
+  `false` subtracts nothing.
+* `scale` multiplies the result. A value above 1 corrects for ABC's
+  estimate being pessimistic: `&nf -l`'s own delay estimate ran about
+  1.2x above STA on `examples/mvt-mini`.
+
+The derivation is printed per domain (`[mapping-target]` /
+`[power] mapping target`), written to `<out>/mapping_target.json`, and for
+a power flow stored in `power_domains.json` under each domain's
+`mapping_target`, with the modes and corners. Each domain's generated
+`flow.yaml` carries the target as `design.abc_delay_target_ps` and the
+tightest period as `clock_period_ps`. A flow config may also set
+`design.abc_delay_target_ps` directly. Without `modes:` and
+`mapping_target:` (in the flow config or the pack), nothing changes: ABC
+gets `clock_period_ps`.
+
+**A pack-level calibration.** How optimistic ABC's delay model is depends
+on the library, so a tech pack may set `flow: {mapping_target: {...}}`
+(the same keys), and a rail may override it in its own `flow:`. Every run
+on the pack then calibrates; in a power flow each domain uses its own
+rail's. A flow config's `mapping_target:` replaces the pack's. When the
+load-aware model is optimistic, a target at the period leaves ABC all
+the slack it thinks it has to recover leakage with: it chooses the
+slowest flavour everywhere and the netlist misses timing in STA. A
+`scale` below 1 corrects that. Calibrate it per rail, since the error
+depends on the supply too: sweep `scale` on a representative design at a
+clock the slowest flavour cannot meet, and keep the value with the least
+leakage that still meets timing after vt_swap.
+
 ## Finding a pack
 
 A flow config names the technology:

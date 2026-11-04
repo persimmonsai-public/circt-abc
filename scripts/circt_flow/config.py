@@ -83,6 +83,68 @@ class DesignConfig:
     pack_pnr: dict = field(default_factory=dict)
     # A pack that does not say `public: true`: its outputs are its data.
     pack_private: bool = False
+    # pdk.rail: the profile's supply rail this run maps on (a schema-2
+    # pack; default its default_rail), and that rail's voltage.
+    rail: Optional[str] = None
+    voltage: Optional[float] = None
+    # design.core_mlir (relative to the flow.yaml): start from this core
+    # MLIR instead of running the front end. The power flow uses it for
+    # each domain's sub-run.
+    core_mlir: Optional[Path] = None
+    # The flow.yaml's `power:` section, validated (power.parse_power): a
+    # tuple of power.Domain. None runs the ordinary single-domain flow.
+    power: Optional[tuple] = None
+    # The flow.yaml's `modes:` (modes.parse_modes): a tuple of modes.Mode,
+    # each from its SDC file; None when the config gives only
+    # clock_period_ps (the single-mode shorthand).
+    modes: Optional[tuple] = None
+    # `mapping_target:` (modes.TargetSpec). Set, the value ABC gets is
+    # calibrated (modes.derive_target); None (no modes: and no
+    # mapping_target:) leaves it clock_period_ps, as before.
+    mapping_target: Optional[object] = None
+    # True when mapping_target came from the pack's flow: default rather
+    # than the flow config: each power domain then uses its own rail's.
+    mapping_target_from_pack: bool = False
+    # design.abc_delay_target_ps: the value ABC gets as clock-period-ps,
+    # given outright (the power flow writes each domain's derived target
+    # here). None: clock_period_ps, or the calibrated target.
+    abc_delay_target_ps: Optional[int] = None
+    # The design's clock port (pnr.clock_port, else the manifest's
+    # constraints.clock_port): where the shorthand mode's clock is.
+    clock_port: Optional[str] = None
+    # The profile's time unit: SDC times are in it.
+    time_unit: str = "ns"
+    # The flow config's `sta:` section (sta.StaSpec); None without one.
+    sta: Optional[object] = None
+    # The flow config's `vt_swap:` section (vtswap.VtSwapSpec); None without
+    # one.
+    vt_swap: Optional[object] = None
+    # Pre-placement fanout buffering (fanout.FanoutSpec): the pack's
+    # flow.fanout_buffer merged with the flow config's fanout_buffer:;
+    # None when neither sets one or the config turns it off.
+    fanout: Optional[object] = None
+    # The power: section's options besides domains (power.parse_options):
+    # insert_level_shifters, ground.
+    power_options: dict = field(default_factory=dict)
+
+    @property
+    def abc_target_ps(self) -> int:
+        """What the abc-bridge gets as clock-period-ps ({period})."""
+        return (self.abc_delay_target_ps if self.abc_delay_target_ps
+                is not None else self.clock_period_ps)
+
+    @property
+    def calibrate(self) -> bool:
+        return (self.mapping_target is not None
+                and self.abc_delay_target_ps is None)
+
+    def effective_modes(self) -> tuple:
+        """The modes, or the clock_period_ps shorthand as one mode."""
+        from . import modes as modes_mod
+        if self.modes:
+            return self.modes
+        return (modes_mod.shorthand_mode(self.clock_period_ps,
+                                         self.clock_port),)
 
     @property
     def lib(self) -> str:
@@ -114,8 +176,21 @@ class DesignConfig:
         tie: dict = {}
         flow_defaults: dict = {}
         pack_root, pack_pnr, pack_private = None, {}, False
+        rail = cfg["pdk"].get("rail")
+        voltage = None
+        prof = None
+        if profile is None and (rail is not None or "power" in cfg):
+            raise ValueError(f"{config_path}: pdk.rail and power: need a "
+                             "pdk.profile (a schema-2 tech pack)")
         if profile is not None:
             prof = profile_mod.load(profile)
+            if rail is not None:
+                if rail not in prof.rails:
+                    raise ValueError(
+                        f"{config_path}: pdk.rail {rail!r} is not a rail of "
+                        f"{prof.name}; rails: {', '.join(prof.rails)}")
+                prof = prof.for_rail(str(rail))
+            rail, voltage = prof.rail, prof.voltage
             libs = [str(p) for p in prof.synth_libs]
             dont_use = prof.dont_use
             tie = prof.tie
@@ -124,9 +199,62 @@ class DesignConfig:
             pack_private = prof.root is not None and not prof.public
         else:
             libs = list(cfg["pdk"]["synth_lib_tt"])
-        return cls(
+        power = None
+        power_options: dict = {}
+        if cfg.get("power") is not None:
+            from . import power as power_mod
+            power = power_mod.parse_power(cfg["power"], prof, config_path)
+            power_options = power_mod.parse_options(cfg["power"],
+                                                    config_path, prof)
+        sta_spec = None
+        if "sta" in cfg:
+            from . import sta as sta_mod
+            sta_spec = sta_mod.parse_sta(cfg["sta"], config_path)
+        vt_swap_spec = None
+        if "vt_swap" in cfg:
+            from . import vtswap as vtswap_mod
+            vt_swap_spec = vtswap_mod.parse_vt_swap(cfg["vt_swap"],
+                                                    config_path)
+        from . import fanout as fanout_mod
+        fanout_spec = fanout_mod.parse_spec(
+            flow_defaults.get("fanout_buffer"), cfg.get("fanout_buffer"),
+            str(config_path))
+        core_mlir = cfg["design"].get("core_mlir")
+        from . import modes as modes_mod
+        time_unit = prof.time_unit if prof is not None else "ns"
+        modes = None
+        if cfg.get("modes") is not None:
+            modes = modes_mod.parse_modes(cfg["modes"], here, config_path,
+                                          time_unit)
+            for m in modes:
+                for w in m.warnings:
+                    print(f"[circt_flow] WARNING: mode {m.name}: {w}")
+        target = None
+        target_from_pack = False
+        if modes is not None or cfg.get("mapping_target") is not None:
+            target = modes_mod.parse_target(cfg.get("mapping_target"),
+                                            config_path)
+        if cfg.get("mapping_target") is None and \
+                flow_defaults.get("mapping_target") is not None:
+            target = modes_mod.parse_target(flow_defaults["mapping_target"],
+                                            f"{profile}: flow")
+            target_from_pack = True
+        period = cfg["design"].get("clock_period_ps")
+        if period is None:
+            if modes is None:
+                raise KeyError(f"{config_path}: design.clock_period_ps is "
+                               "required without modes:")
+            # The tightest clock of any mode.
+            period = min(c.period_ps for m in modes
+                         for c in m.clocks.values() if c.ports)
+        abc_target = cfg["design"].get("abc_delay_target_ps")
+        clock_port = (cfg.get("pnr") or {}).get("clock_port")
+        if clock_port is None and manifest is not None and manifest.is_file():
+            clock_port = ((yaml.safe_load(manifest.read_text()) or {})
+                          .get("constraints") or {}).get("clock_port")
+        obj = cls(
             top_module=cfg["design"]["top_module"],
-            clock_period_ps=int(cfg["design"]["clock_period_ps"]),
+            clock_period_ps=int(round(float(period))),
             synth_lib_tt=libs,
             pnr=cfg.get("pnr"),
             manifest=manifest,
@@ -137,7 +265,44 @@ class DesignConfig:
             pack_root=pack_root,
             pack_pnr=pack_pnr,
             pack_private=pack_private,
+            rail=rail,
+            voltage=voltage,
+            core_mlir=rel(core_mlir),
+            power=power,
+            modes=modes,
+            mapping_target=target,
+            mapping_target_from_pack=target_from_pack,
+            abc_delay_target_ps=(int(abc_target) if abc_target is not None
+                                 else None),
+            clock_port=clock_port,
+            time_unit=time_unit,
+            sta=sta_spec,
+            vt_swap=vt_swap_spec,
+            fanout=fanout_spec,
+            power_options=power_options,
         )
+        if sta_spec is not None:
+            # Names the run cannot honour fail here, not after synthesis.
+            from . import sta as sta_mod
+            sta_mod.check_names(sta_spec, sta_mod.corner_names(prof),
+                                [m.name for m in obj.effective_modes()],
+                                config_path)
+        return obj
+
+
+def _read_lib_args(base: Optional[str], dont_use) -> Optional[str]:
+    """ABC's read_lib arguments: `base` (the command line's, else the
+    pack's flow default) plus `-X <pattern>` for each of the profile's
+    dont_use patterns it does not already carry. The patterns used to be
+    dropped whenever read_lib arguments were set (e.g. "-l" for the
+    load-aware genlib), which let ABC map onto dont_use cells."""
+    base = (base or "").strip()
+    have = base.split()
+    extra = [f"-X {p}" for p in dont_use
+             if not any(have[i] == "-X" and have[i + 1] == p
+                        for i in range(len(have) - 1))]
+    out = " ".join([base] + extra).strip()
+    return out or None
 
 
 @dataclass(frozen=True)
@@ -194,8 +359,15 @@ class FlowConfig:
     # SV2V, which wins over any image).
     sv2v_docker_image: str = "circt-abc"
     directives: DirectiveSet = field(default_factory=DirectiveSet)
+    # --sta: run the STA stage (sta.py) even without an sta: section.
+    run_sta: bool = False
+    run_vt_swap: bool = False
 
     root: Path = field(default_factory=lambda: ROOT)
+    # The explicit (command-line) arguments load() was given, so the power
+    # flow can load each domain's sub-run with the same overrides.
+    load_overrides: dict = field(default_factory=dict, compare=False,
+                                 repr=False)
 
     @staticmethod
     def default_circt_abc_opt(root: Path = ROOT) -> Path:
@@ -234,6 +406,8 @@ class FlowConfig:
         abc_use_mapped_if_present: bool = False,
         abc_keep_buffers: bool = False,
         skip_unmappable: Optional[bool] = None,
+        run_sta: bool = False,
+        run_vt_swap: bool = False,
         root: Path = ROOT,
     ) -> "FlowConfig":
         """Build a FlowConfig for `config_path`/`out_dir`.
@@ -243,6 +417,23 @@ class FlowConfig:
         run_circt_native_synth.sh's `${VAR:-default}` behavior exactly,
         with an additional (new) explicit-argument level on top.
         """
+        overrides = {k: v for k, v in dict(
+            circt_abc_opt=circt_abc_opt, circt_opt=circt_opt,
+            abc_bin=abc_bin, enable_classical_resub=enable_classical_resub,
+            sv2v_docker_image=sv2v_docker_image, directives=directives,
+            partitions=partitions, abc_pool_size=abc_pool_size,
+            partition_workdir=partition_workdir,
+            abc_script_file=abc_script_file,
+            abc_read_lib_args=abc_read_lib_args,
+            abc_save_aig_dir=abc_save_aig_dir,
+            abc_use_datapath=abc_use_datapath,
+            abc_save_mapped_dir=abc_save_mapped_dir,
+            abc_use_mapped_dir=abc_use_mapped_dir,
+            abc_use_mapped_if_present=abc_use_mapped_if_present,
+            abc_keep_buffers=abc_keep_buffers,
+            skip_unmappable=skip_unmappable, run_sta=run_sta,
+            run_vt_swap=run_vt_swap).items()
+            if v is not None and v is not False}
         env = os.environ if env is None else env
         config_path = Path(config_path)
         out_dir = Path(out_dir)
@@ -307,10 +498,9 @@ class FlowConfig:
             partition_workdir=resolved_partition_workdir,
             abc_script_file=(Path(abc_script_file) if abc_script_file
                              else pack.get("abc_script_file")),
-            abc_read_lib_args=(
+            abc_read_lib_args=_read_lib_args(
                 abc_read_lib_args if abc_read_lib_args is not None
-                else pack.get("abc_read_lib_args")
-                or " ".join(f"-X {p}" for p in design.dont_use) or None),
+                else pack.get("abc_read_lib_args"), design.dont_use),
             abc_save_aig_dir=Path(abc_save_aig_dir) if abc_save_aig_dir else None,
             abc_use_datapath=bool(abc_use_datapath),
             abc_save_mapped_dir=Path(abc_save_mapped_dir) if abc_save_mapped_dir else None,
@@ -318,7 +508,10 @@ class FlowConfig:
             abc_use_mapped_if_present=abc_use_mapped_if_present,
             abc_keep_buffers=bool(abc_keep_buffers),
             skip_unmappable=bool(skip_unmappable),
+            run_sta=bool(run_sta),
+            run_vt_swap=bool(run_vt_swap),
             root=root,
+            load_overrides=overrides,
         )
 
     def validate_tools(self) -> None:

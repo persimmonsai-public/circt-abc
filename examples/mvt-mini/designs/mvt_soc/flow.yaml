@@ -1,0 +1,23 @@
+# mvt_soc on the corners pack (techpack_corners.yaml), two modes. Each
+# domain's mapping target is the tightest period of the clock that reaches
+# it over func and turbo (hv: turbo's 1300 ps, lv: func's 1800 ps), minus
+# its rail's worst flop clock-to-Q + setup at the setup corner (ss); the
+# mapping library has ss timing and ff leakage prices. clock_period_ps is
+# left out: with modes it defaults to the tightest clock.
+design:
+  top_module: mvt_soc
+  manifest: manifest.yaml
+pdk:
+  profile: ../../techpack_corners.yaml
+modes:
+  func: func.sdc
+  turbo: turbo.sdc
+mapping_target:
+  flop_overhead: auto
+  scale: 1.0
+power:
+  domains:
+    - {name: lv, rail: VDD_LV, instances: [u_lv]}
+    - {name: hv, rail: VDD_HV, instances: [u_hv]}
+pnr:
+  clock_port: clk_hv_i

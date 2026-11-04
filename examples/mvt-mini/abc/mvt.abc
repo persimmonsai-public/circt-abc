@@ -1,0 +1,20 @@
+# The abc-bridge's default script (ABCBridge.cpp), with both &nf calls in
+# load-aware mode (-l). Two reasons, both found on this example:
+#  * read_lib's default genlib gives every cell of a function class the
+#    class's AVERAGE delay, so RVT/LVT/SLVT (and X1/X2) look equally fast
+#    and &nf picks only on area. `read_lib -l` (flow.abc_read_lib_args)
+#    keeps each cell's own delay.
+#  * &nf reads -D only with -l (giaNf.c, Nf_ManPerformMappingInt); without
+#    it the clock period has no effect on the mapping.
+# {period} is the flow's clock period in ps.
+strash; scorr; dc2
+&get -n; &deepsyn -J 100 -I 4 -S 200 -T 10; &put
+strash; &get -n; &dch -f; &if -C 32 -K 6; &put
+strash; &get -n; &resub -N 2; &put
+# &resub is a stub in this ABC (Gia_ManResub2 returns NULL: "Transformation
+# has failed"); the bridge's own recipe follows it with classical resub
+# (enable-classical-resub, on by default), which a script file replaces,
+# so it is spelled out here.
+resub -K 16 -N 3
+strash; &get -n; &dch -f; &nf -l -C 32 -D {period}; &put
+strash; &get -n; &nf -l -D {period}; &put

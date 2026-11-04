@@ -65,6 +65,16 @@ def run_lower_ibex(cfg: FlowConfig, env: dict | None = None) -> Path:
     """
     import os
 
+    if cfg.design.core_mlir is not None:
+        # design.core_mlir: an already-lowered design (the power flow's
+        # per-domain sub-runs); the front end does not run.
+        src = Path(cfg.design.core_mlir)
+        print(f"[circt_flow] core MLIR given: {src}")
+        if not src.is_file():
+            raise FileNotFoundError(f"design.core_mlir {src} does not exist")
+        if src.resolve() != cfg.core_mlir_raw.resolve():
+            shutil.copyfile(src, cfg.core_mlir_raw)
+        return cfg.core_mlir_raw
     if cfg.design.manifest is not None:
         from . import frontend, profile as profile_mod
         print("[circt_flow] frontend (manifest) + LLHD lowering")
@@ -568,7 +578,7 @@ def _abc_bridge_opt(cfg: FlowConfig, extra: str = "") -> str:
     enable_classical_resub = "true" if cfg.enable_classical_resub else "false"
     opt = (
         f"--abc-bridge=liberty={cfg.design.lib} abc-path={cfg.abc_bin} "
-        f"stubs={cfg.stubs} clock-period-ps={cfg.design.clock_period_ps} "
+        f"stubs={cfg.stubs} clock-period-ps={cfg.design.abc_target_ps} "
         f"enable-classical-resub={enable_classical_resub}"
     )
     if cfg.abc_script_file:

@@ -1,0 +1,13 @@
+# mvt_top: core_lv (0.55 V) feeding core_hv (0.75 V), from this example's
+# own RTL (a path source, not a git commit).
+design:
+  name: mvt_top
+  top: mvt_top
+  source:
+    path: ../../rtl
+  files:
+    - core_lv.sv
+    - core_hv.sv
+    - mvt_top.sv
+constraints:
+  clock_port: clk_i

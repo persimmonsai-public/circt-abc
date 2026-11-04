@@ -13,7 +13,40 @@ A tech pack (doc/techpacks.md) is a profile kept outside the repo, as
 `${VAR}` and `${VAR:-default}` expand from the environment, and it may add
 `flow:` defaults (FLOW_DEFAULTS), a `pnr:` section (a pack-local ORFS
 platform, or a P&R command of its own) and the leak audit's `deny_terms:`,
-`deny_exceptions:` and `public:`. A flow config names a
+`deny_exceptions:` and `public:`.
+
+Schema 2 adds supply rails, for designs whose power domains sit on
+different supplies (doc/techpacks.md, "Rails"):
+
+    schema: 2
+    default_rail: VDD
+    rails:
+      VDD:    {voltage: 0.75, liberties: [...], flow: {...}}
+      VDD_LV: {voltage: 0.55, liberties: [...]}
+    level_shifters: {liberties: [...]}
+
+Each rail has its own liberties (the first is its mapping-primary one) and
+may override the pack's `flow:` defaults and its `icg`, `tie` and
+`dont_use`. A schema-2 profile's `liberties`, `flow`, `icg`, `tie` and
+`dont_use` are its default rail's, so every single-rail caller keeps
+working; `for_rail()` gives the same view of another rail.
+
+Corners (schema 2, optional): a profile-level block names the corners and
+their roles, and each rail lists its liberties per corner:
+
+    corners:
+      names: [tt, ss, ff]
+      setup: ss        # the mapping-delay corner: its timing drives mapping
+      leakage: ff      # the corner whose leakage the mapping library prices
+    rails:
+      VDD: {voltage: 0.75, liberties: [priced.lib, ...],   # mapping list
+            corners: {tt: [...], ss: [...], ff: [...]}}
+
+A rail's `liberties:` stays what the mapper reads; without it, it is the
+setup corner's list. Every rail must list every corner and nothing else.
+A pack without `corners:` has one implicit corner, the rail's liberties.
+A schema-1 pack
+or a repo profile is one implicit rail, IMPLICIT_RAIL. A flow config names a
 profile either by path or by name; resolve() finds a name in the packs
 enclosing the flow config, then on CIRCT_ABC_TECH_PATH, then as a
 <name>-techpack checkout beside the repo, then in profiles/.
@@ -27,9 +60,9 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import yaml
 
@@ -41,13 +74,57 @@ REPO_PROFILES = Path(__file__).resolve().parent.parent.parent / "profiles"
 # pass knobs, applied only where the environment leaves them unset.
 FLOW_DEFAULTS = {"sv2v_docker_image": str, "abc_script_file": Path,
                  "abc_read_lib_args": str, "enable_classical_resub": bool,
-                 "partitions": int, "env": dict}
+                 "partitions": int, "env": dict,
+                 # The mapping target's calibration (modes.parse_target
+                 # keys): how optimistic ABC's delay model is on this
+                 # library is a property of the library, so a pack (or one
+                 # of its rails) may set the scale; a flow config's own
+                 # mapping_target: replaces it.
+                 "mapping_target": dict,
+                 # Pre-placement fanout buffering (fanout.py): the buffer
+                 # cell, its pins and the fanout limit.
+                 "fanout_buffer": dict}
 ENV_PREFIX = "CIRCT_FLOW_"
+# The one rail of a schema-1 pack or a repo profile.
+IMPLICIT_RAIL = "default"
+# What a schema-2 rail may set besides its voltage and liberties.
+RAIL_KEYS = {"voltage", "liberties", "flow", "icg", "tie", "dont_use",
+             "corners"}
+# The profile-level corners: block.
+CORNER_KEYS = {"names", "setup", "leakage", "hold"}
+CORNER_ROLES = ("setup", "leakage")  # required; `hold` is optional
 
 
 def cache_root() -> Path:
     base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
     return Path(os.environ.get("CIRCT_ABC_CACHE", Path(base) / "circt-abc"))
+
+
+@dataclass(frozen=True)
+class Rail:
+    """One supply rail: its voltage (None for an implicit rail), its
+    liberties (the first is mapping-primary), and the pack's `flow:`,
+    `icg`, `tie` and `dont_use` with the rail's own overrides applied."""
+    name: str
+    voltage: Optional[float]
+    liberties: List[Path]
+    flow: dict = field(default_factory=dict)
+    icg: dict = field(default_factory=dict)
+    tie: dict = field(default_factory=dict)
+    dont_use: List[str] = field(default_factory=list)
+    # {corner: liberties}, every corner of the profile; empty without
+    # corners (the rail's one implicit corner is `liberties`).
+    corners: Dict[str, List[Path]] = field(default_factory=dict)
+
+    def libs_at(self, corner: Optional[str]) -> List[Path]:
+        """The rail's liberties at `corner` (its mapping liberties when the
+        profile has no corners or `corner` is None)."""
+        if not self.corners or corner is None:
+            return list(self.liberties)
+        if corner not in self.corners:
+            raise KeyError(f"rail {self.name}: no corner {corner!r}; "
+                           "corners: " + ", ".join(self.corners))
+        return list(self.corners[corner])
 
 
 @dataclass(frozen=True)
@@ -75,12 +152,76 @@ class Profile:
     deny_terms: List[str] = field(default_factory=list)
     deny_exceptions: List[str] = field(default_factory=list)
     public: bool = False
+    # The pack's schema (1 for a repo profile), its rails by name, the rail
+    # the single-rail fields above describe (`rail`), the rail undeclared
+    # logic sits on (`default_rail`), and the level-shifter liberties.
+    schema: int = 1
+    rails: Dict[str, Rail] = field(default_factory=dict)
+    rail: str = IMPLICIT_RAIL
+    default_rail: str = IMPLICIT_RAIL
+    level_shifters: List[Path] = field(default_factory=list)
+    # `vt_flavours: {tokens: [slowest, ..., fastest], re: <regex>}`: how a
+    # cell name carries its threshold flavour (vtswap.py); None without.
+    vt_flavours: Optional[dict] = None
+    # Schema 2 `corners:`: the corner names in order, and {role: corner}
+    # for the roles in CORNER_ROLES. Both empty without corners.
+    corner_names: List[str] = field(default_factory=list)
+    corner_roles: Dict[str, str] = field(default_factory=dict)
+
+    @property
+    def setup_corner(self) -> Optional[str]:
+        return self.corner_roles.get("setup")
+
+    @property
+    def leakage_corner(self) -> Optional[str]:
+        return self.corner_roles.get("leakage")
+
+    @property
+    def hold_corner(self) -> Optional[str]:
+        """The corner hold is checked at: `corners.hold`, else the setup
+        corner (None without corners)."""
+        return self.corner_roles.get("hold", self.setup_corner)
+
+    def libs_at(self, corner: Optional[str] = None,
+                rail: Optional[str] = None) -> List[Path]:
+        """Rail `rail`'s (default: this view's rail) liberties at `corner`
+        (default: the setup corner; the mapping liberties without
+        corners)."""
+        r = self.rails[rail or self.rail]
+        return r.libs_at(corner if corner is not None else self.setup_corner)
 
     @property
     def synth_libs(self) -> List[Path]:
         """What the flow's pdk.synth_lib_tt gets: the merged liberty for an
         ORFS profile, the listed ones otherwise (the first is primary)."""
         return self.liberties
+
+    @property
+    def voltage(self) -> Optional[float]:
+        r = self.rails.get(self.rail)
+        return r.voltage if r else None
+
+    def all_liberties(self) -> List[Path]:
+        """Every rail's liberties and the level shifters', once each."""
+        seen: Dict[Path, None] = {}
+        for libs in [*(r.liberties for r in self.rails.values()),
+                     *(c for r in self.rails.values()
+                       for c in r.corners.values()),
+                     self.liberties, self.level_shifters]:
+            for p in libs:
+                seen.setdefault(p, None)
+        return list(seen)
+
+    def for_rail(self, name: str) -> "Profile":
+        """This profile as seen from rail `name`: its liberties, flow
+        defaults, ICG, tie cells and dont_use are that rail's."""
+        if name not in self.rails:
+            raise KeyError(f"profile {self.name}: no rail {name!r}; rails: "
+                           + ", ".join(self.rails))
+        r = self.rails[name]
+        return replace(self, liberties=list(r.liberties), flow=dict(r.flow),
+                       icg=dict(r.icg), tie=dict(r.tie),
+                       dont_use=list(r.dont_use), rail=name)
 
 
 def _block_end(text: str, open_brace: int) -> int:
@@ -249,17 +390,222 @@ def resolve(ref: str, config_dir: Optional[Path] = None) -> Path:
                             f"enclosing {config_dir}, " + ", ".join(tried))
 
 
+def _flow_section(flow_d: dict, base: Path, where: str) -> dict:
+    """A `flow:` mapping, checked against FLOW_DEFAULTS, paths resolved."""
+    flow = {}
+    for k, v in (flow_d or {}).items():
+        if k not in FLOW_DEFAULTS:
+            raise KeyError(f"{where}.{k} is not a pack default; "
+                           f"allowed: {', '.join(FLOW_DEFAULTS)}")
+        if FLOW_DEFAULTS[k] is Path:
+            v = expand(v, base)
+        elif k == "mapping_target":
+            from .modes import parse_target
+            parse_target(v, where)  # checked here, parsed where used
+        elif k == "fanout_buffer":
+            from .fanout import parse_spec
+            parse_spec(v, None, where)
+        elif k == "env":
+            bad = [e for e in v if not e.startswith(ENV_PREFIX)]
+            if bad:
+                raise KeyError(f"{where}.env.{bad[0]} is not a "
+                               f"{ENV_PREFIX}* pass knob")
+            # The knobs test for "1"; a YAML boolean means the same.
+            v = {e: str(int(x)) if isinstance(x, bool) else str(x)
+                 for e, x in v.items()}
+        flow[k] = v
+    return flow
+
+
+def _icg_section(icg_d: dict, base: Path, pack: bool, where: str) -> dict:
+    icg = dict(icg_d)
+    if "netlist" in icg:
+        if not pack:
+            raise KeyError(f"{where}.netlist needs a tech pack")
+        icg["netlist"] = expand(icg["netlist"], base)
+    return icg
+
+
+def _corners_section(d: dict, path: Path) -> Tuple[List[str], Dict[str, str]]:
+    """A schema-2 pack's `corners:` block: (names, {role: corner})."""
+    c = d.get("corners")
+    if c is None:
+        return [], {}
+    where = f"{path}: corners"
+    if not isinstance(c, dict):
+        raise ValueError(f"{where} must be a mapping {{names, setup, "
+                         "leakage[, hold]}")
+    unknown = set(c) - CORNER_KEYS
+    if unknown:
+        raise KeyError(f"{where}.{sorted(unknown)[0]} is not a corners key; "
+                       f"allowed: {', '.join(sorted(CORNER_KEYS))}")
+    names = c.get("names")
+    if (not isinstance(names, list) or not names
+            or not all(isinstance(n, str) and n for n in names)):
+        raise ValueError(f"{where}.names must be a non-empty list of corner "
+                         "names")
+    if len(set(names)) != len(names):
+        raise ValueError(f"{where}.names lists a corner twice")
+    roles = {}
+    for role in CORNER_ROLES:
+        if role not in c:
+            raise KeyError(f"{where}.{role} is required (the {role} corner)")
+        if c[role] not in names:
+            raise KeyError(f"{where}.{role}: {c[role]!r} is not one of "
+                           f"corners.names ({', '.join(names)})")
+        roles[role] = c[role]
+    if "hold" in c:
+        if c["hold"] not in names:
+            raise KeyError(f"{where}.hold: {c['hold']!r} is not one of "
+                           f"corners.names ({', '.join(names)})")
+        roles["hold"] = c["hold"]
+    return list(names), roles
+
+
+def _rails_section(d: dict, base: Path, path: Path, flow: dict, icg: dict,
+                   tie: dict, dont_use: List[str],
+                   corner_names: List[str] = (),
+                   setup: Optional[str] = None) -> Dict[str, Rail]:
+    """A schema-2 pack's `rails:`, each rail's overrides applied over the
+    pack-level `flow`, `icg`, `tie` and `dont_use`; with corners, each
+    rail's per-corner liberties (its `liberties:` default to the setup
+    corner's)."""
+    rails_d = d.get("rails")
+    if not isinstance(rails_d, dict) or not rails_d:
+        raise ValueError(f"{path}: schema 2 needs a non-empty `rails:` "
+                         "mapping (rail name -> {voltage, liberties})")
+    if "liberties" in d:
+        raise ValueError(f"{path}: schema 2 lists liberties per rail "
+                         "(rails.<name>.liberties), not at the top level")
+    rails: Dict[str, Rail] = {}
+    for name, r in rails_d.items():
+        where = f"{path}: rails.{name}"
+        if not isinstance(r, dict):
+            raise ValueError(f"{where} must be a mapping")
+        unknown = set(r) - RAIL_KEYS
+        if unknown:
+            raise KeyError(f"{where}.{sorted(unknown)[0]} is not a rail key; "
+                           f"allowed: {', '.join(sorted(RAIL_KEYS))}")
+        if "voltage" not in r:
+            raise KeyError(f"{where}: voltage is required")
+        try:
+            voltage = float(r["voltage"])
+        except (TypeError, ValueError):
+            raise ValueError(f"{where}.voltage: {r['voltage']!r} is not a "
+                             "number (volts)") from None
+        corners: Dict[str, List[Path]] = {}
+        if "corners" in r:
+            if not corner_names:
+                raise KeyError(f"{where}.corners needs the pack-level "
+                               "`corners:` block (names, setup, leakage)")
+            rc = r["corners"]
+            if not isinstance(rc, dict):
+                raise ValueError(f"{where}.corners must map each corner to "
+                                 "its liberties")
+            missing = [c for c in corner_names if c not in rc]
+            extra = sorted(set(rc) - set(corner_names))
+            if missing or extra:
+                raise KeyError(
+                    f"{where}.corners: "
+                    + (f"missing corner(s) {', '.join(missing)}" if missing
+                       else f"unknown corner(s) {', '.join(extra)}")
+                    + f"; corners.names: {', '.join(corner_names)}")
+            for c in corner_names:
+                cl = rc[c]
+                if not cl or isinstance(cl, str) or not isinstance(cl, list):
+                    raise ValueError(f"{where}.corners.{c} must be a "
+                                     "non-empty list of liberties")
+                corners[c] = [expand(p, base) for p in cl]
+        elif corner_names:
+            raise KeyError(f"{where}: the pack has corners "
+                           f"({', '.join(corner_names)}); give the rail's "
+                           "liberties per corner (rails.<name>.corners)")
+        libs = r.get("liberties")
+        if libs is None and corners:
+            libs = corners[setup]
+            libs_paths = list(libs)
+        else:
+            libs_paths = None
+        if not libs or isinstance(libs, str):
+            raise ValueError(f"{where}.liberties must be a non-empty list "
+                             "(the first is the rail's mapping-primary one)")
+        rails[str(name)] = Rail(
+            name=str(name), voltage=voltage,
+            liberties=(libs_paths if libs_paths is not None
+                       else [expand(p, base) for p in libs]),
+            flow={**flow, **_flow_section(r.get("flow"), base,
+                                          f"{where}.flow")},
+            icg=(_icg_section(r["icg"], base, True, f"{where}.icg")
+                 if "icg" in r else dict(icg)),
+            tie=dict(r["tie"]) if "tie" in r else dict(tie),
+            dont_use=(list(r["dont_use"]) if "dont_use" in r
+                      else list(dont_use)),
+            corners=corners)
+    return rails
+
+
+def _level_shifters(d: dict, base: Path, path: Path) -> List[Path]:
+    """`level_shifters: {liberties: [...]}` (or the bare list)."""
+    ls = d.get("level_shifters")
+    if ls is None:
+        return []
+    if isinstance(ls, dict):
+        unknown = set(ls) - {"liberties"}
+        if unknown:
+            raise KeyError(f"{path}: level_shifters.{sorted(unknown)[0]} is "
+                           "not a level-shifter key; allowed: liberties")
+        ls = ls.get("liberties") or []
+    if isinstance(ls, str) or not isinstance(ls, list):
+        raise ValueError(f"{path}: level_shifters.liberties must be a list")
+    return [expand(p, base) for p in ls]
+
+
+def _vt_flavours(d: dict, path: Path) -> Optional[dict]:
+    from .vtswap import parse_flavours
+    return parse_flavours(d.get("vt_flavours"), f"{path}")
+
+
 def load(path: Path | str, image: Optional[str] = None) -> Profile:
     path = Path(path)
     if not path.exists() and "/" not in str(path):
         path = resolve(str(path))
     d = yaml.safe_load(path.read_text())
     pack = d.get("schema") is not None
-    if pack and d["schema"] != 1:
+    schema = d["schema"] if pack else 1
+    if pack and schema not in (1, 2):
         raise ValueError(f"{path}: unsupported techpack schema {d['schema']}")
+    if schema == 1:
+        for k in ("rails", "default_rail", "level_shifters", "corners"):
+            if k in d:
+                raise KeyError(f"{path}: {k} needs `schema: 2`")
     base = path.resolve().parent
+    flow = _flow_section(d.get("flow"), base, f"{path}: flow")
+    icg = _icg_section(d["icg"], base, pack, f"{path}: icg")
+    tie = dict(d.get("tie") or {})
+    dont_use = list(d.get("dont_use", []))
     orfs = d.get("orfs")
-    if orfs:
+    corner_names: List[str] = []
+    corner_roles: Dict[str, str] = {}
+    if schema == 2:
+        if orfs:
+            raise ValueError(f"{path}: schema 2 takes liberties per rail; "
+                             "`orfs:` is schema 1 only")
+        corner_names, corner_roles = _corners_section(d, path)
+        rails = _rails_section(d, base, path, flow, icg, tie, dont_use,
+                               corner_names, corner_roles.get("setup"))
+        default = d.get("default_rail")
+        if default is None:
+            if len(rails) != 1:
+                raise KeyError(f"{path}: default_rail is required with more "
+                               "than one rail")
+            default = next(iter(rails))
+        if default not in rails:
+            raise KeyError(f"{path}: default_rail {default!r} is not a rail; "
+                           "rails: " + ", ".join(rails))
+        r = rails[default]
+        liberties, flow, icg = r.liberties, r.flow, r.icg
+        tie, dont_use = r.tie, r.dont_use
+    elif orfs:
         image = image or os.environ.get("ORFS_IMAGE", DEFAULT_IMAGE)
         tag = image.rsplit(":", 1)[-1]
         dest = cache_root() / "orfs" / tag / orfs["platform"]
@@ -274,37 +620,27 @@ def load(path: Path | str, image: Optional[str] = None) -> Profile:
         liberties = [expand(p, base) for p in d["liberties"]]
     else:
         liberties = [Path(os.path.expandvars(p)) for p in d["liberties"]]
-    flow = {}
-    for k, v in (d.get("flow") or {}).items():
-        if k not in FLOW_DEFAULTS:
-            raise KeyError(f"{path}: flow.{k} is not a pack default; "
-                           f"allowed: {', '.join(FLOW_DEFAULTS)}")
-        if FLOW_DEFAULTS[k] is Path:
-            v = expand(v, base)
-        elif k == "env":
-            bad = [e for e in v if not e.startswith(ENV_PREFIX)]
-            if bad:
-                raise KeyError(f"{path}: flow.env.{bad[0]} is not a "
-                               f"{ENV_PREFIX}* pass knob")
-            # The knobs test for "1"; a YAML boolean means the same.
-            v = {e: str(int(x)) if isinstance(x, bool) else str(x)
-                 for e, x in v.items()}
-        flow[k] = v
-    icg = dict(d["icg"])
-    if "netlist" in icg:
-        if not pack:
-            raise KeyError(f"{path}: icg.netlist needs a tech pack")
-        icg["netlist"] = expand(icg["netlist"], base)
-    return Profile(name=d["name"], liberties=liberties,
-                   time_unit=d.get("time_unit", "ns"), icg=icg,
-                   dont_use=list(d.get("dont_use", [])),
+    if schema == 1:
+        default = IMPLICIT_RAIL
+        rails = {default: Rail(name=default, voltage=None,
+                               liberties=list(liberties), flow=dict(flow),
+                               icg=dict(icg), tie=dict(tie),
+                               dont_use=list(dont_use))}
+    return Profile(name=d["name"], liberties=list(liberties),
+                   time_unit=d.get("time_unit", "ns"), icg=dict(icg),
+                   dont_use=list(dont_use),
                    orfs_platform=(orfs or {}).get("platform"),
-                   tie=dict(d.get("tie") or {}),
-                   root=base if pack else None, flow=flow,
+                   tie=dict(tie),
+                   root=base if pack else None, flow=dict(flow),
                    pnr=_pnr_section(d, base, path) if pack else {},
                    deny_terms=list(d.get("deny_terms", [])),
                    deny_exceptions=list(d.get("deny_exceptions", [])),
-                   public=bool(d.get("public", False)))
+                   public=bool(d.get("public", False)),
+                   schema=schema, rails=rails, rail=default,
+                   default_rail=default,
+                   level_shifters=_level_shifters(d, base, path),
+                   corner_names=corner_names, corner_roles=corner_roles,
+                   vt_flavours=_vt_flavours(d, path))
 
 
 if __name__ == "__main__":

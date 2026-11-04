@@ -180,6 +180,22 @@ def _build_parser() -> argparse.ArgumentParser:
         "netlist; for taking a large design as far as it goes.",
     )
     p.add_argument(
+        "--sta",
+        action="store_true",
+        help="After synthesis, run multi-corner multi-mode OpenSTA per "
+        "power domain x corner x mode (the flow.yaml's `sta:` section, or "
+        "its defaults); writes <out_dir>/sta/summary.json (see "
+        "circt_flow/sta.py).",
+    )
+    p.add_argument(
+        "--vt-swap",
+        action="store_true",
+        help="After synthesis, swap threshold flavours on the OpenSTA "
+        "netlist with OpenSTA: faster on failing paths, back to the slowest "
+        "where slack allows (the flow.yaml's `vt_swap:` section, or its "
+        "defaults; the pack's vt_flavours:). See circt_flow/vtswap.py.",
+    )
+    p.add_argument(
         "--pnr",
         action="store_true",
         help="After synthesis, place and route the OpenSTA-compatible "
@@ -228,6 +244,8 @@ def main(argv: list[str] | None = None) -> int:
             abc_use_mapped_if_present=args.abc_use_mapped_if_present,
             abc_keep_buffers=args.abc_keep_buffers,
             skip_unmappable=args.skip_unmappable,
+            run_sta=args.sta,
+            run_vt_swap=args.vt_swap,
         )
         run(cfg, pnr=args.pnr)
     except (FileNotFoundError, DirectiveError) as e:

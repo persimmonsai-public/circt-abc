@@ -1,0 +1,13 @@
+# mvt_soc: mvt_top with a clock per power domain, from this example's own
+# RTL (a path source, not a git commit).
+design:
+  name: mvt_soc
+  top: mvt_soc
+  source:
+    path: ../../rtl
+  files:
+    - core_lv.sv
+    - core_hv.sv
+    - mvt_soc.sv
+constraints:
+  clock_port: clk_hv_i

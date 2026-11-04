@@ -1,0 +1,9 @@
+# core_hv on profile ../../techpack_mvt.yaml.
+design:
+  top_module: core_hv
+  clock_period_ps: 1000
+  manifest: manifest.yaml
+pdk:
+  profile: ../../techpack_mvt.yaml
+pnr:
+  clock_port: clk_i

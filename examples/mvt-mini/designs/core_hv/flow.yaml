@@ -1,0 +1,9 @@
+# core_hv on profile mvt_mini.
+design:
+  top_module: core_hv
+  clock_period_ps: 1000
+  manifest: manifest.yaml
+pdk:
+  profile: mvt_mini
+pnr:
+  clock_port: clk_i

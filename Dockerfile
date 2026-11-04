@@ -22,8 +22,8 @@
 #   docker run --rm -v $PWD/out:/out circt-abc \
 #     python3 -m circt_flow ../designs/ibex/asap7_flow.yaml /out/ibex --pnr
 #
-# ORFS_HOME and SV2V make the P&R stage and the sv2v step run in place
-# rather than in containers of their own.
+# ORFS_HOME, SV2V and OPENSTA make the P&R stage, the sv2v step and the
+# STA / vt_swap stages run in place rather than in containers of their own.
 
 ARG ORFS_IMAGE=openroad/orfs:26Q3-277-gf9ec54a6d
 
@@ -105,10 +105,14 @@ COPY patches patches
 
 ENV ORFS_HOME=/OpenROAD-flow-scripts \
     ORFS_IMAGE=${ORFS_IMAGE} \
+    OPENSTA=/OpenROAD-flow-scripts/tools/install/OpenROAD/bin/sta \
     SV2V=/usr/local/bin/sv2v \
     CIRCT_ABC_CACHE=/opt/circt-abc/cache
 # Extract and merge the asap7 liberties now, so a run needs no setup; the
 # cache stays writable for RTL sources fetched by the front end.
 RUN cd scripts && python3 -m circt_flow.profile ../profiles/asap7.yaml \
  && chmod -R a+rwX ${CIRCT_ABC_CACHE}
+# examples/mvt-mini/run.sh writes its invented libraries beside the packs
+# that name them (lib/), so that directory is writable for any user.
+RUN chmod -R a+rwX examples/mvt-mini/lib
 WORKDIR ${CIRCT_ABC}/scripts

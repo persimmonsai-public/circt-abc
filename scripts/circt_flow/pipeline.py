@@ -3,10 +3,62 @@ scripts/run_circt_native_synth.sh's linear stage sequence.
 """
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
+from pathlib import Path
+from typing import List, Optional
 
 from .config import FlowConfig
 from . import stages
+
+
+def setup_libs(design, rail: Optional[str] = None) -> List[Path]:
+    """The liberties a rail is timed with at the setup corner: the
+    profile's per-corner ones, or its mapping liberties without corners
+    (or without a profile)."""
+    if design.profile is None:
+        return [Path(p) for p in design.synth_lib_tt]
+    from . import profile as profile_mod
+    prof = profile_mod.load(design.profile)
+    return prof.libs_at(rail=rail or design.rail)
+
+
+def mapping_target(design, name: str, feeding=None, clock_names=None,
+                   rail: Optional[str] = None) -> dict:
+    """modes.derive_target for `design` (its modes, its mapping_target:),
+    the flop overhead from `rail`'s setup-corner flops when it is auto."""
+    from . import modes
+    spec = design.mapping_target or modes.TargetSpec()
+    if design.mapping_target_from_pack and rail is not None \
+            and design.profile is not None:
+        # The pack's default: the domain's own rail's (rails may differ).
+        from . import profile as profile_mod
+        r = profile_mod.load(design.profile).rails.get(rail)
+        if r is not None and r.flow.get("mapping_target") is not None:
+            spec = modes.parse_target(r.flow["mapping_target"],
+                                      f"rail {rail}: flow")
+    overhead = None
+    if spec.flop_overhead == "auto":
+        overhead = modes.flop_overhead(setup_libs(design, rail),
+                                       spec.flop_cells)
+    return modes.derive_target(name, design.effective_modes(), feeding, spec,
+                               overhead, clock_names)
+
+
+def calibrate(cfg: FlowConfig) -> FlowConfig:
+    """A single-domain run with modes: or mapping_target:: derive the
+    value ABC gets, log it, write <out>/mapping_target.json, and return
+    cfg with design.abc_delay_target_ps set. Otherwise cfg unchanged."""
+    if not cfg.design.calibrate:
+        return cfg
+    from . import modes
+    rec = mapping_target(cfg.design, cfg.design.top_module)
+    print(modes.log_target(rec))
+    (cfg.out_dir / "mapping_target.json").write_text(
+        json.dumps(rec, indent=2) + "\n")
+    return dataclasses.replace(cfg, design=dataclasses.replace(
+        cfg.design, abc_delay_target_ps=rec["target_ps"]))
 
 
 def run(cfg: FlowConfig, pnr: bool = False) -> None:
@@ -27,6 +79,12 @@ def run(cfg: FlowConfig, pnr: bool = False) -> None:
             "a private tech pack; write the run elsewhere (or set "
             "CIRCT_ABC_ALLOW_REPO_OUT=1)")
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.design.power is not None:
+        # Power domains on their own rails (power.py): each domain and the
+        # rest of the design go through this same flow, then are stitched.
+        from . import power
+        power.run(cfg, pnr=pnr)
+        return
     # The pack's pass-knob defaults (flow.env): the stages read the
     # CIRCT_FLOW_* knobs from the environment, so a knob the environment
     # already sets keeps its value.
@@ -35,9 +93,12 @@ def run(cfg: FlowConfig, pnr: bool = False) -> None:
             os.environ[k] = v
             print(f"[circt_flow] tech pack default {k}={v}")
 
+    cfg = calibrate(cfg)
     print(
         f"[circt_flow] top={cfg.design.top_module} liberty={cfg.design.lib} "
         f"clock_period_ps={cfg.design.clock_period_ps}"
+        + (f" abc_delay_target_ps={cfg.design.abc_delay_target_ps}"
+           if cfg.design.abc_delay_target_ps is not None else "")
     )
 
     stages.run_lower_ibex(cfg)
@@ -69,5 +130,16 @@ def run(cfg: FlowConfig, pnr: bool = False) -> None:
     stages.merge_and_map(cfg)
     stages.export_netlist(cfg)
     stages.opensta_compat_netlist(cfg)
+    if cfg.design.fanout is not None:
+        from . import fanout
+        fanout.run(cfg, cfg.design.fanout)
+    from . import vtswap
+    vspec = vtswap.wanted(cfg)
+    if vspec is not None:
+        vtswap.run(cfg, vspec)
+    from . import sta
+    spec = sta.wanted(cfg)
+    if spec is not None:
+        sta.run(cfg, spec)
     if pnr:
         stages.orfs_pnr(cfg)

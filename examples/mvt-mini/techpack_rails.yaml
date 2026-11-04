@@ -1,0 +1,63 @@
+# mvt-mini profile, schema 2: both supplies as rails of one pack, mapped at
+# the tt corner (techpack_corners.yaml maps at ss instead). The tt, ss and
+# ff libraries are listed per rail for timing and leakage at each corner
+# (the flow's STA stage); tt is the setup and the leakage corner, so the
+# mapping is the tt-only pack's.
+# Invented library (lib/make_libs.py; run.sh generates it). A flow config
+# with a `power:` section puts each power domain on one of these rails and
+# maps it with that rail's liberties only; everything else is on
+# default_rail. Each rail's first liberty is its merged leakage-priced
+# multi-Vt one (scripts/mvt/make_abc_lib.py: its areas are prices), so ABC
+# chooses the flavour per cell; the real per-flavour libraries follow.
+schema: 2
+name: mvt_mini_rails
+time_unit: ns
+icg: {cell: MICG_X1_R, clk: CK, en: E, test_en: SE, out: ECK}
+dont_use: []
+tie: {hi: "MTIEHI_R:H", lo: "MTIELO_R:L"}
+# The threshold flavour in a cell name (MNAND2_X1_S), slowest first: the
+# flow's vt_swap stage (circt_flow/vtswap.py).
+vt_flavours:
+  tokens: [R, L, S]
+  re: '_([RLS])$'
+public: true
+corners:
+  names: [tt, ss, ff]
+  setup: tt
+  leakage: tt
+default_rail: VDD_HV
+rails:
+  VDD_HV:
+    voltage: 0.75
+    liberties:
+      - lib/mini_mvt_0p75v_tt_abc.lib
+      - lib/mini_rvt_0p75v_tt.lib
+      - lib/mini_lvt_0p75v_tt.lib
+      - lib/mini_slvt_0p75v_tt.lib
+    corners:
+      tt: [lib/mini_rvt_0p75v_tt.lib, lib/mini_lvt_0p75v_tt.lib, lib/mini_slvt_0p75v_tt.lib]
+      ss: [lib/mini_rvt_0p75v_ss.lib, lib/mini_lvt_0p75v_ss.lib, lib/mini_slvt_0p75v_ss.lib]
+      ff: [lib/mini_rvt_0p75v_ff.lib, lib/mini_lvt_0p75v_ff.lib, lib/mini_slvt_0p75v_ff.lib]
+    flow:
+      # Per-cell delays and a real delay target for &nf: see abc/mvt.abc.
+      abc_read_lib_args: "-l"
+      abc_script_file: abc/mvt.abc
+  VDD_LV:
+    voltage: 0.55
+    liberties:
+      - lib/mini_mvt_0p55v_tt_abc.lib
+      - lib/mini_rvt_0p55v_tt.lib
+      - lib/mini_lvt_0p55v_tt.lib
+      - lib/mini_slvt_0p55v_tt.lib
+    corners:
+      tt: [lib/mini_rvt_0p55v_tt.lib, lib/mini_lvt_0p55v_tt.lib, lib/mini_slvt_0p55v_tt.lib]
+      ss: [lib/mini_rvt_0p55v_ss.lib, lib/mini_lvt_0p55v_ss.lib, lib/mini_slvt_0p55v_ss.lib]
+      ff: [lib/mini_rvt_0p55v_ff.lib, lib/mini_lvt_0p55v_ff.lib, lib/mini_slvt_0p55v_ff.lib]
+    flow:
+      abc_read_lib_args: "-l"
+      abc_script_file: abc/mvt.abc
+# The cells power.insert_level_shifters puts on the signals that cross
+# between the rails (one tt library, read at every corner).
+level_shifters:
+  liberties:
+    - lib/mini_ls.lib

@@ -1,0 +1,13 @@
+# mvt-mini profile: 0.75 V, RVT/LVT/SLVT, RVT primary, tt corner
+# Invented library (lib/make_libs.py; run.sh generates it). The first liberty is the one the mappers and ABC read, so mapped logic is RVT; this is the baseline arm.
+schema: 1
+name: mvt_mini
+liberties:
+  - lib/mini_rvt_0p75v_tt.lib
+  - lib/mini_lvt_0p75v_tt.lib
+  - lib/mini_slvt_0p75v_tt.lib
+time_unit: ns
+icg: {cell: MICG_X1_R, clk: CK, en: E, test_en: SE, out: ECK}
+dont_use: []
+tie: {hi: "MTIEHI_R:H", lo: "MTIELO_R:L"}
+public: true
