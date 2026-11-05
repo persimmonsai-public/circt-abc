@@ -1,0 +1,32 @@
+# mvt_top on techpack_rails_buf.yaml (the rails pack with a fanout buffer and
+# a flavour list per rail; the sta and vt_swap stages run with --sta and
+# --vt-swap). Otherwise this is flow.yaml, whose header follows.
+# mvt_top on the schema-2 rails pack: core_lv's instance on the 0.55 V
+# rail, core_hv's on the 0.75 V one, each mapped with its own rail's
+# liberties only (tt); the glue is on default_rail. One clock for both
+# domains, two modes: func (1.2 ns) and eco (1.6 ns), with I/O delays.
+# mapping_target.flop_overhead is false, so ABC still gets the tightest
+# period, 1200 ps, as before modes were added: the netlists are those of
+# the single-period config. The power flow also writes <out>/mvt_top.upf,
+# <out>/sdc/{func,eco}.sdc and <out>/power_intent.json (the crossings).
+# `--sta` times each domain x corner (tt/ss/ff) x mode and the whole chip
+# (<out>/sta/summary.json). flow_ls.yaml is this with level shifters.
+design:
+  top_module: mvt_top
+  clock_period_ps: 1200
+  manifest: manifest.yaml
+pdk:
+  profile: ../../techpack_rails_buf.yaml
+modes:
+  func: func.sdc
+  eco: eco.sdc
+mapping_target:
+  flop_overhead: false
+power:
+  domains:
+    - {name: lv, rail: VDD_LV, instances: [u_lv]}
+    - {name: hv, rail: VDD_HV, instances: [u_hv]}
+sta:
+  enabled: false   # --sta turns it on
+pnr:
+  clock_port: clk_i

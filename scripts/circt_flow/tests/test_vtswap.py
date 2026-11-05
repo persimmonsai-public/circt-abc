@@ -185,6 +185,42 @@ def test_swap_times_hold_at_the_hold_corner(tmp_path):
     assert split["hold_wns"] == pytest.approx(ff["hold_wns"], abs=1e-6)
 
 
+@pytest.mark.skipif(not _have_sta(), reason="no OpenSTA (docker image or "
+                    "$OPENSTA)")
+def test_swap_level_shifters_follow_their_corner(tmp_path):
+    """hold_both_libs: the shifters at the hold corner go with the hold
+    libraries. A shifter on the chain times setup at tt and hold at ff, as
+    the same flow with hold_libs alone would not (it times both at tt)."""
+    lib = tmp_path / "lib"
+    subprocess.run([sys.executable, "-I", str(MINI / "lib/make_libs.py"),
+                    str(lib)], check=True, capture_output=True)
+    at = lambda c: [lib / f"mini_{v}_0p75v_{c}.lib"
+                    for v in ("rvt", "lvt", "slvt")]
+    nl = tmp_path / "chain.v"
+    # f0 -> shifter -> f1: the shifter is the hold-critical path's only cell.
+    nl.write_text("module chain (clk, d, q);\n  input clk;\n  input d;\n"
+                  "  output q;\n  wire n0;\n  wire n1;\n"
+                  "  MDFF_X1_R f0 (.CK(clk), .D(d), .Q(n0));\n"
+                  "  MLSHL_X1 ls0 (.A(n0), .Y(n1));\n"
+                  "  MDFF_X1_R f1 (.CK(clk), .D(n1), .Q(q));\nendmodule\n")
+    sdc = (vtswap.sdc_for(5000, "clk", ["d"])
+           + "set_false_path -hold -from [get_ports d]\n"
+           "set_false_path -hold -to [get_ports q]\n")
+    tokens, fre = ["R", "L", "S"], r"_([RLS])$"
+    ls = lambda c: [lib / f"mini_ls_{c}.lib"]
+    run = lambda tag, libs, hold=(), both=(), hboth=(): vtswap.swap(
+        nl, "chain", tmp_path / f"{tag}.v", libs, tokens, fre, sdc,
+        recover=False, hold_libs=hold, both_libs=both,
+        hold_both_libs=hboth)["start"]
+    tt = run("tt", at("tt"), both=ls("tt"))
+    ff = run("ff", at("ff"), both=ls("ff"))
+    old = run("old", at("tt"), at("ff"), both=ls("tt"))
+    new = run("new", at("tt"), at("ff"), both=ls("tt"), hboth=ls("ff"))
+    assert new["wns"] == pytest.approx(tt["wns"], abs=1e-6)
+    assert new["hold_wns"] == pytest.approx(ff["hold_wns"], abs=1e-6)
+    assert old["hold_wns"] != pytest.approx(new["hold_wns"], abs=1e-4)
+
+
 def test_retype_keeps_every_other_byte():
     text = ("module m (a, y);\n  input a;\n  output y;\n  wire n;\n"
             "  INV_R g0 (.A(a), .Y(n));\n"

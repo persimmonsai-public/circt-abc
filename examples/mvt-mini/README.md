@@ -42,11 +42,12 @@ whole chip).
 | `techpack_0p55.yaml` | the same at 0.55 V |
 | `techpack_mvt.yaml`, `techpack_mvt_0p55.yaml` | the merged leakage-priced liberty first, so ABC chooses the flavour; `flow:` sets `read_lib -l` and `abc/mvt.abc` |
 | `techpack_rails.yaml` | schema 2, mapped at tt: rails `VDD_HV` (0.75 V, default) and `VDD_LV` (0.55 V), each with its tt merged priced liberty first and `read_lib -l` + `abc/mvt.abc`, and its tt/ss/ff libraries for timing (`corners:`, setup and leakage tt); `mini_ls.lib` as level shifters |
+| `techpack_rails_buf.yaml` | `techpack_rails.yaml` with a fanout buffer per rail (`MBUF_X2_R`, limit 3, on `VDD_HV`; the weaker `MBUF_X1_R`, limit 2, on `VDD_LV`) and a flavour list per rail (`VDD_LV`: swap list `R < L`) |
 | `techpack_corners.yaml` | schema 2 with `corners:` tt/ss/ff (setup ss, leakage ff, hold ff): the same rails, each mapping on its `ss_ffleak` priced liberty and listing its libraries per corner |
 | `abc/mvt.abc` | the abc-bridge default script with `&nf -l -D {period}` |
 | `rtl/` | `core_hv` (8x8 MAC, 0.75 V), `core_lv` (LFSR + sum + compare, 0.55 V), `mvt_top` joining them on one clock, `mvt_soc` on a clock each |
 | `designs/<core>/` | manifest (a local `source: {path: ...}`) and `flow.yaml` / `flow_mvt.yaml` |
-| `designs/mvt_top/` | `flow.yaml` with `power:`: `u_lv` on `VDD_LV`, `u_hv` on `VDD_HV`, the glue on the default rail; modes `func.sdc` (1.2 ns) and `eco.sdc` (1.6 ns); `sta:` (off unless `--sta`); `flow_ls.yaml`, the same with `insert_level_shifters: true` |
+| `designs/mvt_top/` | `flow.yaml` with `power:`: `u_lv` on `VDD_LV`, `u_hv` on `VDD_HV`, the glue on the default rail; modes `func.sdc` (1.2 ns) and `eco.sdc` (1.6 ns); `sta:` (off unless `--sta`); `flow_ls.yaml`, the same with `insert_level_shifters: true`; `flow_buf.yaml`, the same on `techpack_rails_buf.yaml` (run `run.sh <out> --only mvt_top_buf`) |
 | `designs/mvt_soc/` | `flow.yaml` with `power:`, `modes:` (`func.sdc`, `turbo.sdc`) and `mapping_target:` on `techpack_corners.yaml` |
 | `vt_report.py` | cells, real area and leakage per flavour, optional OpenSTA slack |
 | `run.sh` | the matrix |
@@ -338,14 +339,22 @@ default stays 1.0, which is conservative.
   real.
 * **The example SDCs declare no clock groups.** `mvt_soc`'s lv-to-hv
   crossings (no synchronizer) fail `turbo` in the chip view; see above.
+`flow_buf.yaml` (`--only mvt_top_buf`, not part of the default matrix)
+is `flow.yaml` on `techpack_rails_buf.yaml`. Each module is fanout-buffered
+with its rail's cell and limit, and with `--vt-swap` the swap moves
+`u_lv`'s cells only along `R < L`. The ABC-mapped slvt cells already in
+`core_lv` (3 in this run) stay: the list limits the swap, not the mapper. `<out>/mvt_top_buf/fanout.json` lists each rail's cell
+and, per module, the cell used.
+
 * **Power intent is all-on.** The UPF has one all-on power state, with
   no isolation, retention or power switches. Level shifters are inserted
   only in the top module of the OpenSTA netlist. `mvt_top.v` stays
   unshifted, and domains nested in a remainder module are refused. No
   UPF reader, P&R tool or low-power static checker has read the UPF in
   this tree.
-* **One level-shifter library for every corner.** `mini_ls.lib` is a tt
-  library, and the STA reads it at ss and ff as well.
+* **The shifters' corner scaling is invented.** `mini_ls_{tt,ss,ff}.lib`
+  scale the shifters' delay and leakage by the mean of the two supplies'
+  corner factors; the STA and vt_swap read each corner's own file.
 * **Registers and the ICG map RVT.** The register mapper reads only the
   primary liberty and picks the cheapest flop, which is RVT; the clock-gate
   cell is picked by area across all liberties, the first library winning a

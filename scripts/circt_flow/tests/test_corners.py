@@ -168,6 +168,132 @@ def test_mvt_mini_corners_pack():
         assert r.liberties[1:] == r.corners["ss"]
 
 
+# ---- level shifters per corner -----------------------------------------
+
+
+@pytest.fixture
+def ls_corners_pack(corners_pack):
+    """corners_pack plus shifter libraries: a default and ss and ff ones (tt
+    is not listed, so it falls back to the default)."""
+    lib = corners_pack.parent / "lib"
+    for n in ("ls", "ls_ss", "ls_ff"):
+        write_lib(lib / f"{n}.lib", f"tst_{n}", ["TSTLSHIFT_X1"])
+    d = yaml.safe_load(corners_pack.read_text())
+    d["level_shifters"] = {"liberties": ["lib/ls.lib"],
+                           "corners": {"ss": ["lib/ls_ss.lib"],
+                                       "ff": ["lib/ls_ff.lib"]}}
+    d["corners"]["hold"] = "ff"
+    corners_pack.write_text(yaml.safe_dump(d))
+    return corners_pack
+
+
+def test_level_shifters_per_corner(ls_corners_pack):
+    p = profile_mod.load(ls_corners_pack)
+    lib = ls_corners_pack.parent / "lib"
+    assert p.level_shifters == [lib / "ls.lib"]
+    assert p.level_shifters_at("ss") == [lib / "ls_ss.lib"]
+    assert p.level_shifters_at("ff") == [lib / "ls_ff.lib"]
+    assert p.level_shifters_at("tt") == [lib / "ls.lib"]    # falls back
+    assert p.level_shifters_at() == [lib / "ls_ss.lib"]     # setup corner
+    assert p.for_rail("LO").level_shifters_at("ff") == [lib / "ls_ff.lib"]
+    assert {"ls.lib", "ls_ss.lib", "ls_ff.lib"} <= {
+        x.name for x in p.all_liberties()}
+    names, _ = techpack.denylist(ls_corners_pack)
+    assert {"tst_ls_ss", "tst_ls_ff"} <= names
+
+
+def test_level_shifters_without_corner_block(rails_pack):
+    """No per-corner shifters: every corner (and none) reads liberties."""
+    p = profile_mod.load(rails_pack)
+    assert p.level_shifter_corners == {}
+    assert p.level_shifters_at("ss") == p.level_shifters_at() == \
+        p.level_shifters
+
+
+@pytest.mark.parametrize("edit,err", [
+    (lambda d: d["level_shifters"]["corners"].update(xx=["lib/ls.lib"]),
+     "unknown corner\\(s\\) xx"),
+    (lambda d: d["level_shifters"]["corners"].update(ss="lib/ls_ss.lib"),
+     "corners.ss must be a non-empty list"),
+    (lambda d: d["level_shifters"].update(corners={}),
+     "must map corners to liberties"),
+    (lambda d: d["level_shifters"].update(drift=1),
+     "level_shifters.drift is not a level-shifter key"),
+    (lambda d: d["level_shifters"].pop("liberties"),
+     "no `liberties` default and no libraries for corner\\(s\\) tt"),
+    (lambda d: d.pop("corners"), "needs the pack-level `corners:`"),
+])
+def test_level_shifter_corner_errors(ls_corners_pack, edit, err):
+    d = yaml.safe_load(ls_corners_pack.read_text())
+    edit(d)
+    ls_corners_pack.write_text(yaml.safe_dump(d))
+    with pytest.raises((KeyError, ValueError), match=err):
+        profile_mod.load(ls_corners_pack)
+
+
+def test_level_shifters_only_per_corner(ls_corners_pack):
+    """No default liberties is fine when every corner is listed."""
+    lib = ls_corners_pack.parent / "lib"
+    write_lib(lib / "ls_tt.lib", "tst_ls_tt", ["TSTLSHIFT_X1"])
+    d = yaml.safe_load(ls_corners_pack.read_text())
+    d["level_shifters"] = {"corners": {
+        c: [f"lib/ls_{c}.lib"] for c in ("tt", "ss", "ff")}}
+    ls_corners_pack.write_text(yaml.safe_dump(d))
+    p = profile_mod.load(ls_corners_pack)
+    assert p.level_shifters == []
+    assert p.level_shifters_at("tt") == [lib / "ls_tt.lib"]
+
+
+def test_check_level_shifter_corners(ls_corners_pack, capsys):
+    assert techpack.check(str(ls_corners_pack)) == []
+    assert "level shifters per corner: ss (1), ff (1)" in \
+        capsys.readouterr().out
+    lib = ls_corners_pack.parent / "lib"
+    write_lib(lib / "ls_ff.lib", "tst_ls_ff", ["TSTOTHER_X1"])
+    probs = techpack.check(str(ls_corners_pack))
+    assert any(p.startswith("level_shifters.corners.ff: cells differ")
+               for p in probs)
+    (lib / "ls_ss.lib").unlink()
+    probs = techpack.check(str(ls_corners_pack))
+    assert any(p.startswith("level_shifters.corners.ss: liberty") and
+               p.endswith("does not exist") for p in probs)
+
+
+def test_mvt_mini_corners_level_shifters():
+    p = profile_mod.load(REPO / "examples/mvt-mini/techpack_corners.yaml")
+    for c in ("tt", "ss", "ff"):
+        assert [x.name for x in p.level_shifters_at(c)] == [f"mini_ls_{c}.lib"]
+
+
+def test_mini_ls_libs_scale_with_the_corner(tmp_path):
+    """make_libs.py: mini_ls_<corner>.lib has the same cells as mini_ls.lib,
+    tt is mini_ls's numbers, ss is slower and leaks less, ff the reverse."""
+    import subprocess
+    import sys
+    subprocess.run([sys.executable, "-I", str(
+        REPO / "examples/mvt-mini/lib/make_libs.py"), str(tmp_path)],
+        check=True, capture_output=True)
+    text = {c: (tmp_path / f"mini_ls_{c}.lib").read_text()
+            for c in ("tt", "ss", "ff")}
+    base = (tmp_path / "mini_ls.lib").read_text()
+    assert text["tt"].replace("library(mini_ls_tt)", "library(mini_ls)") \
+        .replace("mini_ls_tt.lib", "mini_ls.lib") .replace(
+        ", corner tt", "") == base
+    first = lambda t, key: float(re.search(
+        key + r"\s*:\s*([0-9.]+)", t).group(1))
+    delay = lambda t: float(re.search(
+        r"cell_rise\(nldm\) \{ values\(\"([0-9.]+)", t).group(1))
+    assert delay(text["ss"]) > delay(text["tt"]) > delay(text["ff"])
+    assert (first(text["ss"], "cell_leakage_power")
+            < first(text["tt"], "cell_leakage_power")
+            < first(text["ff"], "cell_leakage_power"))
+    assert liberty_names(text["ss"]) == liberty_names(text["ff"])
+
+
+def liberty_names(t):
+    return set(re.findall(r"cell\((\w+)\)", t))
+
+
 # ---- make_abc_lib.py ------------------------------------------------------
 
 
@@ -205,7 +331,8 @@ def test_make_abc_lib_default_unchanged(tmp_path):
     b = priced_lib(tmp_path / "b.lib", "b", {"C_S": (1.0, 50.0, 0.3)})
     out = tmp_path / "o.lib"
     m.main([str(out), str(a), str(b), "-W", "0.01"])
-    text = out.read_text()
+    # The first line is the provenance comment (test_provenance.py).
+    text = out.read_text().split("\n", 1)[1]
     assert text.startswith("library(a_mvt_priced)")
     assert re.search(r"cell\(C_R\) \{\s*area : 110 ;", text)
     assert re.search(r"cell\(C_S\) \{\s*area : 150 ;", text)
@@ -222,7 +349,7 @@ def test_make_abc_lib_setup_timing_leakage_prices(tmp_path):
                     {"C_R": (1.0, 30.0, 0.4), "C_S": (1.0, 150.0, 0.24)})
     out = tmp_path / "o.lib"
     m.main([str(out), str(ss), "-W", "0.01", "--leakage-lib", str(ff)])
-    text = out.read_text()
+    text = out.read_text().split("\n", 1)[1]
     assert text.startswith("/* make_abc_lib.py: timing from ss.lib; "
                            "leakage priced from ff.lib;")
     assert "library(x_ss_mvt_priced)" in text

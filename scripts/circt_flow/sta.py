@@ -738,7 +738,9 @@ def _power_views(cfg, prof, ps, text, mods, modes, mode_names, corners,
     d = cfg.design
     top = d.top_module
     tmod = mods[top]
-    ls_libs = list(prof.level_shifters)
+    # Cell names, pins and domains come from the setup corner's shifter
+    # libraries; each view reads the shifters at its own corner.
+    ls_libs = prof.level_shifters_at()
     ls_info = intent.liberty_cells(ls_libs) if ls_libs else {}
     ls_cells = {}
     for c in ls_info.values():
@@ -791,7 +793,8 @@ def _power_views(cfg, prof, ps, text, mods, modes, mode_names, corners,
         sp.write_text(tv["sdc"][mn])
         for c in corners:
             views.append(View(f"top.{mn}.{c}", "domain", "top", c, mn,
-                              _libs(prof, d, top_rail, c) + ls_libs + [blib],
+                              _libs(prof, d, top_rail, c)
+                              + prof.level_shifters_at(c) + [blib],
                               tnl, top, sp, rail=top_rail, module=top))
     if not spec.chip:
         return views
@@ -820,7 +823,8 @@ def _power_views(cfg, prof, ps, text, mods, modes, mode_names, corners,
         cnl.write_text(rename_netlist(text, prefix, cells))
         for mn in mode_names:
             views.append(View(f"chip.{mn}.{c}", "chip", "chip", c, mn,
-                              libs + ls_libs, cnl, top, mode_sdc[mn]))
+                              libs + prof.level_shifters_at(c), cnl, top,
+                              mode_sdc[mn]))
     return views
 
 

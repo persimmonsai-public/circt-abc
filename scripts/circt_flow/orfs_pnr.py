@@ -7,12 +7,15 @@
         [--platform asap7] [--utilization 40] [--place-density D]
         [--set VAR=VALUE ...] [--image openroad/orfs:<tag>] [--target finish]
         [--tie-hi CELL:PIN --tie-lo CELL:PIN] [--platform-dir <dir>]
+        [--no-vt-swap] [--dont-use PATTERN ...]
 
 ORFS takes a pre-synthesised netlist through SYNTH_NETLIST_FILES: its synth
 step then copies the netlist to 1_2_yosys.v instead of running Yosys
 (scripts/synth_preamble.tcl), and floorplan onwards is ORFS's own flow on the
-platform it names. Nothing in ORFS is modified or overridden, so the result
-is a stock-ORFS result for that platform.
+platform it names. Nothing in ORFS is modified; only its documented
+variables (and, with --dont-use, its PRE_<step>_TCL hooks) are set, and
+without --no-vt-swap / --dont-use / --set the result is a stock-ORFS result
+for that platform.
 
 This writes <run_dir>/config.mk (and constraint.sdc unless --sdc is given),
 runs `make <target>` and `make metadata-generate` in the ORFS image with
@@ -34,6 +37,21 @@ cell instead. OpenROAD reads a literal 1/0 net as a power/ground net, which
 the router then refuses (DRT-0305); ORFS's own Yosys flow ties constants the
 same way (hilomap), and its floorplan step duplicates each tie cell per load
 (repair_tie_fanout).
+
+With --no-vt-swap, OpenROAD's repair_timing may not change a cell's
+threshold-voltage flavour: ORFS's SKIP_VT_SWAP and SKIP_CRIT_VT_SWAP stop
+the swap in the floorplan, CTS and global-route repair_timing calls, and
+OPT_POST_GRT_WNS=0 drops the extra post-global-route `repair_timing
+-sequence "vt_swap reroute"` that global_route.tcl hard-codes (the SKIP_*
+flags do not reach it). Sizing and buffering still happen. Each --dont-use
+PATTERN (a cell-name glob, repeatable) is added to the platform's
+DONT_USE_CELLS before every step that runs repair_design/repair_timing, by a
+Tcl hook (dont_use.tcl) on the PRE_<step>_TCL variables; it keeps the
+resizer from choosing those cells (e.g. `*_ASAP7_75t_SL`, the fastest
+flavour) for new buffers and resizes. It does not stop repair_timing's Vt
+swap (measured on ASAP7: swaps to SL still happen; use --no-vt-swap for
+that), and leaves the cells already in the
+netlist alone.
 
 The clock period is in the platform's own time unit (ps for asap7). The
 generated SDC is ORFS's own asap7 template: a clock on --clock-port, a
@@ -138,6 +156,33 @@ def tie_constants(text: str, hi: tuple[str, str], lo: tuple[str, str]
     return text, n
 
 
+# The ORFS steps that run repair_design / repair_timing, as their
+# PRE_<step>_TCL hook names (scripts/util.tcl source_step_tcl).
+REPAIR_STEPS = ("FLOORPLAN", "GLOBAL_PLACE", "RESIZE", "CTS", "GLOBAL_ROUTE")
+NO_VT_SWAP = [("SKIP_VT_SWAP", "1"), ("SKIP_CRIT_VT_SWAP", "1"),
+              ("OPT_POST_GRT_WNS", "0")]
+
+
+def vt_settings(run_dir: Path, no_vt_swap: bool,
+                dont_use: list[str]) -> list[tuple[str, str]]:
+    """config.mk variables for --no-vt-swap and --dont-use; writes the
+    dont-use hook into run_dir. User --set values come after these, so they
+    win."""
+    out = list(NO_VT_SWAP) if no_vt_swap else []
+    if dont_use:
+        hook = run_dir / "dont_use.tcl"
+        pats = " ".join(dont_use)
+        hook.write_text(
+            "# --dont-use: keep the resizer off these cells (written by "
+            "circt_flow.orfs_pnr)\n"
+            "set ::env(DONT_USE_CELLS) \"[expr {[info exists "
+            "::env(DONT_USE_CELLS)] ? $::env(DONT_USE_CELLS) : {}}] "
+            f"{pats}\"\n"
+            f"set_dont_use {{{pats}}}\n")
+        out += [(f"PRE_{s}_TCL", str(hook)) for s in REPAIR_STEPS]
+    return out
+
+
 def write_config(path: Path, *, platform: str, top: str, netlist: Path,
                  sdc: Path, utilization: float,
                  place_density: float | None,
@@ -213,6 +258,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--place-density", type=float)
     ap.add_argument("--set", action="append", default=[], metavar="VAR=VALUE",
                     help="extra config.mk variable (repeatable)")
+    ap.add_argument("--no-vt-swap", action="store_true",
+                    help="stop repair_timing from swapping Vt flavours")
+    ap.add_argument("--dont-use", action="append", default=[],
+                    metavar="PATTERN",
+                    help="cell-name glob added to the platform's "
+                    "DONT_USE_CELLS (repeatable)")
     ap.add_argument("--image", default=os.environ.get("ORFS_IMAGE",
                                                        DEFAULT_IMAGE))
     ap.add_argument("--tie-hi", metavar="CELL:PIN",
@@ -244,6 +295,7 @@ def main(argv: list[str] | None = None) -> int:
 
     run_dir = a.run_dir.resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
+    extra = vt_settings(run_dir, a.no_vt_swap, a.dont_use) + extra
     # Inputs are copied in, so the container sees only the run directory.
     netlist = run_dir / f"{a.top}.v"
     text = a.netlist.read_text()

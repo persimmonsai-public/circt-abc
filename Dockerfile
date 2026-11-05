@@ -113,6 +113,7 @@ ENV ORFS_HOME=/OpenROAD-flow-scripts \
 RUN cd scripts && python3 -m circt_flow.profile ../profiles/asap7.yaml \
  && chmod -R a+rwX ${CIRCT_ABC_CACHE}
 # examples/mvt-mini/run.sh writes its invented libraries beside the packs
-# that name them (lib/), so that directory is writable for any user.
-RUN chmod -R a+rwX examples/mvt-mini/lib
+# that name them (lib/), so that directory is writable for any user; so does
+# examples/asap7-mvt/run.sh (its libraries are built from the platform).
+RUN chmod -R a+rwX examples/mvt-mini/lib examples/asap7-mvt/lib
 WORKDIR ${CIRCT_ABC}/scripts

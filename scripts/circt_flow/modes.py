@@ -44,7 +44,9 @@ liberties at the profile's setup corner (its mapping liberties without
 corners): clock-to-Q at the clock pin's smallest table transition and an
 output load of 4x the flop's largest input capacitance (FO4,
 interpolated), setup at the smallest transitions of its constraint table;
-each the larger of rise and fall. `flop_cells` limits the flops considered
+each the larger of rise and fall. Flops the rail's `dont_use` names are
+never considered (the mapper cannot use them). `flop_cells` limits the
+flops considered
 (for instance to the ones the register mapper picks). The derivation is
 logged and written to the run's mapping_target.json (power_domains.json
 for a power flow).
@@ -564,10 +566,13 @@ _CELL_START = re.compile(r'^[ \t]*cell\s*\(\s*"?([A-Za-z0-9_]+)"?\s*\)\s*\{',
                          re.M)
 
 
-def flop_timings(libs: Iterable[Path], cells: Sequence[str] = ()
+def flop_timings(libs: Iterable[Path], cells: Sequence[str] = (),
+                 exclude: Sequence[str] = ()
                  ) -> Tuple[List[FlopTiming], str]:
     """Clock-to-Q and setup of every flop (cell with an ff group) of
-    `libs` (only `cells` when given), and the libraries' time unit."""
+    `libs` (only `cells` when given; none matching an `exclude` fnmatch
+    pattern), and the libraries' time unit."""
+    import fnmatch
     from .profile import _block_end
     out: List[FlopTiming] = []
     unit = None
@@ -586,6 +591,8 @@ def flop_timings(libs: Iterable[Path], cells: Sequence[str] = ()
         for cm in _CELL_START.finditer(text):
             name = cm.group(1)
             if cells and name not in cells:
+                continue
+            if any(fnmatch.fnmatchcase(name, x) for x in exclude):
                 continue
             body = text[cm.start():_block_end(text, cm.end() - 1)]
             if not re.search(r"^\s*ff\s*\(", body, re.M):
@@ -616,10 +623,12 @@ def flop_timings(libs: Iterable[Path], cells: Sequence[str] = ()
     return out, unit or "1ns"
 
 
-def flop_overhead(libs: Sequence[Path], cells: Sequence[str] = ()) -> dict:
+def flop_overhead(libs: Sequence[Path], cells: Sequence[str] = (),
+                  exclude: Sequence[str] = ()) -> dict:
     """The worst flop's clock-to-Q + setup over `libs` (see the module
-    docstring), in ps, with what it was derived from."""
-    flops, unit = flop_timings(libs, cells)
+    docstring), in ps, with what it was derived from. Flops matching an
+    `exclude` pattern (the pack's dont_use) are not considered."""
+    flops, unit = flop_timings(libs, cells, exclude)
     if not flops:
         raise ModeError("mapping_target: no flop (cell with an ff group and "
                         "a clock-to-output arc) in "

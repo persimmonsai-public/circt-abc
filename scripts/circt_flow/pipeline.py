@@ -30,18 +30,21 @@ def mapping_target(design, name: str, feeding=None, clock_names=None,
     the flop overhead from `rail`'s setup-corner flops when it is auto."""
     from . import modes
     spec = design.mapping_target or modes.TargetSpec()
-    if design.mapping_target_from_pack and rail is not None \
-            and design.profile is not None:
-        # The pack's default: the domain's own rail's (rails may differ).
+    r = None
+    if design.profile is not None:
         from . import profile as profile_mod
-        r = profile_mod.load(design.profile).rails.get(rail)
-        if r is not None and r.flow.get("mapping_target") is not None:
+        prof = profile_mod.load(design.profile)
+        r = prof.rails.get(rail or design.rail or prof.default_rail)
+    if design.mapping_target_from_pack and rail is not None and r is not None:
+        # The pack's default: the domain's own rail's (rails may differ).
+        if r.flow.get("mapping_target") is not None:
             spec = modes.parse_target(r.flow["mapping_target"],
                                       f"rail {rail}: flow")
     overhead = None
     if spec.flop_overhead == "auto":
         overhead = modes.flop_overhead(setup_libs(design, rail),
-                                       spec.flop_cells)
+                                       spec.flop_cells,
+                                       r.dont_use if r is not None else ())
     return modes.derive_target(name, design.effective_modes(), feeding, spec,
                                overhead, clock_names)
 

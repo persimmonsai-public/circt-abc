@@ -142,14 +142,28 @@ def parse_flavours(d, where) -> Optional[dict]:
 TCL = r'''
 set flavours {%(flavours)s}
 set fre {%(fre)s}
+# Per-rail flavour lists (chip view): {<rail>__ {tokens re} ...}; cells of
+# no listed rail use the defaults above.
+set rail_fl_default [list $flavours $fre]
+set rail_fl [dict create %(rails)s]
+proc flav_select {name} {
+  global flavours fre rail_fl rail_fl_default
+  lassign $rail_fl_default flavours fre
+  dict for {pre fl} $rail_fl {
+    if {[string first $pre $name] == 0} { lassign $fl flavours fre; break }
+  }
+}
 proc flav_index {name} {
   global flavours fre
+  flav_select $name
+  if {[llength $flavours] == 0} { return -1 }
   if {![regexp -indices -- $fre $name all tok]} { return -1 }
   set t [string range $name [lindex $tok 0] [lindex $tok 1]]
   return [lsearch -exact $flavours $t]
 }
 proc flav_swap {name k} {
   global flavours fre
+  flav_select $name
   regexp -indices -- $fre $name all tok
   return "[string range $name 0 [expr {[lindex $tok 0] - 1}]][lindex $flavours $k][string range $name [expr {[lindex $tok 1] + 1}] end]"
 }
@@ -327,25 +341,31 @@ def swap(netlist: Path, top: str, out: Path, libs: Sequence[Path],
          tokens: Sequence[str], flavour_re: str, sdc_text: str,
          paths: int = 200, max_iter: int = 30, recover: bool = True,
          image: str = ORFS_IMAGE, margin: float = 0.0,
-         hold_libs: Sequence[Path] = (), both_libs: Sequence[Path] = ()
-         ) -> dict:
+         hold_libs: Sequence[Path] = (), both_libs: Sequence[Path] = (),
+         hold_both_libs: Sequence[Path] = (),
+         rail_flavours: Optional[dict] = None) -> dict:
     """Swap flavours in `netlist` (see the module docstring); writes `out`
     and returns the record. `margin` is the slack to keep, in the
     libraries' time unit. With `hold_libs`, `libs` time setup only
     (`read_liberty -max`) and `hold_libs`, the same cells at the hold
-    corner, time hold (`-min`); `both_libs` (level shifters) serve both."""
+    corner, time hold (`-min`). `both_libs` (level shifters) serve both;
+    with `hold_both_libs` (the shifters at the hold corner) they time setup
+    only and `hold_both_libs` time hold, like `libs` and `hold_libs`."""
     out = Path(out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     hold_libs = [Path(l).resolve() for l in hold_libs]
     both_libs = [Path(l).resolve() for l in both_libs]
+    hold_both_libs = [Path(l).resolve() for l in hold_both_libs]
     files = [Path(netlist).resolve(), *(Path(l).resolve() for l in libs),
-             *hold_libs, *both_libs]
+             *hold_libs, *both_libs, *hold_both_libs]
     flag = "-max " if hold_libs else ""
+    both_flag = "-max " if hold_both_libs else ""
     # Setup libraries first: lib_cell_of takes the first library's cell,
     # and OpenSTA times min paths with the -min library's cell of that name.
     reads = ("".join(f"read_liberty {flag}{Path(l).resolve()}\n" for l in libs)
              + "".join(f"read_liberty -min {l}\n" for l in hold_libs)
-             + "".join(f"read_liberty {l}\n" for l in both_libs))
+             + "".join(f"read_liberty {both_flag}{l}\n" for l in both_libs)
+             + "".join(f"read_liberty -min {l}\n" for l in hold_both_libs))
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         # The record goes beside the output, so a failed or killed run
@@ -359,6 +379,11 @@ def swap(netlist: Path, top: str, out: Path, libs: Sequence[Path],
             + f"read_verilog {files[0]}\nlink_design {top}\n"
             + f"read_sdc {sdc}\n"
             + TCL % {"flavours": " ".join(tokens), "fre": flavour_re,
+                     "rails": " ".join(
+                         "{%s__} {{%s} {%s}}" % (
+                             r, " ".join(f["tokens"]) if f else "",
+                             f["re"] if f else "")
+                         for r, f in sorted((rail_flavours or {}).items())),
                      "record": record, "out": out, "paths": paths,
                      "max_iter": max_iter, "recover": int(recover),
                      "margin": f"{margin:g}"}
@@ -412,9 +437,14 @@ def swap(netlist: Path, top: str, out: Path, libs: Sequence[Path],
     new_cells = cell_changes(orig, out.read_text())
     out.write_text(retype(orig, new_cells))
     res["instances_changed"] = sum(len(v) for v in new_cells.values())
-    res["flavours_before"] = flavour_counts(orig, tokens, flavour_re)
-    res["flavours_after"] = flavour_counts(out.read_text(), tokens,
-                                           flavour_re)
+    if rail_flavours:
+        res["flavours_before"] = rail_flavour_counts(orig, rail_flavours)
+        res["flavours_after"] = rail_flavour_counts(out.read_text(),
+                                                    rail_flavours)
+    else:
+        res["flavours_before"] = flavour_counts(orig, tokens, flavour_re)
+        res["flavours_after"] = flavour_counts(out.read_text(), tokens,
+                                               flavour_re)
     return res
 
 
@@ -489,6 +519,20 @@ def retype(text: str, new_cells: dict) -> str:
     return "".join(pieces)
 
 
+def rail_flavour_counts(text: str, rail_flavours: dict) -> dict:
+    """{<rail>.<token>: instances} over the chip view's <rail>__<cell>
+    names, each rail by its own flavour list."""
+    out = {}
+    for r, f in sorted(rail_flavours.items()):
+        if not f:
+            continue
+        sub = "\n".join(l for l in text.splitlines()
+                        if re.match(r"\s*" + re.escape(r) + r"__", l))
+        out.update({f"{r}.{t}": n for t, n in
+                    flavour_counts(sub, f["tokens"], f["re"]).items()})
+    return out
+
+
 def flavour_counts(text: str, tokens: Sequence[str], flavour_re: str) -> dict:
     """{token: instances} of a netlist's cells whose name carries one."""
     fre = re.compile(flavour_re)
@@ -546,8 +590,10 @@ def run(cfg, spec: VtSwapSpec) -> dict:
     if d.profile is None:
         raise VtSwapError("vt_swap needs a profile with vt_flavours:")
     prof = profile_mod.load(d.profile)
-    if not prof.vt_flavours:
-        raise VtSwapError(f"vt_swap: {prof.name} has no vt_flavours:")
+    fl = prof.flavours_at(d.rail)
+    if not fl:
+        raise VtSwapError(f"vt_swap: {prof.name} has no vt_flavours: "
+                          "(pack level or on the run's rail)")
     nl = cfg.openroad_netlist
     if not nl.exists():
         raise VtSwapError(f"vt_swap: {nl} is missing (needs sv2v)")
@@ -566,8 +612,8 @@ def run(cfg, spec: VtSwapSpec) -> dict:
     keep = cfg.synth_dir / f"{d.top_module}_preswap_openroad.v"
     keep.write_text(nl.read_text())
     out = cfg.synth_dir / f"{d.top_module}_vtswap_openroad.v"
-    res = swap(keep, d.top_module, out, libs, prof.vt_flavours["tokens"],
-               prof.vt_flavours["re"], sdc, spec.paths, spec.max_iter,
+    res = swap(keep, d.top_module, out, libs, fl["tokens"],
+               fl["re"], sdc, spec.paths, spec.max_iter,
                spec.recover, margin=spec.margin_ps / unit_ps(d.time_unit),
                hold_libs=hold_libs)
     out.replace(nl)
@@ -591,8 +637,6 @@ def run_power(cfg, spec: VtSwapSpec, power_summary: dict) -> dict:
     from .modes import unit_ps
     d = cfg.design
     prof = profile_mod.load(d.profile)
-    if not prof.vt_flavours:
-        raise VtSwapError(f"vt_swap: {prof.name} has no vt_flavours:")
     nl = cfg.openroad_netlist
     if not nl.exists():
         raise VtSwapError(f"vt_swap: {nl} is missing (needs sv2v)")
@@ -636,7 +680,12 @@ def run_power(cfg, spec: VtSwapSpec, power_summary: dict) -> dict:
                 dest.append(dst)
                 if c == corner:
                     cells.setdefault(rail, set()).update(names)
-    ls_libs = list(prof.level_shifters)
+    # The shifters at the setup corner, and (with a split hold corner, when
+    # they differ) at the hold corner: they go with the hold libraries.
+    ls_libs = prof.level_shifters_at(corner)
+    ls_hold = prof.level_shifters_at(hold) if split else []
+    if ls_hold == ls_libs:
+        ls_hold = []
     chip = work / f"{top}_chip.v"
     chip.write_text(sta.rename_netlist(text, prefix, cells))
     top_ins = [p for p in tmod.ports if tmod.decls[p].kind == "input"]
@@ -648,8 +697,21 @@ def run_power(cfg, spec: VtSwapSpec, power_summary: dict) -> dict:
                             if c.ports), default=float("inf"))
     order = sorted(modes, key=period)
     margin = spec.margin_ps / unit_ps(d.time_unit)
-    tokens, fre = prof.vt_flavours["tokens"], prof.vt_flavours["re"]
-    rec = {"view": "chip", "corner": corner, "hold_corner": hold,
+    # Each rail's flavour list; one list when every rail has the same.
+    rail_fl = {r: prof.flavours_at(r) for r in sorted(set(prefix.values()))}
+    if not any(rail_fl.values()):
+        raise VtSwapError(f"vt_swap: {prof.name} has no vt_flavours: "
+                          "(pack level or on any rail in use)")
+    rail_fl_arg = None
+    base = rail_fl.get(prof.default_rail) or next(
+        f for f in rail_fl.values() if f)
+    if any(f != base for f in rail_fl.values()):
+        rail_fl_arg = rail_fl
+    tokens, fre = base["tokens"], base["re"]
+    rec = {"view": "chip", "corner": corner,
+           **({"flavours": {r: (f["tokens"] if f else None)
+                            for r, f in rail_fl.items()}}
+              if rail_fl_arg else {}), "hold_corner": hold,
            "unswapped_netlist": str(keep),
            "netlist": str(nl), "shared_modules": shared, "modes": {}}
     cur = chip
@@ -662,7 +724,8 @@ def run_power(cfg, spec: VtSwapSpec, power_summary: dict) -> dict:
         # what the earlier passes left failing in it.
         res = swap(cur, top, out, libs, tokens, fre, sdc_text,
                    spec.paths, spec.max_iter, spec.recover and k == 0,
-                   margin=margin, hold_libs=hold_libs, both_libs=ls_libs)
+                   margin=margin, hold_libs=hold_libs, both_libs=ls_libs,
+                   hold_both_libs=ls_hold, rail_flavours=rail_fl_arg)
         rec["modes"][m.name] = res
         print(f"[vt_swap] chip, mode {m.name}"
               + (" (fix only)" if k else "") + f": {summary(res)}")

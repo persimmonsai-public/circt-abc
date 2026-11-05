@@ -31,6 +31,7 @@ Steps:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import importlib.util
 import os
 import re
@@ -69,18 +70,34 @@ def _run(cmd, **kw) -> None:
     subprocess.run([str(c) for c in cmd], check=True, **kw)
 
 
+def _at_commit(src: Path, commit: str) -> bool:
+    """True when src is a git checkout whose HEAD is commit (false for a
+    missing directory, a bare `git init` and a clone that died half way)."""
+    r = subprocess.run(["git", "-C", str(src), "rev-parse", "HEAD"],
+                       capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() == commit
+
+
 def fetch_source(design: dict, src: Path | None) -> Path:
     s = design["source"]
     commit = s["commit"]
     if src is None:
         src = (profile_mod.cache_root() / "src"
                / f"{design['name']}-{commit[:12]}")
-        if not (src / ".git").exists():
-            src.mkdir(parents=True, exist_ok=True)
-            _run(["git", "-C", src, "init", "-q"])
-            _run(["git", "-C", src, "fetch", "-q", "--depth", "1",
-                  s["git"], commit])
-            _run(["git", "-C", src, "checkout", "-q", "FETCH_HEAD"])
+        # Flows run in parallel (examples/asap7-mvt/run.sh starts four)
+        # and share this directory: one fetches under an exclusive lock
+        # while the others wait, then find the checkout done. Readiness is
+        # HEAD == commit, not the presence of .git, which `git init` makes
+        # before the fetch.
+        src.parent.mkdir(parents=True, exist_ok=True)
+        with open(src.parent / f".{src.name}.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if not _at_commit(src, commit):
+                src.mkdir(parents=True, exist_ok=True)
+                _run(["git", "-C", src, "init", "-q"])
+                _run(["git", "-C", src, "fetch", "-q", "--depth", "1",
+                      s["git"], commit])
+                _run(["git", "-C", src, "checkout", "-q", "FETCH_HEAD"])
     head = subprocess.run(["git", "-C", str(src), "rev-parse", "HEAD"],
                           capture_output=True, text=True,
                           check=True).stdout.strip()

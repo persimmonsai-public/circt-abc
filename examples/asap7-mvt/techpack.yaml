@@ -1,0 +1,58 @@
+# asap7-mvt: ASAP7's three threshold flavours on one rail, as a multi-Vt
+# tech pack (schema 2). ASAP7 is the open predictive 7 nm PDK (BSD-3); the
+# libraries are the ORFS asap7 platform's NLDM ones, built into lib/ by
+# lib/make_libs.py (run.sh calls it; nothing in lib/ is committed).
+#
+# The rail's first liberty is the merged leakage-priced multi-Vt one
+# (scripts/mvt/make_abc_lib.py: its areas are prices), so ABC chooses the
+# flavour per cell; the real per-flavour libraries follow it.
+#
+# Corners are the platform's: tt (0.7 V, 25 C), ss (0.63 V, 100 C) and
+# ff (0.77 V, 0 C). Mapping and setup time at tt. Leakage is priced at ss:
+# at 100 C it is the leakiest corner (ff is cold). Hold is checked at ff.
+schema: 2
+name: asap7_mvt
+time_unit: ps
+icg: {cell: ICGx1_ASAP7_75t_R, clk: CLK, en: ENA, test_en: SE, out: GCLK}
+# The platform's DONT_USE_CELLS.
+dont_use: ["*x1p*_ASAP7*", "*xp*_ASAP7*", "SDF*", "ICG*"]
+tie: {hi: "TIEHIx1_ASAP7_75t_R:H", lo: "TIELOx1_ASAP7_75t_R:L"}
+# The flavour in a cell name (NAND2x1_ASAP7_75t_SL), slowest first: the
+# flow's vt_swap stage (circt_flow/vtswap.py).
+vt_flavours:
+  tokens: [R, L, SL]
+  re: '_ASAP7_75t_(R|L|SL)$'
+public: true
+corners:
+  names: [tt, ss, ff]
+  setup: tt
+  leakage: ss
+  hold: ff
+flow:
+  # Per-cell delays (read_lib -l) and a real delay target for &nf (-l -D):
+  # abc/mvt.abc. Without both, every flavour of a cell looks equally fast.
+  abc_read_lib_args: "-l"
+  abc_script_file: abc/mvt.abc
+  # ABC's load-aware delay model is optimistic on these libraries (ibex, RVT
+  # arm: &nf ends at ~1.0 ns, OpenSTA times the paths at ~2.1-2.2 ns), so a target of
+  # the clock period leaves the slack ABC thinks it has to area recovery,
+  # and vt_swap then has hundreds of ps to recover. A tighter target makes
+  # the mapping itself faster. Calibrated on ibex at 1.5-2 ns (README):
+  # target = 0.5 * (period - flop overhead). A flow config's own
+  # mapping_target: replaces this.
+  mapping_target: {scale: 0.5}
+  # Pre-placement fanout buffering (circt_flow/fanout.py).
+  fanout_buffer: {cell: BUFx2_ASAP7_75t_R, input: A, output: Y, max_fanout: 32}
+default_rail: VDD
+rails:
+  VDD:
+    voltage: 0.7
+    liberties:
+      - lib/asap7_mvt_tt_abc.lib
+      - lib/asap7_rvt_tt.lib
+      - lib/asap7_lvt_tt.lib
+      - lib/asap7_slvt_tt.lib
+    corners:
+      tt: [lib/asap7_rvt_tt.lib, lib/asap7_lvt_tt.lib, lib/asap7_slvt_tt.lib]
+      ss: [lib/asap7_rvt_ss.lib, lib/asap7_lvt_ss.lib, lib/asap7_slvt_ss.lib]
+      ff: [lib/asap7_rvt_ff.lib, lib/asap7_lvt_ff.lib, lib/asap7_slvt_ff.lib]

@@ -844,10 +844,22 @@ def _merge_and_map_partitioned(cfg: FlowConfig) -> Path:
 def export_netlist(cfg: FlowConfig) -> Path:
     cfg.synth_dir.mkdir(parents=True, exist_ok=True)
     print(f"[circt_flow] hw-flatten-modules + export-verilog -> {cfg.netlist}")
+    src = cfg.mapped_mlir
+    if os.environ.get("CIRCT_FLOW_OUTLINE_AFTER_FLATTEN") == "1":
+        # outline-after-flatten leaves one public `<top>_residual` module,
+        # which hw-flatten-modules keeps; make it private so the netlist is
+        # flat (the fanout stage, sv2v and OpenSTA's flat view need one
+        # module).
+        import re
+        text = Path(cfg.mapped_mlir).read_text()
+        text = re.sub(r"hw\.module @(%s_residual)\(" % re.escape(
+            cfg.design.top_module), r"hw.module private @\1(", text)
+        src = Path(str(cfg.mapped_mlir) + ".private")
+        src.write_text(text)
     _run(
         [
             cfg.circt_opt,
-            cfg.mapped_mlir,
+            src,
             "--hw-flatten-modules",
             "--export-verilog",
             "-o",
@@ -987,9 +999,18 @@ def orfs_pnr(cfg: FlowConfig) -> Path:
         argv += ["--place-density", str(p["place_density"])]
     for k, v in (p.get("set") or {}).items():
         argv += ["--set", f"{k}={v}"]
-    if cfg.design.tie:
-        argv += ["--tie-hi", cfg.design.tie["hi"],
-                 "--tie-lo", cfg.design.tie["lo"]]
+    # `pnr.tie_hi` / `pnr.tie_lo` (CELL:PIN) replace the pack's tie cells,
+    # for a platform that carries only another flavour's (ASAP7_USE_VT).
+    tie = {"hi": p.get("tie_hi", (cfg.design.tie or {}).get("hi")),
+           "lo": p.get("tie_lo", (cfg.design.tie or {}).get("lo"))}
+    if tie["hi"] and tie["lo"]:
+        argv += ["--tie-hi", tie["hi"], "--tie-lo", tie["lo"]]
+    # `pnr.vt_swap: false` keeps OpenROAD's repair_timing from swapping Vt
+    # flavours; `pnr.dont_use` (cell-name globs) keeps the resizer off cells.
+    if not p.get("vt_swap", True):
+        argv += ["--no-vt-swap"]
+    for pat in p.get("dont_use") or []:
+        argv += ["--dont-use", str(pat)]
     if "orfs_platform_dir" in cfg.design.pack_pnr:
         argv += ["--platform-dir", str(cfg.design.pack_pnr["orfs_platform_dir"])]
     print(f"[circt_flow] ORFS P&R -> {cfg.pnr_dir}")

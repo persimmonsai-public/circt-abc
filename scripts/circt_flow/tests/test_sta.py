@@ -304,3 +304,40 @@ def test_power_views_and_summary(tmp_path, mv_pack, monkeypatch, capsys):
     assert "[sta]   lo         LO         func     default    +0.1000" in printed
     with pytest.raises(sta.StaError, match="sta.corners: ss not among"):
         sta.run(cfg, sta.StaSpec(corners=("ss",)), {"domains": recs})
+
+
+def test_views_read_the_corners_level_shifters(tmp_path, mv_pack,
+                                               monkeypatch):
+    """The top-domain and chip views read the shifters of their own corner
+    (`level_shifters.corners`), not the pack's default ones."""
+    import dataclasses
+    f = _flow(tmp_path, mv_pack)
+    out = tmp_path / "out"
+    cfg = FlowConfig.load(f, out, run_sta=True)
+    cfg.synth_dir.mkdir(parents=True)
+    cfg.openroad_netlist.write_text(NETLIST)
+    recs = [{"name": "lo", "rail": "LO", "module": "lo_core",
+             "netlist_instances": ["u_lo"]},
+            {"name": "h2", "rail": "HI2", "module": "hi2_core",
+             "netlist_instances": ["u_h2"]}]
+    (out / "power_domains.json").write_text(json.dumps({"domains": recs}))
+    real = profile.load(cfg.design.profile)
+    ls = mv_pack.parent / "lib" / "ls.lib"
+    alt = mv_pack.parent / "lib" / "ls_alt.lib"
+    alt.write_text(ls.read_text())
+    monkeypatch.setattr(profile, "load", lambda *a, **k: dataclasses.replace(
+        real, level_shifter_corners={"default": [alt]}))
+    seen = []
+
+    def fake(views, sta_dir, image):
+        for v in views:
+            seen.append(v)
+            v.result = {"wns_ns": 0.1, "tns_ns": 0.0, "hold_wns_ns": 0.0,
+                        "log": "x"}
+            if v.kind == "chip":
+                v.result["endpoints"] = []
+    monkeypatch.setattr(sta, "run_views", fake)
+    sta.run(cfg, sta.wanted(cfg), {"domains": recs})
+    by = {v.label: v for v in seen}
+    for label in ("top.func.default", "chip.func.default"):
+        assert alt in by[label].libs and ls not in by[label].libs

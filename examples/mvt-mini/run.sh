@@ -10,7 +10,7 @@
 # mvt_top and mvt_soc, of each domain against its own rail's real
 # libraries; for mvt_soc, per domain x mode x corner).
 #
-#   examples/mvt-mini/run.sh <out_dir> [-W <leak weight>] [--sta] [--vt-swap] [--only <core_hv|core_lv|mvt_top|mvt_soc>]
+#   examples/mvt-mini/run.sh <out_dir> [-W <leak weight>] [--sta] [--vt-swap] [--only <core_hv|core_lv|mvt_top|mvt_soc|mvt_top_buf>]
 #
 # <out_dir> may not be inside this repository (the flow allows it for this
 # public pack, but results do not belong in the tree). -W is
@@ -57,7 +57,7 @@ for s in 0p75v 0p55v; do
 done
 
 cd "$root/scripts"
-for p in techpack techpack_0p55 techpack_mvt techpack_mvt_0p55 techpack_rails techpack_corners; do
+for p in techpack techpack_0p55 techpack_mvt techpack_mvt_0p55 techpack_rails techpack_rails_buf techpack_corners; do
   python3 -m circt_flow.techpack check "$here/$p.yaml" >/dev/null \
     || { python3 -m circt_flow.techpack check "$here/$p.yaml"; exit 1; }
 done
@@ -130,6 +130,20 @@ PY
   fi
   grep -h "^\[power\] level shifters\|^\[sta\]   \|^\[sta\] [pc]" "$run.log" \
     | sed 's/^/mvt_top_ls /' | tee -a "$summary" || true
+fi
+
+# 3b. mvt_top_buf (only with --only mvt_top_buf, so the default summary is
+#    unchanged): mvt_top on techpack_rails_buf.yaml, each rail with its own
+#    fanout buffer cell and limit, and u_lv's flavours without slvt.
+#    <run>/fanout.json lists each rail's cell and what each module used.
+if [ "$ONLY" = mvt_top_buf ]; then
+  cfg="$here/designs/mvt_top/flow_buf.yaml"; run="$out/mvt_top_buf"
+  echo "[mvt-mini] mvt_top with a buffer and flavours per rail -> $run"
+  if ! python3 -m circt_flow "$cfg" "$run" $STA $VTSWAP > "$run.log" 2>&1; then
+    echo "[mvt-mini] FAILED, see $run.log" >&2; tail -20 "$run.log" >&2; exit 1
+  fi
+  grep -h "^\[fanout\]\|^\[vt_swap\]" "$run.log" | sed 's/^/mvt_top_buf /' \
+    | tee -a "$summary" || true
 fi
 
 # 4. mvt_soc: core_lv on VDD_LV clocked by clk_lv_i, core_hv on VDD_HV by

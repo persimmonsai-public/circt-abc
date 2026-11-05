@@ -57,6 +57,12 @@ rails:
     flow:
       abc_read_lib_args: "-l"
       abc_script_file: abc/mvt.abc
+# The shifters per corner too (their delay and leakage scale with the
+# corner); a corner not listed would read `liberties`.
 level_shifters:
   liberties:
     - lib/mini_ls.lib
+  corners:
+    tt: [lib/mini_ls_tt.lib]
+    ss: [lib/mini_ls_ss.lib]
+    ff: [lib/mini_ls_ff.lib]

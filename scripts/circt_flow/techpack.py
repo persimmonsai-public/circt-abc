@@ -42,6 +42,7 @@ from typing import Iterable, Iterator
 import yaml
 
 from . import profile as profile_mod
+from . import provenance
 
 # Shorter cell names (INV, ND2, ...) are ordinary words; a library's
 # distinctive names are longer.
@@ -108,6 +109,7 @@ def check(ref: str) -> list[str]:
                                         pdir)
         print(f"  {len(prof.liberties)} liberties, {n} cells")
         problems += cell_problems
+        problems += _check_provenance(prof, prof.rails.get(prof.rail), "")
     print(f"  pack root: {prof.root or '(repo profile)'}")
     for k, v in prof.flow.items():
         print(f"  flow.{k}: {v}")
@@ -163,6 +165,9 @@ def _check_rails(prof) -> list[str]:
             print(f"    flow.{k}: {v}")
         if r.corners and not rp:
             rp += _check_corners(prof, r)
+        if not rp:
+            rp += _check_provenance(prof, r, f"rails.{name}: ")
+            rp += _check_rail_flow(prof, r)
         problems += rp
     ls_missing = [p for p in prof.level_shifters if not p.exists()]
     problems += [f"level_shifters: liberty {p} does not exist"
@@ -172,10 +177,86 @@ def _check_rails(prof) -> list[str]:
              if not ls_missing else "?")
         print(f"  level shifters: {len(prof.level_shifters)} liberties, "
               f"{n} cells")
+    if prof.level_shifter_corners:
+        # Every corner's shifters: the files exist, with the setup corner's
+        # cell names (a netlist is timed at any corner).
+        ref_c = prof.setup_corner
+        ref_libs = prof.level_shifters_at(ref_c)
+        ref = (set(liberty_cells(ref_libs))
+               if ref_libs and all(p.exists() for p in ref_libs) else None)
+        for c, libs in prof.level_shifter_corners.items():
+            miss = [p for p in libs if not p.exists()]
+            problems += [f"level_shifters.corners.{c}: liberty {p} does "
+                         "not exist" for p in miss]
+            if miss or ref is None:
+                continue
+            cells = set(liberty_cells(libs))
+            if cells != ref:
+                problems.append(
+                    f"level_shifters.corners.{c}: cells differ from the "
+                    f"{ref_c} corner's ({', '.join(sorted(cells ^ ref))})")
+        print("  level shifters per corner: "
+              + ", ".join(f"{c} ({len(prof.level_shifter_corners[c])})"
+                          for c in prof.corner_names
+                          if c in prof.level_shifter_corners))
     for k, v in prof.pnr.items():
         print(f"  pnr.{k}: {v}")
     for p in problems:
         print(f"  ERROR: {p}")
+    return problems
+
+
+def _check_provenance(prof, r, where: str) -> list[str]:
+    """Print the rail's priced-library verdict (circt_flow.provenance);
+    stale is a problem, unverified a warning."""
+    res = provenance.check_rail(prof, r) if r is not None else None
+    if res is None:
+        return []
+    verdict, why = res
+    name = r.liberties[0].name
+    if verdict == "ok":
+        print(f"    priced library {name}: provenance ok")
+        return []
+    if verdict == "unverified":
+        print(f"    WARNING: priced library {name}: unverified: {why[0]}")
+        return []
+    print(f"    priced library {name}: stale")
+    return [f"{where}priced library {name} is stale: {w}" for w in why]
+
+
+def _check_rail_flow(prof, r) -> list[str]:
+    """A rail's fanout buffer (a cell of its own libraries, with its pins)
+    and its flavour list: which cell families lack which flavours."""
+    problems = []
+    libs = r.corners.get(prof.setup_corner) or r.liberties
+    cells = liberty_cells(libs)
+    fb = r.flow.get("fanout_buffer")
+    if isinstance(fb, dict) and fb.get("enabled") is not False:
+        cell = fb.get("cell")
+        print(f"    fanout_buffer: {cell}, max_fanout "
+              f"{fb.get('max_fanout', 16)}")
+        if cell not in cells:
+            problems.append(f"rails.{r.name}: fanout_buffer cell {cell} is "
+                            "not in the rail's liberties")
+    fl = prof.flavours_at(r.name)
+    if fl:
+        fre = re.compile(fl["re"])
+        fam: dict[str, set[str]] = {}
+        for c in cells:
+            m = fre.search(c)
+            if m and m.group(1) in fl["tokens"]:
+                fam.setdefault(c[:m.start(1)] + "\0" + c[m.end(1):],
+                               set()).add(m.group(1))
+        print(f"    vt_flavours: {' < '.join(fl['tokens'])}"
+              + (" (rail's own)" if r.vt_flavours else ""))
+        lack = {}
+        for k, have in sorted(fam.items()):
+            for t in fl["tokens"]:
+                if t not in have:
+                    lack.setdefault(t, []).append(k.replace("\0", "*"))
+        for t, ks in lack.items():
+            print(f"    flavour {t} missing in {len(ks)} of {len(fam)} "
+                  f"cell families, e.g. {ks[0]}")
     return problems
 
 

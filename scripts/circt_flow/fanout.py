@@ -46,6 +46,7 @@ def parse_spec(pack: Optional[dict], design, where: str
                            and design.get("enabled") is False):
         return None
     merged = {}
+    off = False
     for src, w in ((pack, "pack flow.fanout_buffer"),
                    (design, "fanout_buffer")):
         if src is None or src is True:
@@ -58,8 +59,10 @@ def parse_spec(pack: Optional[dict], design, where: str
                            f"{', '.join(sorted(bad))}; allowed: "
                            f"{', '.join(sorted(SPEC_KEYS))}")
         merged.update(src)
+        if "enabled" in src:
+            off = src["enabled"] is False
     merged.pop("enabled", None)
-    if not merged:
+    if off or not merged:
         return None
     if not merged.get("cell"):
         raise KeyError(f"{where}: fanout_buffer needs a cell (the pack's "
@@ -72,6 +75,16 @@ def parse_spec(pack: Optional[dict], design, where: str
                       input=str(merged.get("input", "A")),
                       output=str(merged.get("output", "Y")),
                       max_fanout=mf)
+
+
+def rail_specs(prof, design, where: str) -> Dict[str, Optional[FanoutSpec]]:
+    """Each rail's spec: its merged flow.fanout_buffer (the pack's, then
+    the rail's own key by key) under the flow config's `design` override.
+    None for a rail with none, or one that sets `enabled: false`."""
+    return {name: parse_spec(r.flow.get("fanout_buffer"), design,
+                             f"{where}: rail {name}")
+            for name, r in prof.rails.items()}
+
 
 _STMT = re.compile(r"^[ \t]*([A-Za-z_]\w*)[ \t]+(\\\S+|[A-Za-z_]\w*)\s*\("
                    r"(.*?)\)\s*;", re.M | re.S)
@@ -241,11 +254,13 @@ def run(cfg, spec: FanoutSpec) -> dict:
 
 
 def buffer_modules(text: str, top: str, rail_of: Dict[str, str],
-                   cells_of: Dict[str, dict], spec: FanoutSpec
+                   cells_of: Dict[str, dict], spec
                    ) -> Tuple[str, dict]:
     """Buffer each module of `text` named in `rail_of` on its own, with the
-    cells of its rail (`cells_of[rail]`); returns (text, {module: stats})
-    for the modules that changed."""
+    cells and the buffer of its rail (`cells_of[rail]`; `spec` is one
+    FanoutSpec, or {rail: FanoutSpec or None}, None leaving the rail's
+    modules alone); returns (text, {module: stats}) for the modules that
+    changed."""
     from . import vnetlist as vn
     spans = vn.module_spans(text)
     mods = vn.parse(text)
@@ -254,23 +269,27 @@ def buffer_modules(text: str, top: str, rail_of: Dict[str, str],
     for m, (a, b) in sorted(spans.items(), key=lambda kv: -kv[1][0]):
         if m not in rail_of:
             continue
+        sp = spec.get(rail_of[m]) if isinstance(spec, dict) else spec
+        if sp is None:
+            continue
         # A module's inputs are driven by its parent, except the top's
         # (primary inputs, left alone as in a flat run).
         ins = [] if m == top else [
             q for q in mods[m].ports if mods[m].decls[q].kind == "input"]
-        new, st = buffer_fanout(out[a:b], cells_of[rail_of[m]], spec.cell,
-                                spec.input, spec.output, spec.max_fanout,
+        new, st = buffer_fanout(out[a:b], cells_of[rail_of[m]], sp.cell,
+                                sp.input, sp.output, sp.max_fanout,
                                 driven_ports=ins)
         if st.nets:
             out = out[:a] + new + out[b:]
-            per[m] = {"rail": rail_of[m], "nets": st.nets,
+            per[m] = {"rail": rail_of[m], "cell": sp.cell,
+                      "max_fanout": sp.max_fanout, "nets": st.nets,
                       "buffers": st.buffers, "worst_fanout": st.worst_fanout,
                       "largest": [{"net": n, "fanout": f}
                                   for n, f in st.top]}
     return out, per
 
 
-def run_power(cfg, spec: FanoutSpec, power_summary: dict) -> dict:
+def run_power(cfg, spec, power_summary: dict) -> dict:
     """The power flow's stage: buffer each module of the stitched OpenSTA
     netlist on its own, with its rail's libraries (the top and the glue on
     the default rail, each domain's modules on the domain's). Nets that
@@ -279,7 +298,12 @@ def run_power(cfg, spec: FanoutSpec, power_summary: dict) -> dict:
     port counts as a driver (a flop's net enters the ABC residual module
     through one), and the tree is built inside the submodule, on its rail.
     Domain crossings keep their level shifters; a tree only follows them.
-    A module under domains of two rails is not buffered."""
+    A module under domains of two rails is not buffered.
+
+    `spec` is one FanoutSpec for every rail, or {rail: spec or None}
+    (rail_specs): a module is buffered with the cell, pins and limit of
+    the rail its instances live on, and checked against that rail's
+    libraries."""
     from . import intent, profile as profile_mod, sta, vnetlist as vn
     d = cfg.design
     prof = profile_mod.load(d.profile)
@@ -302,33 +326,44 @@ def run_power(cfg, spec: FanoutSpec, power_summary: dict) -> dict:
     for m in sorted(shared):
         print(f"[fanout] WARNING: module {m} is under domains on rails "
               f"{', '.join(sorted(owners[m]))}; not buffered")
-    used = used_cells(text) | {spec.cell}
+    specs = (dict(spec) if isinstance(spec, dict)
+             else {r: spec for r in set(rail_of.values())})
+    specs = {r: sp for r, sp in specs.items()
+             if sp is not None and r in set(rail_of.values())}
+    used = used_cells(text) | {sp.cell for sp in specs.values()}
     corner = prof.setup_corner
     cells_of = {}
-    for rail in sorted(set(rail_of.values())):
+    for rail in sorted(specs):
+        sp = specs[rail]
         libs = list(prof.libs_at(corner, rail=rail)) + \
             list(prof.level_shifters)
         cells = intent.liberty_cells(libs, only=used)
-        c = cells.get(spec.cell)
-        if c is None or c.pins.get(spec.input) != "input" or \
-                c.pins.get(spec.output) != "output":
-            raise ValueError(f"fanout: rail {rail} has no buffer {spec.cell} "
-                             f"with input {spec.input} and output "
-                             f"{spec.output}")
+        c = cells.get(sp.cell)
+        if c is None or c.pins.get(sp.input) != "input" or \
+                c.pins.get(sp.output) != "output":
+            raise ValueError(f"fanout: rail {rail} has no buffer {sp.cell} "
+                             f"with input {sp.input} and output "
+                             f"{sp.output}")
         cells_of[rail] = cells
     out, per = buffer_modules(text, top, {m: r for m, r in rail_of.items()
-                                     if m not in shared}, cells_of, spec)
+                                     if m not in shared}, cells_of, specs)
     keep = cfg.synth_dir / f"{top}_prebuf_openroad.v"
     keep.write_text(text)
     nl.write_text(out)
-    res = {"cell": spec.cell, "max_fanout": spec.max_fanout,
+    res = {"rails": {r: {"cell": sp.cell, "max_fanout": sp.max_fanout}
+                     for r, sp in sorted(specs.items())},
            "nets": sum(v["nets"] for v in per.values()),
            "buffers": sum(v["buffers"] for v in per.values()),
            "modules": per, "shared_modules": sorted(shared),
            "unbuffered_netlist": str(keep), "netlist": str(nl)}
+    if len(set(specs.values())) == 1:   # one buffer everywhere: as before
+        sp = next(iter(specs.values()))
+        res = {"cell": sp.cell, "max_fanout": sp.max_fanout, **res}
     (cfg.out_dir / "fanout.json").write_text(json.dumps(res, indent=2)
                                              + "\n")
-    print(f"[fanout] {res['nets']} net(s) over {spec.max_fanout} loads in "
-          f"{len(per)} module(s): {res['buffers']} {spec.cell} -> {nl} "
+    cellsum = ", ".join(f"{r}: {sp.cell} over {sp.max_fanout}"
+                        for r, sp in sorted(specs.items()))
+    print(f"[fanout] {res['nets']} net(s) in {len(per)} module(s), "
+          f"{res['buffers']} buffer(s) ({cellsum}) -> {nl} "
           f"(unbuffered: {keep})")
     return res

@@ -57,7 +57,12 @@ rails:
       abc_read_lib_args: "-l"
       abc_script_file: abc/mvt.abc
 # The cells power.insert_level_shifters puts on the signals that cross
-# between the rails (one tt library, read at every corner).
+# between the rails: the tt library by default, each corner's own for STA
+# and vt_swap (lib/make_libs.py scales their delay and leakage per corner).
 level_shifters:
   liberties:
     - lib/mini_ls.lib
+  corners:
+    tt: [lib/mini_ls_tt.lib]
+    ss: [lib/mini_ls_ss.lib]
+    ff: [lib/mini_ls_ff.lib]

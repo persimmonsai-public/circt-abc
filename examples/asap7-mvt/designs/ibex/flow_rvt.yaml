@@ -1,0 +1,15 @@
+# ibex_top on asap7-mvt (rvt).
+design:
+  top_module: ibex_top
+  manifest: ibex
+pdk:
+  profile: ../../techpack_rvt.yaml
+modes:
+  func: func.sdc
+pnr:
+  platform: asap7
+  clock_port: clk_i
+  utilization: 40
+  tie_hi: "TIEHIx1_ASAP7_75t_R:H"
+  tie_lo: "TIELOx1_ASAP7_75t_R:L"
+  set: {ASAP7_USE_VT: RVT, CORNER: TC}

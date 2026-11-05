@@ -1,0 +1,29 @@
+# asap7-mvt's SLVT control: techpack_rvt.yaml with SLVT only.
+schema: 2
+name: asap7_slvt
+time_unit: ps
+icg: {cell: ICGx1_ASAP7_75t_SL, clk: CLK, en: ENA, test_en: SE, out: GCLK}
+dont_use: ["*x1p*_ASAP7*", "*xp*_ASAP7*", "SDF*", "ICG*"]
+tie: {hi: "TIEHIx1_ASAP7_75t_SL:H", lo: "TIELOx1_ASAP7_75t_SL:L"}
+public: true
+corners:
+  names: [tt, ss, ff]
+  setup: tt
+  leakage: ss
+  hold: ff
+flow:
+  abc_read_lib_args: "-l"
+  abc_script_file: abc/mvt.abc
+  # The multi-Vt pack's calibrated target (techpack.yaml), so the arms
+  # differ only in their libraries.
+  mapping_target: {scale: 0.5}
+  fanout_buffer: {cell: BUFx2_ASAP7_75t_SL, input: A, output: Y, max_fanout: 32}
+default_rail: VDD
+rails:
+  VDD:
+    voltage: 0.7
+    liberties: [lib/asap7_slvt_tt.lib]
+    corners:
+      tt: [lib/asap7_slvt_tt.lib]
+      ss: [lib/asap7_slvt_ss.lib]
+      ff: [lib/asap7_slvt_ff.lib]

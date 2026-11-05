@@ -82,7 +82,8 @@ extracted into the cache and merged into one file.
 `${VAR}` and `${VAR:-default}` are expanded from the environment in every
 path; an unset `${VAR}` with no default is an error. Paths are relative to
 the pack directory. The first liberty is the primary one, which the
-single-liberty passes read.
+single-liberty passes read. A pack with several supplies uses schema 2
+(Rails, below).
 
 `python3 -m circt_flow.techpack check <name|path>` loads a pack and checks
 that every liberty, `flow:` path and `pnr:` path exists and that the ICG and
@@ -151,6 +152,8 @@ rails:
     # icg:, tie:, dont_use: may also be overridden per rail
 level_shifters:
   liberties: [lib/level_shifters.lib]
+  corners:                          # optional, with `corners:` below
+    ss: [lib/level_shifters_ss.lib]
 ```
 
 There is no top-level `liberties:`; each rail lists its own, primary
@@ -170,9 +173,15 @@ between rails. A cell qualifies when it has `is_level_shifter : true`, a
 `level_shifter_type` of `LH` (low to high), `HL` or `LH_HL`, one input and
 one output pin whose `function` is that input (no enable), and, when it
 gives them, an `input_voltage_range` / `output_voltage_range` that hold
-the two rails' voltages. The smallest-area qualifying cell is used. The
-level-shifter liberties have no corners: the same files are read at every
-corner.
+the two rails' voltages. The smallest-area qualifying cell is used. A pack with
+`corners:` may add `level_shifters.corners: {<corner>: [libs]}`: the
+shifters' liberties at that corner (names checked against `corners.names`;
+a corner not listed reads `liberties`, and `liberties` may be omitted when
+every corner is listed). The STA stage's top-domain and chip views read
+their own corner's shifters, and vt_swap reads the setup corner's with the
+setup libraries and the hold corner's with the hold libraries.
+`techpack check` requires every corner's shifters to exist and have the
+setup corner's cell names. Shifter cells are not renamed per rail.
 
 ### Corners
 
@@ -225,6 +234,61 @@ netlist's register-to-register hold at each fast corner and take the
 worst. A rail `corners:` without the
 pack-level block, a rail missing a corner, or `corners:` in a schema-1 pack
 is an error.
+
+### Mapping-library provenance
+
+The priced library (a multi-Vt rail's primary liberty, built by
+`scripts/mvt/make_abc_lib.py`) is derived from the rail's real liberties.
+If those change (a re-characterised corner, a new list entry) or the file
+is edited, it is stale: the flow would map with prices that no longer
+describe the libraries it times with. So `make_abc_lib.py` writes, as the
+first line of its output, one machine-readable comment:
+
+```
+/* make_abc_lib provenance v1: {"inputs":[{"name","sha256","size"},...],
+   "leakage_libs":[...same...],"W":..,"S":..,"exclude":[..],"keep":[..],
+   "keep_dont_use":..,"cells":N,"dropped":{..},"tool":{"git","sha256"},
+   "body_sha256":"..","body_size":N} */
+```
+
+(really one line; `*/` inside the JSON is escaped). `body_sha256` hashes
+every byte after that line. Hashes are streamed; names are file names, not
+paths.
+
+`python3 -m circt_flow.techpack check` applies this rule to each rail that
+has a priced library: with `corners:`, a rail whose first liberty is not
+one of its setup corner's files; without `corners:`, a rail whose first
+liberty has a provenance line (nothing else marks a primary as priced). Let
+SRC be the rail's setup corner list (without corners, its `liberties:` after
+the first) and LEAK the leakage corner's list. The library is
+
+- `ok` when all of these hold:
+  1. its recorded `inputs` and SRC are the same set of files by sha256
+     (order and location do not matter);
+  2. its recorded `leakage_libs` and LEAK are the same set by sha256; when
+     it records none, the leakage corner must be the setup corner (or the
+     pack has no corners);
+  3. the file after its first line still hashes to `body_sha256`;
+  4. every cell of the library is a cell of a file in SRC.
+- `stale` when the line is present and any of these fails. The reason names
+  the file ("input X changed since the library was built", "input X is in
+  the rail's list but was not an input", "edited after it was built", ...).
+  `check` prints it as an `ERROR` and exits 1.
+- `unverified` when there is no provenance line (a library built before
+  the line existed, or not built by this tool).
+  `check` prints a `WARNING` and exits 0.
+
+`W`, `S`, the `-X` / `--keep` patterns and the tool revision are recorded
+but not compared: the pack does not state them, so the file's own record is
+all there is. The fix for a stale library is to rebuild it (the
+`examples/*/run.sh` scripts do).
+
+The flow runs the same rule when it loads a pack's profile
+(`pdk.profile`), controlled by the environment variable
+`CIRCT_ABC_PROVENANCE`: `warn` (default) prints stale and unverified rails
+to stderr once per process, `error` refuses a stale library (unverified
+still only warns), `off` skips the check. Cost on ASAP7 (about 107 MB of
+liberties): 0.55 s cold, once per process.
 
 ## Power domains
 
@@ -435,7 +499,8 @@ Limits:
   clocks: a check of the netlist and the constraints, not signoff;
 * a clock that reaches a domain through logic other than level shifters
   is not traced, so that domain's own view is unclocked (with a warning);
-* the level-shifter liberties have one corner, read at every corner;
+* a domain's own view holds no level shifters (they are in the top and
+  chip views);
 * without corners, a rail's mapping liberties are used. Those may include
   a priced merged liberty, whose cells duplicate the real ones; OpenSTA
   binds the first library it read that has the cell.
@@ -478,7 +543,7 @@ driven by it, see realistic loads.
 **In a power flow** the stage runs after the intent step (crossings, UPF,
 level shifters) and before vt_swap, on the stitched OpenSTA netlist, one
 module at a time with that module's rail's cells (the top and the glue on
-the default rail; one buffer cell for every rail, checked in each). A
+the default rail), with the buffer of that module's rail (below). A
 submodule's input port counts as a driver: a domain's flops sit in its
 module and ABC's logic in a `_residual` submodule, so a flop's net fans
 out through a port, and its tree is built on the load side, inside the
@@ -487,6 +552,34 @@ that cross a domain boundary end on module ports, so the crossings and
 their level shifters stay as the intent step left them, and every buffer
 sits in a module of its domain (the UPF names module instances). A module
 under domains of two rails is not buffered (a warning says so).
+
+**Per rail.** A buffer cell from one rail's library is wrong on another
+rail, so on a schema-2 pack `fanout_buffer` can also sit in a rail's
+`flow:`:
+
+```yaml
+flow:                         # pack level: the default for every rail
+  fanout_buffer: {cell: BUF_X4, max_fanout: 16}
+rails:
+  VDD_LV:
+    flow:
+      fanout_buffer: {cell: BUF_X2, max_fanout: 8}   # keys override one by one
+  VDD_RET:
+    flow:
+      fanout_buffer: {enabled: false}                # this rail is not buffered
+```
+
+A rail's keys (`cell`, `input`, `output`, `max_fanout`) override the
+pack-level ones key by key, so a rail may change only the limit and keep
+the pack's cell; `enabled: false` turns the rail's buffering off. A flow
+config's `fanout_buffer:` is applied over every rail's spec, and
+`fanout_buffer: false` turns all of them off. In a power flow each module
+is buffered with the cell, pins and limit of its own rail, checked against
+that rail's setup-corner libraries (and the level shifters'); a rail with
+no spec is left alone, and `<out>/fanout.json` lists each rail's cell and
+limit and, per module, the cell used. A flat run (`pdk.rail:`, or the
+default rail) reads the spec from that rail. `techpack check` prints each
+rail's buffer and fails when the cell is not in the rail's liberties.
 
 ### Threshold-voltage swap: `--vt-swap` and `vt_swap:`
 
@@ -559,6 +652,21 @@ Swapping each domain alone in its own view was tried first and is not
 sound: the view misses the glue and shifters on the domain's inputs, so
 its recovery can leave a cross-domain path that passes in the domain's own
 view failing in the chip view.
+
+**Per rail.** `vt_flavours:` may also be set in a rail
+(`rails.<name>.vt_flavours`), replacing the pack-level list for that rail:
+a rail can have a different ladder or leave a flavour out of the swap,
+and a rail with none inherits the pack's. The list limits the swap only:
+cells ABC mapped to a flavour outside it stay as they are, so keeping a
+flavour out of a rail altogether also takes `dont_use` or a priced
+library without it. A flat
+run uses the run's rail's list. In the chip view each cell moves along
+the list of its rail (the `<rail>__` prefix tells), so cells of a rail
+never reach a flavour the rail does not list; level shifters never move.
+When the rails' lists differ, `vt_swap.json` records them and the flavour
+counts are keyed `<rail>.<token>`. `techpack check` prints each rail's
+list and, for each flavour, how many cell families (names equal but for
+the flavour token) lack it, which the swap skips silently.
 
 `examples/mvt-mini` shows the swap on its cores and power designs (its
 README has the numbers).
@@ -672,7 +780,17 @@ directory, for scripts that read files from it.
 
 `design.manifest:` is a path relative to the flow config, or a bare name
 for a design in this repository's `designs/<name>/manifest.yaml`. A pack
-with a private design keeps its manifest beside the flow config.
+with a private design keeps its manifest beside the flow config. A
+manifest's `source:` is a git repository at a pinned commit, or `path:`, a
+directory relative to the manifest, for RTL kept beside it.
+
+A `source:` checkout is cached under the flow's cache root, named for the
+design and the first 12 characters of the commit. Flows that run in
+parallel (`examples/asap7-mvt/run.sh` starts four) share it: the first
+fetches under an exclusive file lock (`.<name>.lock` beside the checkout)
+and the others wait, then find it at the pinned commit. A checkout counts
+as ready when its `HEAD` is the pinned commit; a directory that exists only
+because `git init` ran before the fetch does not.
 
 ## Precedence
 
@@ -686,11 +804,20 @@ Each setting a pack can default resolves, highest first:
 
 The keys a `flow:` section may set are `profile.FLOW_DEFAULTS`:
 `sv2v_docker_image`, `abc_script_file` (a path in the pack),
-`abc_read_lib_args`, `enable_classical_resub`, `partitions`, and `env`.
+`abc_read_lib_args`, `enable_classical_resub`, `partitions`,
+`mapping_target` (see "Modes and the mapping target"), `fanout_buffer`
+(see "Fanout buffering"; a rail's own overrides it key by key), and `env`.
 `env` sets defaults for the flow's `CIRCT_FLOW_*` pass knobs (the ones
 `stages.py` documents); only `CIRCT_FLOW_` names are accepted, a YAML
 boolean means `1`/`0`, and a knob the environment already sets keeps its
 value. The flow prints each default it applies.
+
+`CIRCT_FLOW_OUTLINE_AFTER_FLATTEN=1` moves the outlining of unmapped logic
+after the hierarchy is flattened, so ABC receives one residual module
+spanning the design instead of one per module. The exported netlist is
+still flat: the single `<top>_residual` module is made private before the
+final flatten, so the fanout stage, sv2v and OpenSTA's flat view see one
+module.
 
 The built-in sv2v image is `circt-abc`, the image this repository builds;
 inside that image `SV2V` is set and no image is needed.
@@ -726,6 +853,24 @@ What runs depends on the pack's own `pnr:`:
   of the command that start with `./` or `../` are relative to the pack,
   and every word has `${VAR}` expanded. The template's `pnr/run.py` is a
   stand-in that only counts cells.
+
+The flow config's `pnr:` section also takes four options for the ORFS
+stage (they do not apply to a pack's own `command`):
+
+* `tie_hi` / `tie_lo` (`CELL:PIN`): the tie cells for constants 1 and 0,
+  replacing the pack's `tie`. Every constant the netlist drives with a
+  literal is tied with them before ORFS runs (OpenROAD reads a literal
+  net as a power net, which the router refuses). Use them when the
+  platform carries only another flavour's cells (`ASAP7_USE_VT`).
+* `vt_swap: false` passes `--no-vt-swap`: OpenROAD's `repair_timing` may
+  not change a cell's threshold-voltage flavour, so the flavours the flow
+  chose stay. Sizing and buffering still happen.
+* `dont_use`: a list of cell-name globs, each passed as `--dont-use`. The
+  resizer is kept off those cells when it picks new buffers and resizes
+  (a hook adds them to the platform's `DONT_USE_CELLS` before every step
+  that runs `repair_design` or `repair_timing`). Cells already in the
+  netlist are left alone. This does **not** stop OpenROAD's Vt swap, which
+  still moves cells to a flavour the list names; `vt_swap: false` does.
 
 ## Docker
 

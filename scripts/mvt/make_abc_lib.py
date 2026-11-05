@@ -36,6 +36,12 @@ use them as logic, but clock-gate inference instantiates them as gates
 
 This library is for the mapper ONLY: its areas are not areas.
 
+The first line of the output is a machine-readable provenance comment
+(its inputs' sha256 and sizes, leakage libraries, W, S, the patterns, the
+tool revision, and a hash of the rest of the file), which
+`python3 -m circt_flow.techpack check` verifies against the tech pack's
+real per-flavour libraries (circt_flow/provenance.py).
+
 Usage:
     make_abc_lib.py <out.lib> <in1.lib> [<in2.lib> ...] [-S 100] [-W 10]
                     [--leakage-lib <lk1.lib> ...] [-X <pattern> ...]
@@ -43,12 +49,46 @@ Usage:
 """
 import argparse, re
 import fnmatch
+import hashlib
+import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
+
+# The first line of every library this tool writes (doc/techpacks.md,
+# "Mapping-library provenance"): `/* <MARK> <json> */`.
+MARK = "make_abc_lib provenance v1:"
 
 _CELL = re.compile(r'^\s*cell\s*\(\s*"?([A-Za-z0-9_]+)"?\s*\)')
 _DONT_USE = re.compile(r'\s*dont_use\s*:\s*"?true"?\s*;', re.I)
 _LEAK = re.compile(r"(\s*)cell_leakage_power\s*:\s*([-\d.eE+]+)\s*;")
+
+
+def sha256_file(path, _chunk=1 << 22):
+    """(sha256 hex, size) of a file, streamed."""
+    h, n = hashlib.sha256(), 0
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(_chunk), b""):
+            h.update(b)
+            n += len(b)
+    return h.hexdigest(), n
+
+
+def _tool_revision():
+    me = Path(__file__).resolve()
+    try:
+        git = subprocess.run(["git", "-C", str(me.parent), "rev-parse",
+                              "--short=12", "HEAD"], capture_output=True,
+                             text=True, timeout=10).stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        git = None
+    return {"git": git, "sha256": sha256_file(me)[0][:16]}
+
+
+def _entry(path):
+    sha, size = sha256_file(path)
+    return {"name": Path(path).name, "sha256": sha, "size": size}
 
 
 def cell_leakage(paths):
@@ -87,7 +127,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
     dropped = {"dont_use": 0, "pattern": 0}
     leak_from = cell_leakage(a.leakage_lib) if a.leakage_lib else None
-    out = open(a.out, "w")
+    final = a.out
+    out = open(final + ".body", "w")
     if leak_from is not None:
         out.write("/* make_abc_lib.py: timing from "
                   + " ".join(Path(p).name for p in a.inputs)
@@ -144,9 +185,38 @@ def main(argv=None):
                                    dropped, a.keep))
     out.write("}\n")
     out.close()
+    _finish(final, a, dropped)
     if any(dropped.values()):
         print(f"make_abc_lib: left out {dropped['dont_use']} dont_use "
               f"cell(s) and {dropped['pattern']} matching -X", file=sys.stderr)
+
+
+def _finish(final, a, dropped):
+    """Write `final`: the provenance line, then the body written so far.
+    The line records the inputs (name, sha256, size), the leakage
+    libraries, W, S, the -X / --keep patterns, the counts, the tool
+    revision, and the sha256 of everything after it, so any later edit of
+    the file is detectable. `*/` is escaped so the comment stays closed."""
+    body = final + ".body"
+    bsha, bsize = sha256_file(body)
+    ncell = 0
+    with open(body) as f:
+        for l in f:
+            ncell += bool(_CELL.match(l))
+    prov = {"inputs": [_entry(p) for p in a.inputs],
+            "leakage_libs": [_entry(p) for p in a.leakage_lib],
+            "W": a.leak_weight, "S": a.area_scale,
+            "exclude": a.exclude, "keep": a.keep,
+            "keep_dont_use": a.keep_dont_use,
+            "cells": ncell, "dropped": dropped,
+            "tool": _tool_revision(),
+            "body_sha256": bsha, "body_size": bsize}
+    js = json.dumps(prov, sort_keys=True, separators=(",", ":"))
+    js = js.replace("*/", "*\\/")
+    with open(final, "w") as out, open(body) as f:
+        out.write(f"/* {MARK} {js} */\n")
+        shutil.copyfileobj(f, out)
+    Path(body).unlink()
 
 
 def _header_groups(hdr):

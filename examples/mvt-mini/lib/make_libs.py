@@ -9,7 +9,11 @@ writes
 
     mini_{rvt,lvt,slvt}_{0p75v,0p55v}_{tt,ss,ff}.lib
                          one library per flavour x supply x corner
-    mini_ls.lib          level shifters between supplies
+    mini_ls.lib          level shifters between supplies (the tt cells)
+    mini_ls_{tt,ss,ff}.lib
+                         the same shifters per corner: delay scales by the
+                         mean of the two supplies' corner factors, leakage
+                         likewise (mini_ls_tt is mini_ls under its own name)
 
 File names are mini_<flavour>_<supply>_<corner>.lib; the library inside has
 the same name. Corners (invented, not any foundry's):
@@ -259,7 +263,7 @@ def flavour_lib(vt, sup, corner):
     return lib, s + "}\n"
 
 
-def level_shifter(name, kind, vin, vout, f):
+def level_shifter(name, kind, vin, vout, f, leak_f=1.0):
     # Supply pins as a real shifter library has them: an LH cell has two
     # power pins, VDDL on the input side (the low rail it reads) and VDD on
     # the output side; an HL cell has one, VDDL, the low rail it drives
@@ -270,7 +274,7 @@ def level_shifter(name, kind, vin, vout, f):
         [("VDD", "primary_power")] if kind == "LH" else []) + [
         ("VSS", "primary_ground")]
     in_pg, out_pg = ("VDDL", "VDD") if kind == "LH" else ("VDDL", "VDDL")
-    return (head(name, 0.08, 0.08 * LEAK_PER_AREA)
+    return (head(name, 0.08, 0.08 * LEAK_PER_AREA * leak_f)
             + f"    is_level_shifter : true;\n"
             f"    level_shifter_type : {kind};\n"
             f"    input_voltage_range({vin - 0.05:.2f}, {vin + 0.05:.2f});\n"
@@ -286,15 +290,24 @@ def level_shifter(name, kind, vin, vout, f):
             + "    }\n  }\n")
 
 
-def ls_lib():
-    s = header("mini_ls", 0.75, "level shifters between the 0.55 V and "
-               "0.75 V supplies")
+def ls_lib(corner=None):
+    """The level shifters at `corner` (None: the corner-less mini_ls, which
+    is the tt cells). A shifter straddles both supplies, so its delay and
+    leakage factors are the mean of the two supplies' corner factors."""
+    cd, cl = (1.0, 1.0) if corner is None else (
+        sum(CORNERS[corner][2].values()) / len(SUPPLIES),
+        sum(CORNERS[corner][3].values()) / len(SUPPLIES))
+    name = "mini_ls" if corner is None else f"mini_ls_{corner}"
+    what = ("level shifters between the 0.55 V and 0.75 V supplies"
+            + ("" if corner is None else f", corner {corner}"))
+    proc, temp = (1.0, 25) if corner is None else CORNERS[corner][:2]
+    s = header(name, 0.75, what, proc, temp)
     # The supplies' nominal voltages, for the cells' pg_pins.
     s += ("  voltage_map(VDD, 0.75);\n  voltage_map(VDDL, 0.55);\n"
           "  voltage_map(VSS, 0.0);\n")
-    s += level_shifter("MLSLH_X1", "LH", 0.55, 0.75, 1.3)
-    s += level_shifter("MLSHL_X1", "HL", 0.75, 0.55, 1.0)
-    return "mini_ls", s + "}\n"
+    s += level_shifter("MLSLH_X1", "LH", 0.55, 0.75, 1.3 * cd, cl)
+    s += level_shifter("MLSHL_X1", "HL", 0.75, 0.55, 1.0 * cd, cl)
+    return name, s + "}\n"
 
 
 def main():
@@ -303,6 +316,7 @@ def main():
     libs = [flavour_lib(vt, sup, c) for c in CORNERS for sup in SUPPLIES
             for vt in FLAVOURS]
     libs.append(ls_lib())
+    libs += [ls_lib(c) for c in CORNERS]
     for lib, text in libs:
         (out / f"{lib}.lib").write_text(text)
         print(f"wrote {out / lib}.lib")

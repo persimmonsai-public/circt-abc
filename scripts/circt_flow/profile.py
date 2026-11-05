@@ -23,7 +23,7 @@ different supplies (doc/techpacks.md, "Rails"):
     rails:
       VDD:    {voltage: 0.75, liberties: [...], flow: {...}}
       VDD_LV: {voltage: 0.55, liberties: [...]}
-    level_shifters: {liberties: [...]}
+    level_shifters: {liberties: [...], corners: {tt: [...], ss: [...]}}
 
 Each rail has its own liberties (the first is its mapping-primary one) and
 may override the pack's `flow:` defaults and its `icg`, `tie` and
@@ -89,7 +89,7 @@ ENV_PREFIX = "CIRCT_FLOW_"
 IMPLICIT_RAIL = "default"
 # What a schema-2 rail may set besides its voltage and liberties.
 RAIL_KEYS = {"voltage", "liberties", "flow", "icg", "tie", "dont_use",
-             "corners"}
+             "corners", "vt_flavours"}
 # The profile-level corners: block.
 CORNER_KEYS = {"names", "setup", "leakage", "hold"}
 CORNER_ROLES = ("setup", "leakage")  # required; `hold` is optional
@@ -115,6 +115,8 @@ class Rail:
     # {corner: liberties}, every corner of the profile; empty without
     # corners (the rail's one implicit corner is `liberties`).
     corners: Dict[str, List[Path]] = field(default_factory=dict)
+    # The rail's own `vt_flavours:` (None: the pack's).
+    vt_flavours: Optional[dict] = None
 
     def libs_at(self, corner: Optional[str]) -> List[Path]:
         """The rail's liberties at `corner` (its mapping liberties when the
@@ -160,6 +162,9 @@ class Profile:
     rail: str = IMPLICIT_RAIL
     default_rail: str = IMPLICIT_RAIL
     level_shifters: List[Path] = field(default_factory=list)
+    # `level_shifters.corners`: the shifter liberties per corner; a corner
+    # not listed reads `level_shifters` (see level_shifters_at).
+    level_shifter_corners: Dict[str, List[Path]] = field(default_factory=dict)
     # `vt_flavours: {tokens: [slowest, ..., fastest], re: <regex>}`: how a
     # cell name carries its threshold flavour (vtswap.py); None without.
     vt_flavours: Optional[dict] = None
@@ -190,6 +195,19 @@ class Profile:
         r = self.rails[rail or self.rail]
         return r.libs_at(corner if corner is not None else self.setup_corner)
 
+    def level_shifters_at(self, corner: Optional[str] = None) -> List[Path]:
+        """The level-shifter liberties at `corner` (default: the setup
+        corner): `level_shifters.corners[corner]`, else the pack's
+        `level_shifters.liberties`."""
+        c = corner if corner is not None else self.setup_corner
+        return list(self.level_shifter_corners.get(c, self.level_shifters))
+
+    def flavours_at(self, rail: Optional[str] = None) -> Optional[dict]:
+        """Rail `rail`'s (default: this view's rail) `vt_flavours`: its
+        own, else the pack's; None without either."""
+        r = self.rails.get(rail or self.rail)
+        return (r.vt_flavours if r and r.vt_flavours else self.vt_flavours)
+
     @property
     def synth_libs(self) -> List[Path]:
         """What the flow's pdk.synth_lib_tt gets: the merged liberty for an
@@ -207,7 +225,8 @@ class Profile:
         for libs in [*(r.liberties for r in self.rails.values()),
                      *(c for r in self.rails.values()
                        for c in r.corners.values()),
-                     self.liberties, self.level_shifters]:
+                     self.liberties, self.level_shifters,
+                     *self.level_shifter_corners.values()]:
             for p in libs:
                 seen.setdefault(p, None)
         return list(seen)
@@ -390,8 +409,11 @@ def resolve(ref: str, config_dir: Optional[Path] = None) -> Path:
                             f"enclosing {config_dir}, " + ", ".join(tried))
 
 
-def _flow_section(flow_d: dict, base: Path, where: str) -> dict:
-    """A `flow:` mapping, checked against FLOW_DEFAULTS, paths resolved."""
+def _flow_section(flow_d: dict, base: Path, where: str,
+                  pack_flow: Optional[dict] = None) -> dict:
+    """A `flow:` mapping, checked against FLOW_DEFAULTS, paths resolved. A
+    rail's passes the pack's `flow:` as `pack_flow`, whose fanout_buffer its
+    own overrides key by key."""
     flow = {}
     for k, v in (flow_d or {}).items():
         if k not in FLOW_DEFAULTS:
@@ -404,7 +426,7 @@ def _flow_section(flow_d: dict, base: Path, where: str) -> dict:
             parse_target(v, where)  # checked here, parsed where used
         elif k == "fanout_buffer":
             from .fanout import parse_spec
-            parse_spec(v, None, where)
+            parse_spec((pack_flow or {}).get("fanout_buffer"), v, where)
         elif k == "env":
             bad = [e for e in v if not e.startswith(ENV_PREFIX)]
             if bad:
@@ -529,12 +551,19 @@ def _rails_section(d: dict, base: Path, path: Path, flow: dict, icg: dict,
         if not libs or isinstance(libs, str):
             raise ValueError(f"{where}.liberties must be a non-empty list "
                              "(the first is the rail's mapping-primary one)")
+        from .vtswap import parse_flavours
+        rflow = _flow_section(r.get("flow"), base, f"{where}.flow", flow)
+        if isinstance(flow.get("fanout_buffer"), dict) and \
+                isinstance(rflow.get("fanout_buffer"), dict):
+            # The rail's buffer overrides the pack's key by key.
+            rflow["fanout_buffer"] = {**flow["fanout_buffer"],
+                                      **rflow["fanout_buffer"]}
         rails[str(name)] = Rail(
             name=str(name), voltage=voltage,
             liberties=(libs_paths if libs_paths is not None
                        else [expand(p, base) for p in libs]),
-            flow={**flow, **_flow_section(r.get("flow"), base,
-                                          f"{where}.flow")},
+            flow={**flow, **rflow},
+            vt_flavours=parse_flavours(r.get("vt_flavours"), where),
             icg=(_icg_section(r["icg"], base, True, f"{where}.icg")
                  if "icg" in r else dict(icg)),
             tie=dict(r["tie"]) if "tie" in r else dict(tie),
@@ -544,20 +573,50 @@ def _rails_section(d: dict, base: Path, path: Path, flow: dict, icg: dict,
     return rails
 
 
-def _level_shifters(d: dict, base: Path, path: Path) -> List[Path]:
-    """`level_shifters: {liberties: [...]}` (or the bare list)."""
+def _level_shifters(d: dict, base: Path, path: Path,
+                    corner_names: List[str] = ()):
+    """`level_shifters: {liberties: [...], corners: {<corner>: [...]}}` (or
+    the bare list): (the default liberties, {corner: liberties}). A corner
+    not listed falls back to the default liberties; `corners` needs the
+    pack's `corners:` block and only its names. Without `liberties`, every
+    corner must be listed."""
     ls = d.get("level_shifters")
     if ls is None:
-        return []
+        return [], {}
+    per: Dict[str, List[Path]] = {}
     if isinstance(ls, dict):
-        unknown = set(ls) - {"liberties"}
+        unknown = set(ls) - {"liberties", "corners"}
         if unknown:
             raise KeyError(f"{path}: level_shifters.{sorted(unknown)[0]} is "
-                           "not a level-shifter key; allowed: liberties")
+                           "not a level-shifter key; allowed: liberties, "
+                           "corners")
+        lc = ls.get("corners")
+        if lc is not None:
+            where = f"{path}: level_shifters.corners"
+            if not corner_names:
+                raise KeyError(f"{where} needs the pack-level `corners:` "
+                               "block (names, setup, leakage)")
+            if not isinstance(lc, dict) or not lc:
+                raise ValueError(f"{where} must map corners to liberties")
+            extra = sorted(set(lc) - set(corner_names))
+            if extra:
+                raise KeyError(f"{where}: unknown corner(s) "
+                               f"{', '.join(extra)}; corners.names: "
+                               f"{', '.join(corner_names)}")
+            for c, cl in lc.items():
+                if not cl or isinstance(cl, str) or not isinstance(cl, list):
+                    raise ValueError(f"{where}.{c} must be a non-empty list "
+                                     "of liberties")
+                per[c] = [expand(p, base) for p in cl]
         ls = ls.get("liberties") or []
+        miss = [c for c in corner_names if c not in per]
+        if not ls and per and miss:
+            raise ValueError(f"{path}: level_shifters has no `liberties` "
+                             "default and no libraries for corner(s) "
+                             f"{', '.join(miss)}")
     if isinstance(ls, str) or not isinstance(ls, list):
         raise ValueError(f"{path}: level_shifters.liberties must be a list")
-    return [expand(p, base) for p in ls]
+    return [expand(p, base) for p in ls], per
 
 
 def _vt_flavours(d: dict, path: Path) -> Optional[dict]:
@@ -626,6 +685,7 @@ def load(path: Path | str, image: Optional[str] = None) -> Profile:
                                liberties=list(liberties), flow=dict(flow),
                                icg=dict(icg), tie=dict(tie),
                                dont_use=list(dont_use))}
+    ls_libs, ls_corners = _level_shifters(d, base, path, corner_names)
     return Profile(name=d["name"], liberties=list(liberties),
                    time_unit=d.get("time_unit", "ns"), icg=dict(icg),
                    dont_use=list(dont_use),
@@ -638,7 +698,7 @@ def load(path: Path | str, image: Optional[str] = None) -> Profile:
                    public=bool(d.get("public", False)),
                    schema=schema, rails=rails, rail=default,
                    default_rail=default,
-                   level_shifters=_level_shifters(d, base, path),
+                   level_shifters=ls_libs, level_shifter_corners=ls_corners,
                    corner_names=corner_names, corner_roles=corner_roles,
                    vt_flavours=_vt_flavours(d, path))
 

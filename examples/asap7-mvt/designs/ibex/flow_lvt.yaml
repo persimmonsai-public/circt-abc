@@ -1,0 +1,15 @@
+# ibex_top on asap7-mvt (lvt).
+design:
+  top_module: ibex_top
+  manifest: ibex
+pdk:
+  profile: ../../techpack_lvt.yaml
+modes:
+  func: func.sdc
+pnr:
+  platform: asap7
+  clock_port: clk_i
+  utilization: 40
+  tie_hi: "TIEHIx1_ASAP7_75t_L:H"
+  tie_lo: "TIELOx1_ASAP7_75t_L:L"
+  set: {ASAP7_USE_VT: LVT, CORNER: TC}

@@ -63,7 +63,10 @@ class DesignConfig:
     # The optional `pnr:` section, for the ORFS stage (`--pnr`): platform,
     # clock_port, and optionally clock_period (in the platform's time unit;
     # default clock_period_ps), clock_latency, utilization, place_density,
-    # and `set:`, a mapping of extra ORFS config.mk variables.
+    # tie_hi / tie_lo (CELL:PIN, replacing the pack's tie cells),
+    # vt_swap (false: OpenROAD's repair_timing may not change Vt flavours),
+    # dont_use (cell-name globs the resizer must not choose), and
+    # `set:`, a mapping of extra ORFS config.mk variables.
     pnr: Optional[dict] = None
     # design.manifest / pdk.profile (paths relative to the flow.yaml): the
     # front end elaborates the manifest (circt_flow/frontend.py) instead of
@@ -123,6 +126,9 @@ class DesignConfig:
     # flow.fanout_buffer merged with the flow config's fanout_buffer:;
     # None when neither sets one or the config turns it off.
     fanout: Optional[object] = None
+    # The flow config's own fanout_buffer: (raw), applied over each rail's
+    # pack-level spec by a power flow (fanout.rail_specs).
+    fanout_override: object = None
     # The power: section's options besides domains (power.parse_options):
     # insert_level_shifters, ground.
     power_options: dict = field(default_factory=dict)
@@ -164,7 +170,7 @@ class DesignConfig:
             cfg = yaml.safe_load(f)
         here = Path(config_path).resolve().parent
         rel = lambda p: (here / p).resolve() if p else None
-        from . import profile as profile_mod
+        from . import profile as profile_mod, provenance
         manifest = cfg["design"].get("manifest")
         # A bare name is a design under this repo's designs/.
         if manifest and "/" not in manifest and not manifest.endswith(".yaml"):
@@ -184,6 +190,7 @@ class DesignConfig:
                              "pdk.profile (a schema-2 tech pack)")
         if profile is not None:
             prof = profile_mod.load(profile)
+            provenance.enforce(prof)
             if rail is not None:
                 if rail not in prof.rails:
                     raise ValueError(
@@ -219,6 +226,10 @@ class DesignConfig:
         fanout_spec = fanout_mod.parse_spec(
             flow_defaults.get("fanout_buffer"), cfg.get("fanout_buffer"),
             str(config_path))
+        if power is not None and cfg.get("fanout_buffer") is not False:
+            # Every rail's spec is checked here, not after synthesis.
+            fanout_mod.rail_specs(prof, cfg.get("fanout_buffer"),
+                                  str(config_path))
         core_mlir = cfg["design"].get("core_mlir")
         from . import modes as modes_mod
         time_unit = prof.time_unit if prof is not None else "ns"
@@ -279,6 +290,7 @@ class DesignConfig:
             sta=sta_spec,
             vt_swap=vt_swap_spec,
             fanout=fanout_spec,
+            fanout_override=cfg.get("fanout_buffer"),
             power_options=power_options,
         )
         if sta_spec is not None:

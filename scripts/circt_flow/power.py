@@ -740,13 +740,17 @@ def run(cfg, pnr: bool = False) -> Path:
         print("[power] WARNING: no OpenSTA-compatible netlist (sv2v); no "
               "crossings, UPF or per-mode SDCs written")
 
-    # 6. Fanout buffering, per module on its rail (the pack's
-    #    flow.fanout_buffer; the domain sub-runs do not buffer).
-    if d.fanout is not None and cfg.openroad_netlist.exists():
-        from . import fanout
-        summary["fanout"] = str(cfg.out_dir / "fanout.json")
-        fanout.run_power(cfg, d.fanout, summary)
-        js.write_text(json.dumps(summary, indent=2) + "\n")
+    # 6. Fanout buffering, per module on its rail, with the rail's buffer
+    #    (flow.fanout_buffer of the pack or the rail; the domain sub-runs do
+    #    not buffer).
+    if d.fanout_override is not False and cfg.openroad_netlist.exists():
+        from . import fanout, profile as profile_mod
+        specs = fanout.rail_specs(profile_mod.load(d.profile),
+                                  d.fanout_override, "power flow")
+        if any(sp is not None for sp in specs.values()):
+            summary["fanout"] = str(cfg.out_dir / "fanout.json")
+            fanout.run_power(cfg, specs, summary)
+            js.write_text(json.dumps(summary, indent=2) + "\n")
 
     # 7. Threshold-voltage swap per domain (opt-in).
     from . import vtswap

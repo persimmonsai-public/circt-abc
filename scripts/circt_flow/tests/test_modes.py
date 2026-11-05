@@ -559,3 +559,13 @@ def test_pack_fanout_buffer(tmp_path, flop_lib):
     pack.write_text(yaml.safe_dump(d))
     with pytest.raises(KeyError, match="needs a cell"):
         FlowConfig.load(flow(tmp_path, pack), tmp_path / "out", env={})
+
+
+
+def test_flop_overhead_skips_excluded_flops(flop_lib):
+    """Flops matching an exclude pattern (the pack's dont_use: scan flops,
+    say) never set the overhead, even when they are the slowest."""
+    r = modes.flop_overhead([flop_lib], exclude=["*_SLOW"])
+    assert r["cell"] == "TSTDFF_FAST" and r["flops_considered"] == 1
+    with pytest.raises(ModeError, match="no flop"):
+        modes.flop_overhead([flop_lib], exclude=["TSTDFF*"])
