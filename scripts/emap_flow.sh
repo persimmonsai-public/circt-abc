@@ -50,9 +50,9 @@ echo "== 1/3 flow, saving the pre-mapping AIG"
 ( cd "$ROOT/scripts" && python3 -m circt_flow "$CFG" "$OUT/pass1" \
     --abc-save-aig-dir "$OUT/aig" ) > "$OUT/pass1.log" 2>&1
 
-# ABC's optimisation body, verbatim from ABCBridge's built-in recipe minus
+# ABC's optimisation body, as in ABCBridge's built-in recipe, minus
 # the two `&nf` mapping steps -- emap replaces those.
-BODY="strash; scorr; dc2; &get -n; &deepsyn -J 100 -I 4 -S 200 -T 10; &put"
+BODY="strash; scorr; dc2; &get -n; &deepsyn -J 100 -I 4 -S 200; &put"
 BODY="$BODY; strash; &get -n; &dch -f; &if -C 32 -K 6; &put"
 BODY="$BODY; strash; &get -n; &resub -N 2; &put; strash; &get -n"
 

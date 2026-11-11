@@ -71,3 +71,34 @@ def test_main_writes_config(tmp_path, monkeypatch):
     assert lines.index("export OPT_POST_GRT_WNS = 1") > \
         lines.index("export OPT_POST_GRT_WNS = 0")
     assert f"export PRE_GLOBAL_ROUTE_TCL = {run / 'dont_use.tcl'}" in lines
+
+
+def test_cts_settings_default_is_empty():
+    assert op.cts_settings([], None, None, []) == []
+    assert op.margin_settings(None, None) == []
+
+
+def test_cts_settings_replace_ctsargs_with_defaults_kept():
+    kv = dict(op.cts_settings(["BUFA", "BUFB"], 20, 50.0,
+                              ["-no_insertion_delay"]))
+    a = kv["CTS_ARGS"]
+    assert a.startswith("-sink_clustering_enable -repair_clock_nets")
+    assert "-buf_list {BUFA BUFB}" in a
+    assert "-sink_clustering_size 20" in a
+    assert "-sink_clustering_max_diameter 50" in a
+    assert a.endswith("-no_insertion_delay")
+
+
+def test_margins():
+    assert dict(op.margin_settings(10, -5)) == {
+        "HOLD_SLACK_MARGIN": "10", "SETUP_SLACK_MARGIN": "-5"}
+
+
+def test_stage_passes_cts_and_margin_controls(tmp_path, monkeypatch):
+    c = cfg(tmp_path, {"clock_port": "clk", "cts_args": ["-no_insertion_delay"],
+                       "hold_margin": 20})
+    c.design.pack_pnr = {"cts_buffers": ["B1"], "hold_margin": 5}
+    argv = argv_of(monkeypatch, c)
+    assert argv[argv.index("--cts-buffer") + 1] == "B1"      # from the pack
+    assert argv[argv.index("--hold-margin") + 1] == "20"     # flow.yaml wins
+    assert argv[argv.index("--cts-arg") + 1] == "-no_insertion_delay"

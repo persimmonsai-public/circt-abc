@@ -102,6 +102,7 @@ COPY designs designs
 COPY profiles profiles
 COPY examples examples
 COPY patches patches
+COPY mapper/test mapper/test
 
 ENV ORFS_HOME=/OpenROAD-flow-scripts \
     ORFS_IMAGE=${ORFS_IMAGE} \

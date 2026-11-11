@@ -295,6 +295,9 @@ struct FnNode {
   std::unique_ptr<FnNode> a, b;
 };
 
+// Liberty boolean expressions: `!` (prefix NOT), `&` or `*` (AND), `^` (XOR),
+// `|` or `+` (OR), parentheses; Liberty allows both spellings of AND and OR and
+// real libraries use either (the open ASAP7 library writes `(A * B) + (!A)`).
 class FunctionParser {
 public:
   FunctionParser(StringRef text, const std::vector<std::string> &pinNames)
@@ -326,7 +329,7 @@ private:
     if (!lhs)
       return nullptr;
     skipSpace();
-    while (peek() == '|') {
+    while (peek() == '|' || peek() == '+') {
       ++pos;
       skipSpace();
       auto rhs = parseXor();
@@ -368,7 +371,7 @@ private:
     if (!lhs)
       return nullptr;
     skipSpace();
-    while (peek() == '&') {
+    while (peek() == '&' || peek() == '*') {
       ++pos;
       skipSpace();
       auto rhs = parseUnary();
@@ -492,6 +495,78 @@ std::optional<CellPattern> buildPattern(const RawCell &raw) {
       table |= (static_cast<TruthTable>(1) << a);
   pat.table = table;
   return pat;
+}
+
+// Builds a WideAndOrCell from a RawCell with exactly 8 inputs and one output
+// whose function is the OR of four two-input ANDs (output possibly inverted),
+// found by pairing the inputs: a pair is an AND term when raising only those
+// two inputs raises the (non-inverted) function. The pairing is then
+// verified against the whole 256-row table.
+std::optional<WideAndOrCell> buildWideAndOrPattern(const RawCell &raw) {
+  if (raw.hasSequential)
+    return std::nullopt;
+  WideAndOrCell w;
+  w.name = raw.name;
+  w.area = raw.area;
+  const RawPin *outputPin = nullptr;
+  std::vector<std::string> in;
+  for (const RawPin &pin : raw.pins) {
+    if (!pin.sawDirection)
+      continue;
+    if (pin.isOutput) {
+      if (outputPin)
+        return std::nullopt;
+      outputPin = &pin;
+    } else {
+      in.push_back(pin.name);
+    }
+  }
+  if (!outputPin || outputPin->function.empty() || in.size() != 8)
+    return std::nullopt;
+  FunctionParser parser(outputPin->function, in);
+  auto ast = parser.parse();
+  if (!ast)
+    return std::nullopt;
+  // Four AND terms ORed (AO / AOI) or four OR terms ANDed (OA / OAI): try
+  // the function as written and its dual (complemented inputs and output).
+  auto raw8 = [&](unsigned a) { return evalFn(ast.get(), a); };
+  for (int dual = 0; dual < 2; ++dual) {
+    auto g0 = [&](unsigned a) { return dual ? !raw8(~a & 0xFF) : raw8(a); };
+    bool inv = g0(0); // AOI-like: true on all-zero inputs
+    auto f = [&](unsigned a) { return g0(a) != inv; };
+    std::vector<int> partner(8, -1);
+    bool ok = true;
+    for (unsigned i = 0; i < 8 && ok; ++i)
+      for (unsigned j = i + 1; j < 8 && ok; ++j)
+        if (f((1u << i) | (1u << j)) && !f(1u << i) && !f(1u << j)) {
+          if (partner[i] >= 0 || partner[j] >= 0)
+            ok = false;
+          partner[i] = j;
+          partner[j] = i;
+        }
+    for (int p : partner)
+      ok &= p >= 0;
+    if (!ok)
+      continue;
+    for (unsigned a = 0; a < 256 && ok; ++a) {
+      bool want = false;
+      for (unsigned i = 0; i < 8; ++i)
+        want |= ((a >> i) & 1) && ((a >> partner[i]) & 1);
+      ok &= f(a) == want;
+    }
+    if (!ok)
+      continue;
+    for (unsigned i = 0; i < 8; ++i)
+      if (partner[i] > (int)i) {
+        w.pins.push_back(in[i]);
+        w.pins.push_back(in[partner[i]]);
+      }
+    w.outputPin = outputPin->name;
+    w.inverted = inv;
+    w.orAnd = dual;
+    return w;
+  }
+  return std::nullopt;
 }
 
 // Builds a HalfAdderCellPattern from a RawCell, or std::nullopt if the
@@ -868,6 +943,8 @@ std::optional<LibertyLibrary> LibertyLibrary::loadFromFile(StringRef path) {
       lib.cells.push_back(std::move(*pat));
     for (FFCellPattern &ffPat : buildFFPatterns(raw))
       lib.ffCells.push_back(std::move(ffPat));
+    if (auto wPat = buildWideAndOrPattern(raw))
+      lib.wideAndOr.push_back(std::move(*wPat));
     if (auto icgPat = buildICGPattern(raw))
       lib.icgCells.push_back(std::move(*icgPat));
     if (auto haPat = buildHalfAdderPattern(raw))

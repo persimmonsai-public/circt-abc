@@ -123,7 +123,17 @@ struct LimitFanoutPass
           << libertyPath.getValue();
       return signalPassFailure();
     }
-    unsigned cap = std::max<unsigned>(maxFanout.getValue(), 2);
+    unsigned globalCap = std::max<unsigned>(maxFanout.getValue(), 2);
+    // A driver may carry `circt_abc.max_fanout = N` (set by the pass that
+    // built the net, e.g. a decoded select whose loads are one-hot gated):
+    // that net's limit is the larger of N and the global cap.
+    auto capOf = [&](Value v) -> unsigned {
+      if (Operation *def = v.getDefiningOp())
+        if (auto a = def->getAttrOfType<IntegerAttr>("circt_abc.max_fanout"))
+          return std::max<unsigned>(globalCap, a.getValue().getZExtValue());
+      return globalCap;
+    };
+    unsigned cap = globalCap;
 
     mlir::ModuleOp top = getOperation();
     MLIRContext *ctx = top.getContext();
@@ -164,7 +174,7 @@ struct LimitFanoutPass
           return;
         if (!seen.insert(v.getAsOpaquePointer()).second)
           return;
-        if (std::distance(v.use_begin(), v.use_end()) <= (ptrdiff_t)cap)
+        if (std::distance(v.use_begin(), v.use_end()) <= (ptrdiff_t)capOf(v))
           return;
         candidates.push_back(v);
       };
@@ -175,6 +185,7 @@ struct LimitFanoutPass
         consider(a);
 
       for (Value net : candidates) {
+        cap = capOf(net);
         // Collect the uses, and bail if any is a clock pin.
         SmallVector<OpOperand *> uses;
         bool isClock = false;

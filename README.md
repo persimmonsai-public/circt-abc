@@ -43,6 +43,8 @@ under `out/ibex/pnr/`, summarised in `out/ibex/pnr/pnr_metrics.json`.
 | `designs/` | design manifests (source, files, defines) and flow configs |
 | `profiles/` | library profiles (ASAP7): liberties, ICG and tie cells, dont_use; other libraries come as tech packs |
 | `examples/techpack-template/` | a runnable tech pack on an invented library, to copy |
+| `doc/passes.md` | the pass reference: what each pass does, its options and flow switches |
+| `examples/shift-select/` | a `case` over a shift amount, with `map-shift-select` off and on, on ASAP7 |
 | `doc/techpacks.md` | tech packs: format, lookup, P&R from a pack, the leak audit |
 | `patches/` | patches to CIRCT, ABC and mockturtle (see `patches/README`) |
 | `scripts/verify/` | equivalence checks: register-mapper miter, top-level miter |

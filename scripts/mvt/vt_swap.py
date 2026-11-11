@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from circt_flow import vtswap  # noqa: E402
+from circt_flow import vtswap, wire_model  # noqa: E402
 
 
 def main(argv=None):
@@ -39,12 +39,29 @@ def main(argv=None):
                     help="setup slack to keep in hand (ps)")
     ap.add_argument("--json")
     ap.add_argument("--image", default=vtswap.ORFS_IMAGE)
+    ap.add_argument("--wire-cap-base-ff", type=float, default=0.0,
+                    help="wire model: capacitance per net (fF)")
+    ap.add_argument("--wire-cap-per-fanout-ff", type=float, default=0.0,
+                    help="wire model: capacitance per load pin (fF)")
+    ap.add_argument("--wire-res-base-ohm", type=float, default=0.0,
+                    help="wire model: resistance per net (ohm)")
+    ap.add_argument("--wire-res-per-fanout-ohm", type=float, default=0.0,
+                    help="wire model: resistance per load pin (ohm)")
     a = ap.parse_args(argv)
     if not a.sdc and a.period_ps is None:
         ap.error("--sdc or --period-ps is required")
     sdc = (Path(a.sdc).read_text() + "".join(
         f"set_false_path -from [get_ports {p}]\n" for p in a.false_from)
         if a.sdc else vtswap.sdc_for(a.period_ps, a.clock, a.false_from))
+    wire = None
+    if a.wire_cap_base_ff or a.wire_cap_per_fanout_ff:
+        wire = wire_model.WireModel(
+            cap_per_fanout_ff=a.wire_cap_per_fanout_ff,
+            cap_base_ff=a.wire_cap_base_ff,
+            res_per_fanout_ohm=a.wire_res_per_fanout_ohm,
+            res_base_ohm=a.wire_res_base_ohm)
+    elif a.wire_res_base_ohm or a.wire_res_per_fanout_ohm:
+        ap.error("a wire resistance needs a wire capacitance")
     try:
         res = vtswap.swap(Path(a.netlist), a.top, Path(a.out),
                           [Path(l) for l in a.lib],
@@ -52,7 +69,7 @@ def main(argv=None):
                            if f.strip()],
                           a.flavour_re, sdc, a.paths, a.max_iter,
                           not a.no_recover, a.image,
-                          margin=a.margin_ps / 1000.0)
+                          margin=a.margin_ps / 1000.0, wire_model=wire)
     except vtswap.VtSwapError as e:
         sys.exit(str(e))
     print(f"vt_swap: {vtswap.summary(res)} -> {Path(a.out).resolve()}")

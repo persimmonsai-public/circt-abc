@@ -1,0 +1,19 @@
+# The multi-Vt pack recipe (examples/mvt-mini/abc/mvt.abc: both &nf calls load-aware,
+# {period} = the flow's clock period in ps, &deepsyn bounded by -J steps without
+# improvement, no wall-clock -T, so the result is reproducible; the -J, -I and -S
+# values are an example, not a tuned setting) plus ONE added line: after &deepsyn,
+#     &sopb; &b -d
+# (SOP balancing, then delay-only AIG balancing). &deepsyn, dc2 and scorr minimise
+# area and are blind to depth: they fold a parallel-prefix adder back into a
+# near-ripple chain, so the deepest cone of a design can end up much deeper
+# than the subject graph CombToSynth built. &sopb/&b -d re-balance the AIG for
+# delay before the final &nf mapping, which costs some area.
+# Use with: --abc-script-file recipes/depth_recovery.abc  (or flow.abc_script_file)
+strash; scorr; dc2
+&get -n; &deepsyn -J 20 -I 4 -S 200; &put
+strash; &get -n; &sopb; &b -d; &put
+strash; &get -n; &dch -f; &if -C 32 -K 6; &put
+strash; &get -n; &resub -N 2; &put
+resub -K 16 -N 3
+strash; &get -n; &dch -f; &nf -l -C 32 -D {period}; &put
+strash; &get -n; &nf -l -D {period}; &put

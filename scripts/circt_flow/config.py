@@ -126,6 +126,25 @@ class DesignConfig:
     # flow.fanout_buffer merged with the flow config's fanout_buffer:;
     # None when neither sets one or the config turns it off.
     fanout: Optional[object] = None
+    # The multibit spec for register-mapper (multibit.resolve): the pack's
+    # flow.multibit under the flow config's `multibit:`; None when off.
+    multibit: Optional[dict] = None
+    # The wire model for the STA and vt_swap stages (wire_model.WireModel):
+    # the pack's flow.wire_model under the flow config's `wire_model:`;
+    # None when off (the default).
+    wire_model: Optional[object] = None
+    # The pack's `wire_rc:` (wire_rc.WireRc), and its setup corner (the one
+    # P&R gets); None without one.
+    wire_rc: Optional[object] = None
+    wire_rc_setup: Optional[str] = None
+    # clock-gate-inference's extra options (clockgating.resolve): the pack's
+    # flow.clock_gating under the flow config's `clock_gating:`; None when
+    # off.
+    clock_gating: Optional[str] = None
+    # The flow config's `shift_select:` (shiftselect.parse): options of the
+    # map-shift-select pass; None when absent (the environment variables
+    # CIRCT_FLOW_SHIFT_SELECT* still apply).
+    shift_select: Optional[dict] = None
     # The flow config's own fanout_buffer: (raw), applied over each rail's
     # pack-level spec by a power flow (fanout.rail_specs).
     fanout_override: object = None
@@ -230,6 +249,31 @@ class DesignConfig:
             # Every rail's spec is checked here, not after synthesis.
             fanout_mod.rail_specs(prof, cfg.get("fanout_buffer"),
                                   str(config_path))
+        from . import multibit as multibit_mod
+        multibit_spec = multibit_mod.resolve(
+            flow_defaults.get("multibit"), cfg.get("multibit"), here,
+            str(config_path))
+        from . import wire_model as wire_mod
+        wire_spec = wire_mod.resolve(flow_defaults.get("wire_model"),
+                                     cfg.get("wire_model"), str(config_path))
+        wire_rc = prof.wire_rc if prof is not None else None
+        if wire_spec is not None and wire_spec.rc_corner is not None:
+            from . import wire_rc as wire_rc_mod
+            if wire_rc is None:
+                raise wire_mod.WireModelError(
+                    f"{config_path}: wire_model.rc_corner "
+                    f"{wire_spec.rc_corner!r} needs a pack wire_rc:")
+            if wire_rc_mod.IMPLICIT not in wire_rc.entries and \
+                    wire_spec.rc_corner not in wire_rc.entries:
+                raise wire_mod.WireModelError(
+                    f"{config_path}: wire_model.rc_corner "
+                    f"{wire_spec.rc_corner!r} is not a wire_rc corner; "
+                    "wire_rc corners: " + ", ".join(wire_rc.entries))
+        from . import clockgating as clockgating_mod
+        from . import shiftselect as shiftselect_mod
+        clock_gating = clockgating_mod.resolve(
+            flow_defaults.get("clock_gating"), cfg.get("clock_gating"),
+            str(config_path))
         core_mlir = cfg["design"].get("core_mlir")
         from . import modes as modes_mod
         time_unit = prof.time_unit if prof is not None else "ns"
@@ -290,6 +334,13 @@ class DesignConfig:
             sta=sta_spec,
             vt_swap=vt_swap_spec,
             fanout=fanout_spec,
+            multibit=multibit_spec,
+            wire_model=wire_spec,
+            wire_rc=wire_rc,
+            wire_rc_setup=prof.setup_corner if prof is not None else None,
+            clock_gating=clock_gating,
+            shift_select=shiftselect_mod.parse(cfg.get("shift_select"),
+                                               str(config_path)),
             fanout_override=cfg.get("fanout_buffer"),
             power_options=power_options,
         )
@@ -300,6 +351,24 @@ class DesignConfig:
                                 [m.name for m in obj.effective_modes()],
                                 config_path)
         return obj
+
+
+def _slow_cell_names(design, pack, env) -> List[str]:
+    """Cells the slow-cell filter (pack flow.slow_cell_filter, or
+    CIRCT_FLOW_SLOW_CELL_RATIO=<ratio>) takes out of ABC's library; []
+    when it is off (the default)."""
+    from . import slowcells
+    spec = slowcells.parse_spec(pack.get("slow_cell_filter"), "pack flow")
+    if env.get("CIRCT_FLOW_SLOW_CELL_RATIO"):
+        spec = dict(spec or {"slew_ps": 30.0, "load_ff": 2.5},
+                    ratio=float(env["CIRCT_FLOW_SLOW_CELL_RATIO"]))
+    if not spec or design.profile is None:
+        return []
+    from . import pipeline, profile as profile_mod
+    prof = profile_mod.load(design.profile)
+    fl = prof.flavours_at(design.rail)
+    return slowcells.slow_cells(pipeline.setup_libs(design), spec,
+                                fl["re"] if fl else None)
 
 
 def _read_lib_args(base: Optional[str], dont_use) -> Optional[str]:
@@ -512,7 +581,8 @@ class FlowConfig:
                              else pack.get("abc_script_file")),
             abc_read_lib_args=_read_lib_args(
                 abc_read_lib_args if abc_read_lib_args is not None
-                else pack.get("abc_read_lib_args"), design.dont_use),
+                else pack.get("abc_read_lib_args"),
+                list(design.dont_use) + _slow_cell_names(design, pack, env)),
             abc_save_aig_dir=Path(abc_save_aig_dir) if abc_save_aig_dir else None,
             abc_use_datapath=bool(abc_use_datapath),
             abc_save_mapped_dir=Path(abc_save_mapped_dir) if abc_save_mapped_dir else None,

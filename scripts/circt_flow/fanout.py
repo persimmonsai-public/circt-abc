@@ -100,9 +100,29 @@ class Buffering:
     top: List[Tuple[str, int]] = field(default_factory=list)
 
 
+def net_limits_from_mlir(paths) -> Dict[str, int]:
+    """Per-driver fanout limits annotated by the mapper passes: instance name
+    (as written in the netlist, '/' escaped to '2F') -> the limit N of its
+    `circt_abc.max_fanout = N` attribute. A pass that builds a net whose loads
+    are one-hot gated (a decoded shift select) sets it; the net then stays
+    unbuffered up to N loads instead of the global limit."""
+    out: Dict[str, int] = {}
+    pat = re.compile(r'hw\.instance "([^"]+)"[^\n]*?circt_abc\.max_fanout = '
+                     r'(\d+)')
+    for p in paths:
+        try:
+            text = Path(p).read_text()
+        except OSError:
+            continue
+        for m in pat.finditer(text):
+            out[m.group(1).replace("/", "2F")] = int(m.group(2))
+    return out
+
+
 def buffer_fanout(text: str, cells: Dict[str, "object"], buffer: str,
                   buf_in: str, buf_out: str, max_fanout: int = 16,
-                  prefix: str = "fob_", driven_ports: Sequence[str] = ()
+                  prefix: str = "fob_", driven_ports: Sequence[str] = (),
+                  net_limits: Optional[Dict[str, int]] = None
                   ) -> Tuple[str, Buffering]:
     """Return (`text` with fanout trees, stats). `cells` maps cell name to an
     object with `.pins` {pin: direction} (intent.LibCell). Nets of
@@ -112,6 +132,7 @@ def buffer_fanout(text: str, cells: Dict[str, "object"], buffer: str,
         raise ValueError("max_fanout must be at least 2")
     # Pass 1: drivers and loads of every net.
     drivers: Dict[str, int] = {}
+    driver_inst: Dict[str, str] = {}
     clock_nets = set()   # nets reaching a clock pin: CTS builds those trees
     loads: Dict[str, List[Tuple[str, str, int]]] = {}  # net -> (inst, pin, stmt)
     stmts = []
@@ -128,6 +149,7 @@ def buffer_fanout(text: str, cells: Dict[str, "object"], buffer: str,
             d = cell.pins.get(pin)
             if d == "output":
                 drivers[net] = drivers.get(net, 0) + 1
+                driver_inst[net] = m.group(2).lstrip("\\")
             elif d == "input":
                 loads.setdefault(net, []).append((m.group(2), pin, idx))
                 if pin in getattr(cell, "clock_pins", ()):
@@ -149,20 +171,26 @@ def buffer_fanout(text: str, cells: Dict[str, "object"], buffer: str,
     new_wires: List[str] = []
     new_insts: List[str] = []
     nb = nn = 0
+    nl_ = net_limits or {}
+
+    def limit_of(n: str) -> int:
+        return max(max_fanout, nl_.get(driver_inst.get(n, ""), 0))
+
     big = sorted(((n, len(l)) for n, l in loads.items()
-                  if len(l) > max_fanout and drivers.get(n) == 1
+                  if len(l) > limit_of(n) and drivers.get(n) == 1
                   and n not in clock_nets),
                  key=lambda x: -x[1])
     for net, fo in big:
+        max_fanout_net = limit_of(net)
         st.nets += 1
         st.worst_fanout = max(st.worst_fanout, fo)
         if len(st.top) < 10:
             st.top.append((net, fo))
         level = sorted(loads[net], key=lambda l: l[0])
         # Leaves: (inst, pin, stmt) pins to drive; build upwards.
-        while len(level) > max_fanout:
-            groups = [level[i:i + max_fanout]
-                      for i in range(0, len(level), max_fanout)]
+        while len(level) > max_fanout_net:
+            groups = [level[i:i + max_fanout_net]
+                      for i in range(0, len(level), max_fanout_net)]
             # Balance group sizes so no buffer drives a sliver.
             k = len(groups)
             size = -(-len(level) // k)
@@ -235,14 +263,15 @@ def run(cfg, spec: FanoutSpec) -> dict:
     if pins.get(spec.input) != "input" or pins.get(spec.output) != "output":
         raise ValueError(f"fanout: {spec.cell} has no input {spec.input} "
                          f"and output {spec.output}")
+    limits = net_limits_from_mlir(cfg.out_dir.glob("*_mapped.mlir"))
     out, st = buffer_fanout(text, cells, spec.cell, spec.input, spec.output,
-                            spec.max_fanout)
+                            spec.max_fanout, net_limits=limits)
     keep = cfg.synth_dir / f"{d.top_module}_prebuf_openroad.v"
     keep.write_text(text)
     nl.write_text(out)
     res = {"cell": spec.cell, "max_fanout": spec.max_fanout,
            "nets": st.nets, "buffers": st.buffers,
-           "worst_fanout": st.worst_fanout,
+           "worst_fanout": st.worst_fanout, "annotated_nets": len(limits),
            "largest": [{"net": n, "fanout": f} for n, f in st.top],
            "unbuffered_netlist": str(keep), "netlist": str(nl)}
     (cfg.out_dir / "fanout.json").write_text(json.dumps(res, indent=2)

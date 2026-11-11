@@ -534,7 +534,7 @@ def DatapathApplyArch : Pass<"dp-apply-arch", "mlir::ModuleOp"> {
   let summary = "Stamp synth.test.arch per dp-annotate op id from an override JSON (PHYS-DP write-back)";
   let constructor = "circt_abc::createDatapathApplyArchPass()";
   let options = [
-    Option<"jsonPath", "json", "std::string", "\"\"", "overrides {op id: ARCH}">,
+    Option<"jsonPath", "json", "std::string", "", "overrides {op id: ARCH}">,
     Option<"minWidth", "min-width", "unsigned", "8", "must match dp-annotate">
   ];
 }
@@ -550,7 +550,7 @@ def DatapathAnnotate : Pass<"dp-annotate", "mlir::ModuleOp"> {
   }];
   let constructor = "circt_abc::createDatapathAnnotatePass()";
   let options = [
-    Option<"jsonPath", "json", "std::string", "\"\"", "sidecar JSON path">,
+    Option<"jsonPath", "json", "std::string", "", "sidecar JSON path">,
     Option<"minWidth", "min-width", "unsigned", "8", "annotate ops at/above this width">
   ];
 }
@@ -901,6 +901,84 @@ def PruneUnusedResidualOutputs : Pass<"prune-unused-residual-outputs", "mlir::Mo
   let dependentDialects = ["hw::HWDialect"];
 }
 
+def LowerCarryInAdds : Pass<"lower-carry-in-adds", "hw::HWModuleOp"> {
+  let summary = "Rewrite a + b + zext(c) into one wider two-operand add";
+  let description = [{
+    CombToSynth lowers a three-operand add whose third operand is a variable
+    single bit as two serial binary adds with the architecture attribute
+    dropped. `{a,1} + {b,c}` computes the same sum in one carry-propagate add
+    (bit 0 turns c into the carry-in). Off unless enable=true.
+  }];
+  let constructor = "circt_abc::createLowerCarryInAddsPass()";
+  let options = [
+    Option<"enable", "enable", "bool", "false", "off = no-op">,
+    Option<"minWidth", "min-width", "unsigned", "8",
+           "only rewrite adds at or above this width">
+  ];
+  let dependentDialects = ["comb::CombDialect", "hw::HWDialect"];
+}
+
+def LowerBarrelShifts : Pass<"lower-barrel-shifts", "hw::HWModuleOp"> {
+  let summary = "Lower variable shifts to log2(width) mux stages";
+  let description = [{
+    CombToSynth's variable shift is a mux tree over width distinct shifted
+    copies; the barrel form shares the stages: width*log2(width) mux bits
+    instead of about width^2. Off unless enable=true.
+  }];
+  let constructor = "circt_abc::createLowerBarrelShiftsPass()";
+  let options = [
+    Option<"enable", "enable", "bool", "false", "off = no-op">,
+    Option<"minWidth", "min-width", "unsigned", "8",
+           "only rewrite shifts of at least this width">,
+    Option<"minAmountBits", "min-amount-bits", "unsigned", "2",
+           "only rewrite when the amount is wider than this">
+  ];
+  let dependentDialects = ["comb::CombDialect", "hw::HWDialect"];
+}
+
+def MapPrefixAdders : Pass<"map-prefix-adders", "mlir::ModuleOp"> {
+  let summary = "Lower wide adds to parallel-prefix networks of liberty cells";
+  let description = [{
+    Builds `a + b` and `a + b + cin` (a constant 1 or a zero-extended bit) as
+    Sklansky, Kogge-Stone, Han-Carlson or Brent-Kung prefix networks of
+    library cells before ABC, whose area-oriented restructuring otherwise
+    folds a prefix adder back into a near-ripple chain. Off unless
+    enable-prefix-adders=true.
+  }];
+  let constructor = "circt_abc::createMapPrefixAddersPass()";
+  let options = [
+    Option<"enablePass", "enable-prefix-adders", "bool", "false", "enable">,
+    Option<"libertyPath", "liberty", "std::string", "", "liberty file">,
+    Option<"minWidth", "min-width", "unsigned", "16", "minimum add width">,
+    Option<"maxWidth", "max-width", "unsigned", "0", "maximum add width (0 = none)">,
+    Option<"archOpt", "arch", "std::string", "SKLANSKEY",
+           "SKLANSKEY | KOGGE-STONE | HAN-CARLSON | BRENT-KUNG | attr">
+  ];
+  let dependentDialects = ["comb::CombDialect", "hw::HWDialect"];
+}
+
+def MapShiftSelect : Pass<"map-shift-select", "mlir::ModuleOp"> {
+  let summary = "Build a one-hot select over shifted copies of one word as a "
+                "two-level AND-OR network of liberty cells";
+  let description = [{
+    The output form of decode-mux-chains for a `case` over a shift amount,
+    OR_k (sel_k ? word << s_k : 0), is factored under the (syntactically
+    checked) one-hot invariant into a radix-r AND-OR network of library
+    cells, so ABC cannot rebuild a log shifter whose every stage switches on
+    each change of the data or the amount. Off unless enable-shift-select.
+  }];
+  let constructor = "circt_abc::createMapShiftSelectPass()";
+  let options = [
+    Option<"enablePass", "enable-shift-select", "bool", "false", "enable">,
+    Option<"libertyPath", "liberty", "std::string", "", "liberty file">,
+    Option<"minArms", "min-arms", "unsigned", "12", "minimum number of arms">,
+    Option<"minWidth", "min-width", "unsigned", "16", "minimum word width">,
+    Option<"radix", "radix", "unsigned", "4", "radix of the first level">,
+    Option<"wide", "wide-cells", "bool", "false", "use three-term AND-OR cells">
+  ];
+  let dependentDialects = ["comb::CombDialect", "hw::HWDialect"];
+}
+
 def SetAdderArch : Pass<"set-adder-arch", "hw::HWModuleOp"> {
   let summary = "Stamp synth.test.arch on comb.add/comb.icmp so CombToSynth "
                 "uses the chosen adder architecture (area knob)";
@@ -913,7 +991,7 @@ def SetAdderArch : Pass<"set-adder-arch", "hw::HWModuleOp"> {
   }];
   let constructor = "circt_abc::createSetAdderArchPass()";
   let options = [
-    Option<"arch", "arch", "std::string", "\"\"",
+    Option<"arch", "arch", "std::string", "",
            "RIPPLE-CARRY | SKLANSKEY | BRENT-KUNG | KOGGE-STONE">,
     Option<"minWidth", "min-width", "unsigned", "8",
            "only stamp adds/compares at or above this width">
@@ -1368,12 +1446,28 @@ def RegisterMapper : Pass<"register-mapper", "mlir::ModuleOp"> {
     active-low). The per-bit Q outputs are reassembled (MSB-first
     `comb.concat`) into the register's original `data` result, and the
     `seq.firreg` is erased.
+
+    With `multibit=<spec.json>` the mapper packs bits into multibit cells
+    first (see the MbSpec comment in RegisterMapperPass.cpp for the spec):
+    bits of one register (or, with `cross_register`, the leftover bits of
+    registers in the same module) that share clock, reset signal and flop
+    class (async clear-to-0, or no reset) form banks of 8/4/2 bits (the
+    spec's widths), in index order; async-set bits and leftover bits stay
+    single-bit cells. The mapper decides this on the register bits, before
+    ABC, so the clock and reset structure (clock-gate outputs included) is
+    known and banks never straddle clock domains.
   }];
   let constructor = "circt_abc::createRegisterMapperPass()";
   let options = [
     Option<"libertyPath", "liberty", "std::string", "",
            "Path to the liberty file whose ff() groups supply the "
            "plain/async-clear/async-preset flip-flop cells to map to">,
+    Option<"multibitPath", "multibit", "std::string", "",
+           "Path to a JSON multibit-flop spec (families, cell templates, pin "
+           "names, widths, optional per-register family overrides). Bits "
+           "that share clock, reset and flop class are packed, in index "
+           "order, into banks of the declared widths; leftover bits stay "
+           "single-bit cells. Empty: no banking.">,
   ];
   let dependentDialects = ["hw::HWDialect", "comb::CombDialect",
                            "seq::SeqDialect"];

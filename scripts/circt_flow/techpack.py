@@ -7,7 +7,9 @@
 
 `check` resolves the pack the way a flow config would (profile.resolve),
 loads it, and verifies that every liberty and `flow:` and `pnr:` path
-exists and that the ICG and tie cells it names (for a composite ICG, the
+exists, that its `wire_rc:` files exist, are non-empty, match their
+sha256 pins and cover the setup and hold corners (circt_flow.wire_rc), and
+that the ICG and tie cells it names (for a composite ICG, the
 cells its netlist instantiates) are cells of its liberties; tie cells may
 instead be cells of the pack's ORFS platform (`lib/*.lib`), since only P&R
 uses them. A schema-2 pack is checked rail by rail (each rail's cells
@@ -115,8 +117,27 @@ def check(ref: str) -> list[str]:
         print(f"  flow.{k}: {v}")
     for k, v in prof.pnr.items():
         print(f"  pnr.{k}: {v}")
+    problems += _check_wire_rc(prof)
     for p in problems:
         print(f"  ERROR: {p}")
+    return problems
+
+
+def _check_wire_rc(prof) -> list[str]:
+    """The pack's `wire_rc:` (circt_flow.wire_rc.check): files exist, are
+    non-empty, match their sha256 pins and cover the setup and hold
+    corners. A wire model that scales by them (flow.wire_model.rc_corner)
+    also needs each file's signal wire."""
+    from . import wire_rc
+    if prof.wire_rc is None:
+        return []
+    wm = prof.flow.get("wire_model") or {}
+    ref = wm.get("rc_corner") if isinstance(wm, dict) else None
+    problems = wire_rc.check(prof, need_signal=ref is not None)
+    if ref is not None and ref not in prof.wire_rc.entries and \
+            wire_rc.IMPLICIT not in prof.wire_rc.entries:
+        problems.append(f"flow.wire_model.rc_corner {ref!r} is not a "
+                        "wire_rc corner")
     return problems
 
 
@@ -157,6 +178,11 @@ def _check_rails(prof) -> list[str]:
         if not rp:
             cp, n = _check_cells(r.liberties, r.icg, r.tie, pdir)
             rp += [f"rails.{name}: {p}" for p in cp]
+            mbd = {**prof.flow, **r.flow}.get("multibit")
+            if mbd:
+                from .multibit import check_cells
+                rp += [f"rails.{name}: {p}" for p in
+                       check_cells(mbd, liberty_cells(r.liberties))]
         mark = " (default)" if name == prof.default_rail else ""
         print(f"  rail {name}{mark}: {r.voltage:g} V, {len(r.liberties)} "
               f"liberties" + (f", {n} cells" if n is not None else "")
@@ -201,6 +227,7 @@ def _check_rails(prof) -> list[str]:
                           if c in prof.level_shifter_corners))
     for k, v in prof.pnr.items():
         print(f"  pnr.{k}: {v}")
+    problems += _check_wire_rc(prof)
     for p in problems:
         print(f"  ERROR: {p}")
     return problems
@@ -240,13 +267,17 @@ def _check_rail_flow(prof, r) -> list[str]:
                             "not in the rail's liberties")
     fl = prof.flavours_at(r.name)
     if fl:
+        from .vtswap import flavour_key
         fre = re.compile(fl["re"])
         fam: dict[str, set[str]] = {}
         for c in cells:
             m = fre.search(c)
-            if m and m.group(1) in fl["tokens"]:
-                fam.setdefault(c[:m.start(1)] + "\0" + c[m.end(1):],
-                               set()).add(m.group(1))
+            if m and flavour_key(m) in fl["tokens"]:
+                key, last = "", 0
+                for i in range(1, fre.groups + 1):
+                    key += c[last:m.start(i)] + "\0"
+                    last = m.end(i)
+                fam.setdefault(key + c[last:], set()).add(flavour_key(m))
         print(f"    vt_flavours: {' < '.join(fl['tokens'])}"
               + (" (rail's own)" if r.vt_flavours else ""))
         lack = {}
@@ -315,7 +346,9 @@ def denylist(pack: Path) -> tuple[set[str], set[str]]:
     d = yaml.safe_load(pack.read_text()) or {}
     if d.get("public"):
         return set(), set()
-    prof = profile_mod.load(pack)
+    # audit=True skips the `pnr:` schema check: the audit reads only names
+    # and values.
+    prof = profile_mod.load(pack, audit=True)
     # Every rail's ICG, tie cells and liberties, and the level shifters'.
     names = set()
     for r in prof.rails.values():
@@ -331,6 +364,46 @@ def denylist(pack: Path) -> tuple[set[str], set[str]]:
     allow = set(prof.deny_exceptions)
     terms = {t.lower() for t in prof.deny_terms} - {a.lower() for a in allow}
     return names - allow, terms
+
+
+# Sections whose numbers are specific to a pack: the audit refuses
+# `<key>: <value>` of any of them.
+_NUMERIC_SECTIONS = ("wire_model", "multibit", "clock_gating", "slow_cell_filter",
+                     "mapping_target")
+
+
+def numeric_values(pack: Path) -> set[str]:
+    """Regular expressions matching `key: value` (or `key=value`) for every
+    number of the sections above (and of `wire_rc:`), except 0, 1 and other
+    small integers (those are everywhere)."""
+    d = yaml.safe_load(pack.read_text()) or {}
+    if d.get("public"):
+        return set()
+    out: set[str] = set()
+
+    def walk(node, key=None):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, str(k))
+        elif isinstance(node, list):
+            for v in node:
+                walk(v, key)
+        elif (isinstance(node, (int, float)) and not isinstance(node, bool)
+              and key and not (float(node) == int(node) and abs(node) < 10)):
+            forms = {repr(node), f"{node:g}"}
+            alt = "|".join(sorted(re.escape(f) for f in forms))
+            out.add(r"\b" + re.escape(key) + r"\b[\"']?\s*[:=]\s*(?:" + alt
+                    + r")(?![0-9.])")
+
+    flows = [d.get("flow") or {}] + [(r or {}).get("flow") or {}
+                                      for r in (d.get("rails") or {}).values()]
+    for fl in flows:
+        for sec in _NUMERIC_SECTIONS:
+            if sec in fl:
+                walk(fl[sec])
+    if "wire_rc" in d:
+        walk(d["wire_rc"])
+    return out
 
 
 def liberty_names(paths) -> set[str]:
@@ -439,12 +512,21 @@ def audit(paths: list[str]) -> int:
         names |= n
         terms |= t
     rx = _matcher(names, terms)
-    if rx is None:
+    kv: set[str] = set()
+    for pack in packs:
+        # every pack file in the directory
+        for y in sorted(pack.parent.glob("*.yaml")):
+            try:
+                kv |= numeric_values(y)
+            except (OSError, yaml.YAMLError, AttributeError):
+                continue
+    kvrx = re.compile("|".join(sorted(kv))) if kv else None
+    if rx is None and kvrx is None:
         print("techpack audit: no private pack installed; nothing to refuse")
         return 0
     hits = 0
     for f, i, text in (_files(paths) if paths else _staged()):
-        m = rx.search(text)
+        m = (rx.search(text) if rx else None) or (kvrx.search(text) if kvrx else None)
         if m:
             hits += 1
             where = f"{f}:{i}" if i else f"{f} (file name)"

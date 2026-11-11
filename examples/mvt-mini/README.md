@@ -73,6 +73,11 @@ netlist of the existing arms is byte-identical.
 `core_hv` at a 1,000 ps clock on the 0.75 V libraries. WNS is from OpenSTA
 with zero I/O delays; leakage is in nW, from the real libraries.
 
+`abc/mvt.abc` bounds `&deepsyn` by `-J 100` and has no wall-clock `-T`. The
+tables below were measured with the earlier script (`-T 10`); the chains of
+this small design end by `-J 100` first, and the tables reproduce exactly with
+the current one.
+
 | arm | flavours | leakage | WNS ns |
 | :--- | :--- | ---: | ---: |
 | `flow`: RVT, stock ABC script | 423 R | 499 | -0.330 |

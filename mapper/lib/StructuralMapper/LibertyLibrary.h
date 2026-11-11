@@ -170,6 +170,25 @@ struct HalfAdderCellPattern {
   std::string carryPin; // function == a&b
 };
 
+// A purely combinational cell with 2*N inputs (N = 4 here) whose function is
+// the OR of N two-input AND terms, possibly with the output inverted
+// (AO2222 / AOI2222). Eight inputs do not fit a TruthTable, so such cells
+// are recognised by a direct pairing check and used only by passes that build
+// AND-OR networks themselves (map-shift-select).
+struct WideAndOrCell {
+  std::string name;
+  double area = 0.0;
+  // pins[2*t], pins[2*t+1] are the two inputs of term t.
+  llvm::SmallVector<std::string, 8> pins;
+  std::string outputPin;
+  // orAnd = false: output = OR_t(a_t & b_t)  (AO2222), or its complement
+  // when `inverted` (AOI2222). orAnd = true: output = AND_t(a_t | b_t)
+  // (OA2222), or its complement when `inverted` (OAI2222).
+  bool orAnd = false;
+  bool inverted = false;
+  unsigned terms() const { return pins.size() / 2; }
+};
+
 class LibertyLibrary {
 public:
   // Parses `path` and indexes every purely-combinational cell with 1..6
@@ -192,6 +211,19 @@ public:
   // real and the default pricing is correct.
   std::optional<CellMatch> lookup(unsigned arity, TruthTable table,
                                   bool inversionIsFree = false) const;
+
+  // Cheapest (lowest-area) cell computing the OR of `terms` two-input AND
+  // terms (4 or more terms: the cells TruthTable cannot hold), with an
+  // inverted output when `inverted`. nullptr if the library has none.
+  const WideAndOrCell *lookupWideAndOr(unsigned terms, bool inverted,
+                                       bool orAnd = false) const {
+    const WideAndOrCell *best = nullptr;
+    for (const WideAndOrCell &c : wideAndOr)
+      if (c.terms() == terms && c.inverted == inverted && c.orAnd == orAnd &&
+          (!best || c.area < best->area))
+        best = &c;
+    return best;
+  }
 
   // Cheapest (lowest-area) flip-flop cell with no clear/preset pin at all.
   const FFCellPattern *lookupFFNoReset() const { return cheapestNoResetFF; }
@@ -294,6 +326,7 @@ private:
   const ICGCellPattern *cheapestICG = nullptr;
 
   std::vector<HalfAdderCellPattern> halfAdderCells;
+  std::vector<WideAndOrCell> wideAndOr;
   std::vector<FullAdderCellPattern> fullAdderCells;
   const HalfAdderCellPattern *cheapestHalfAdder = nullptr;
   const FullAdderCellPattern *cheapestFullAdder = nullptr;

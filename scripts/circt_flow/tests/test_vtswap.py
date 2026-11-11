@@ -39,8 +39,28 @@ def test_parse_flavours():
         "tokens": ["R", "L", "S"], "re": "_([RLS])$"}
     with pytest.raises(KeyError, match="two or more"):
         vtswap.parse_flavours({"tokens": ["R"]}, "p")
-    with pytest.raises(KeyError, match="exactly one group"):
+    with pytest.raises(KeyError, match="at least one group"):
         vtswap.parse_flavours({"tokens": ["R", "L"], "re": "_[RL]$"}, "p")
+
+
+def test_parse_flavours_two_axes():
+    """A regex with several groups: tokens name one value per group."""
+    d = {"tokens": ["R/A", "R/B", "L/A"], "re": "_([RL])_([AB])$"}
+    assert vtswap.parse_flavours(d, "p") == d
+    with pytest.raises(KeyError, match="2 groups"):
+        vtswap.parse_flavours({"tokens": ["R", "L"],
+                               "re": "_([RL])_([AB])$"}, "p")
+    with pytest.raises(KeyError, match="2 groups"):
+        vtswap.parse_flavours({"tokens": ["R/A", "L/A/x"],
+                               "re": "_([RL])_([AB])$"}, "p")
+    text = ("module m (a);\n  input a;\n  wire n;\n"
+            "  INV_R_A g0 (.A(a), .Y(n));\n  INV_R_B g1 (.A(a), .Y(n));\n"
+            "  INV_L_A g2 (.A(a), .Y(n));\n  INV_L_B g3 (.A(a), .Y(n));\n"
+            "endmodule\n")
+    assert vtswap.flavour_counts(text, d["tokens"], d["re"]) == {
+        "R/A": 1, "R/B": 1, "L/A": 1}
+    assert vtswap._fmt_counts({"R/A": 3, "R/B": 1}) == "R/A=3 R/B=1"
+    assert vtswap._fmt_counts({"R": 3, "L": 1}) == "R3/L1"
 
 
 def _have_sta():
@@ -238,3 +258,154 @@ def test_retype_keeps_every_other_byte():
     ch = vtswap.cell_changes(text, out)
     assert ch == {"m": {"g0": "INV_L", "\\u_x/g1": "INV_S"}}
     assert vtswap.retype(text, ch) == out
+
+
+# ---- a two-axis ladder: Vt x a second axis --------------
+
+def _scale_lib(text, tag, name, dscale, lscale):
+    """A copy of a mini library whose cells carry `_<tag>` after the Vt
+    letter, delays (cell_rise/fall) times dscale and leakage times lscale:
+    the 'B' variant of the two-axis tests (invented numbers)."""
+    text = re.sub(r"library\((\w+)\)", f"library({name})", text, 1)
+    text = re.sub(r"cell\((\w+_[RLS])\)", rf"cell(\1_{tag})", text)
+
+    def scale_values(m):
+        vals = re.sub(r"[-\d.]+", lambda n: f"{float(n.group()) * dscale:.5f}",
+                      m.group(2))
+        return f"{m.group(1)}{vals}"
+    # (the mini libraries' tables take their axes from a template; give the
+    # ones the characterisation tool reads their own)
+    text = re.sub(r"(cell_(?:rise|fall)\(nldm\) \{ )values",
+                  r'\1index_1("0.005, 0.02, 0.05, 0.1, 0.2"); '
+                  r'index_2("0.0005, 0.002, 0.005, 0.01, 0.02"); values', text)
+    text = re.sub(r"(cell_(?:rise|fall)\(nldm\) \{ index_1\([^)]*\); index_2\([^)]*\); values\()(.*?)(?=\); \})",
+                  scale_values, text, flags=re.S)
+    return re.sub(r"(cell_leakage_power : )([-\d.eE+]+)",
+                  lambda m: f"{m.group(1)}{float(m.group(2)) * lscale:.6f}",
+                  text)
+
+
+def _two_axis_libs(tmp_path, drop=()):
+    """Libraries for ladder R/A < R/B < L/A < L/B < S/A < S/B: the mini
+    libraries as variant A, and B faster for more leakage. `drop`
+    lists cell names left out of the B libraries."""
+    lib = tmp_path / "lib"
+    subprocess.run([sys.executable, "-I", str(MINI / "lib/make_libs.py"),
+                    str(lib)], check=True, capture_output=True)
+    libs = []
+    for v, t in (("rvt", "R"), ("lvt", "L"), ("slvt", "S")):
+        src = (lib / f"mini_{v}_0p75v_tt.lib").read_text()
+        for tag, d, k in (("A", 1.0, 1.0), ("B", 0.9, 1.7)):
+            text = _scale_lib(src, tag, f"mini_{v}_{tag}", d, k)
+            for c in drop:
+                if tag == "B" and c.endswith("_" + t + "_B"):
+                    text = re.sub(r"  cell\(" + c + r"\) \{.*?\n  \}\n", "",
+                                  text, flags=re.S)
+            p = tmp_path / f"two_{v}_{tag}.lib"
+            p.write_text(text)
+            libs.append(p)
+    return libs
+
+
+TWO_TOKENS = ["R/A", "R/B", "L/A", "L/B", "S/A", "S/B"]
+TWO_RE = r"_([RLS])_([AB])$"
+
+
+def _two_axis_netlist():
+    return _chain_netlist().replace("_R ", "_R_A ")
+
+
+@pytest.mark.skipif(not _have_sta(), reason="no OpenSTA (docker image or "
+                    "$OPENSTA)")
+def test_swap_two_axis_ladder(tmp_path):
+    """The ladder runs R/A < R/B < L/A < ...: a small shortfall is closed
+    by the cheap R/B step alone, a big one climbs to L; recovery walks
+    back down the same ladder; counts are keyed by the joined token."""
+    libs = _two_axis_libs(tmp_path)
+    nl = tmp_path / "chain.v"
+    nl.write_text(_two_axis_netlist())
+
+    def run(period, recover=True):
+        out = tmp_path / f"out_{period}_{recover}.v"
+        res = vtswap.swap(nl, "chain", out, libs, TWO_TOKENS, TWO_RE,
+                          vtswap.sdc_for(period, "clk", ["d"]),
+                          recover=recover)
+        return res, re.findall(r"^\s*M\w+_([RLS]_[AB])\s", out.read_text(),
+                               re.M)
+
+    res0, cells = run(5000)
+    assert not res0["up"] and set(cells) == {"R_A"}
+    assert res0["flavours_before"]["R/A"] == CHAIN + 2
+    slack = res0["start"]["wns"]
+    full = 5.0 - slack                       # ns: the all-R/A path
+    # Slightly under: R/B is enough, nothing leakier than it is used.
+    res, cells = run(int(full * 1000 * 0.96), recover=False)
+    assert res["start"]["wns"] < 0 and res["end"]["wns"] >= 0
+    assert set(cells) <= {"R_A", "R_B"} and "R_B" in cells
+    assert res["flavours_after"]["L/A"] == 0
+    # Far under: needs LVT or faster, and the fix reaches it.
+    res, cells = run(int(full * 1000 * 0.70), recover=False)
+    assert res["end"]["wns"] >= 0
+    assert {c[0] for c in cells} - {"R"}
+    # Recovery then gives back what the clock does not need, down the
+    # ladder (step by step), never past a failing path.
+    res_r, cells_r = run(int(full * 1000 * 0.70), recover=True)
+    assert res_r["end"]["wns"] >= -1e-6
+    order = {t.replace("/", "_"): i for i, t in enumerate(TWO_TOKENS)}
+    assert sum(order[c] for c in cells_r) <= sum(order[c] for c in cells)
+    assert sum(res_r["flavours_after"].values()) == CHAIN + 2
+
+
+@pytest.mark.skipif(not _have_sta(), reason="no OpenSTA (docker image or "
+                    "$OPENSTA)")
+def test_swap_steps_over_a_missing_flavour(tmp_path):
+    """A cell family without one ladder token steps over it: no MINV in
+    the R/B flavour, so an inverter goes R/A -> L/A or beyond."""
+    libs = _two_axis_libs(tmp_path, drop=["MINV_X1_R_B"])
+    nl = tmp_path / "chain.v"
+    nl.write_text(_two_axis_netlist())
+    out = tmp_path / "out.v"
+    res0 = vtswap.swap(nl, "chain", tmp_path / "o0.v", libs, TWO_TOKENS,
+                       TWO_RE, vtswap.sdc_for(5000, "clk", ["d"]),
+                       recover=False)
+    full = 5.0 - res0["start"]["wns"]
+    res = vtswap.swap(nl, "chain", out, libs, TWO_TOKENS, TWO_RE,
+                      vtswap.sdc_for(int(full * 1000 * 0.85), "clk", ["d"]),
+                      recover=False)
+    text = out.read_text()
+    assert res["end"]["wns"] >= 0
+    cells = re.findall(r"^\s*(MINV_X1_\w+)\s", text, re.M)
+    assert "MINV_X1_R_B" not in cells and "MINV_X1_R_A" not in cells
+    assert all(c.startswith("MINV_X1_L_") for c in cells)
+    # The flops have an R/B: they take that step (or go on past it).
+    assert res["flavours_after"]["R/A"] == 0
+
+
+def test_ladder_char_reads_a_two_axis_ladder(tmp_path, capsys):
+    """scripts/mvt/ladder_char.py on the invented two-axis libraries: B is
+    faster than A for more leakage, at the same area."""
+    sys.path.insert(0, str(ROOT / "scripts" / "mvt"))
+    import ladder_char
+    libs = _two_axis_libs(tmp_path)
+    ladder_char.main(["--tokens", ",".join(TWO_TOKENS), "--re", TWO_RE]
+                     + [str(l) for l in libs])
+    out = capsys.readouterr().out
+    rows = {l.split()[0]: l.split() for l in out.splitlines()
+            if l.split() and l.split()[0] in TWO_TOKENS}
+    assert "families carry all 6 flavours" in out
+    # first section (comb): R/B vs R/A
+    assert float(rows["R/B"][1]) == pytest.approx(0.9, abs=0.02)
+    assert float(rows["R/B"][2]) == pytest.approx(1.7, abs=0.01)
+    assert float(rows["R/B"][3]) == pytest.approx(1.0)
+
+
+def test_vt_swap_false_to_parses_and_makes_sdc():
+    from circt_flow import vtswap as v
+    s = v.parse_vt_swap({"margin_ps": 10, "false_to": ["outputs", "q[0]"]}, "f")
+    assert s.false_to == ("outputs", "q[0]")
+    assert v.parse_vt_swap({}, "f").false_to == ()
+    t = v.false_to_sdc(s.false_to)
+    assert "set_false_path -to [all_outputs]" in t
+    assert "set_false_path -to [get_ports q[0]]" in t
+    with pytest.raises(v.VtSwapError, match="false_to"):
+        v.parse_vt_swap({"false_to": "outputs"}, "f")

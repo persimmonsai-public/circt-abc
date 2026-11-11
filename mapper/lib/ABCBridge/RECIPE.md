@@ -30,7 +30,7 @@ baseline has to use this one:
 
 ```
 abc_script = "strash;scorr;dc2"
-  + ";&get -n;&deepsyn -J 100 -I 4 -S 200 -T 10;&put"   # deep AIG restructuring
+  + ";&get -n;&deepsyn -J 3 -I 4 -S 200;&put"   # deep AIG restructuring; -J bound, no wall-clock -T (see ABCBridge.cpp)
   + ";strash;&get -n;&dch -f;&if -C 32 -K 6;&put"        # &if-based exploration
   + ";strash;&get -n;&resub -N 2;&put"                   # resubstitution
   + ";strash;&get -n;&dch -f;&nf -C 32 -D $clk;&put"     # final area/timing map

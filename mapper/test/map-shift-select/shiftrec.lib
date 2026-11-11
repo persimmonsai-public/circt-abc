@@ -1,0 +1,168 @@
+/* Hermetic liberty for the shift-select test: inverting compound cells are cheaper than their
+   non-inverting forms, as in real CMOS. */
+library(shift_cells) {
+  cell(TINV) {
+    area : 0.02 ;
+    pin(A) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!A)" ;
+    }
+  }
+  cell(TNAND2) {
+    area : 0.03 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!(A&B))" ;
+    }
+  }
+  cell(TNAND3) {
+    area : 0.04 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(C) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!(A&B&C))" ;
+    }
+  }
+  cell(TNAND4) {
+    area : 0.05 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(C) { direction : input ; }
+    pin(D) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!(A&B&C&D))" ;
+    }
+  }
+  cell(TNOR2) {
+    area : 0.03 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!(A|B))" ;
+    }
+  }
+  cell(TAND2) {
+    area : 0.04 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(A&B)" ;
+    }
+  }
+  cell(TOR2) {
+    area : 0.04 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(A|B)" ;
+    }
+  }
+  cell(TAOI22) {
+    area : 0.05 ;
+    pin(A1) { direction : input ; }
+    pin(A2) { direction : input ; }
+    pin(B1) { direction : input ; }
+    pin(B2) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!((A1&A2)|(B1&B2)))" ;
+    }
+  }
+  cell(TAOI2222) {
+    area : 0.09 ;
+    pin(A0) { direction : input ; }
+    pin(A1) { direction : input ; }
+    pin(B0) { direction : input ; }
+    pin(B1) { direction : input ; }
+    pin(C0) { direction : input ; }
+    pin(C1) { direction : input ; }
+    pin(D0) { direction : input ; }
+    pin(D1) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!((A0&A1)|(B0&B1)|(C0&C1)|(D0&D1)))" ;
+    }
+  }
+  cell(TOAI2222) {
+    area : 0.09 ;
+    pin(A0) { direction : input ; }
+    pin(A1) { direction : input ; }
+    pin(B0) { direction : input ; }
+    pin(B1) { direction : input ; }
+    pin(C0) { direction : input ; }
+    pin(C1) { direction : input ; }
+    pin(D0) { direction : input ; }
+    pin(D1) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!((A0|A1)&(B0|B1)&(C0|C1)&(D0|D1)))" ;
+    }
+  }
+  cell(TOAI22) {
+    area : 0.05 ;
+    pin(A0) { direction : input ; }
+    pin(A1) { direction : input ; }
+    pin(B0) { direction : input ; }
+    pin(B1) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!((A0|A1)&(B0|B1)))" ;
+    }
+  }
+  cell(TAOI222) {
+    area : 0.07 ;
+    pin(A0) { direction : input ; }
+    pin(A1) { direction : input ; }
+    pin(B0) { direction : input ; }
+    pin(B1) { direction : input ; }
+    pin(C0) { direction : input ; }
+    pin(C1) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!((A0&A1)|(B0&B1)|(C0&C1)))" ;
+    }
+  }
+  cell(TOAI222) {
+    area : 0.07 ;
+    pin(A0) { direction : input ; }
+    pin(A1) { direction : input ; }
+    pin(B0) { direction : input ; }
+    pin(B1) { direction : input ; }
+    pin(C0) { direction : input ; }
+    pin(C1) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!((A0|A1)&(B0|B1)&(C0|C1)))" ;
+    }
+  }
+  cell(TAOI32) {
+    area : 0.06 ;
+    pin(A0) { direction : input ; }
+    pin(A1) { direction : input ; }
+    pin(A2) { direction : input ; }
+    pin(B0) { direction : input ; }
+    pin(B1) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!((A0&A1&A2)|(B0&B1)))" ;
+    }
+  }
+  cell(TAND2B) {
+    area : 0.05 ;
+    pin(AN) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!AN&B)" ;
+    }
+  }
+}

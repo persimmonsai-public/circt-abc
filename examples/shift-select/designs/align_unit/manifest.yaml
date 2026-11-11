@@ -1,0 +1,10 @@
+# align_unit, from this example's own RTL (a path source, not a git commit).
+design:
+  name: align_unit
+  top: align_unit
+  source:
+    path: ../../rtl
+  files:
+    - align_unit.sv
+constraints:
+  clock_port: clk_i

@@ -667,23 +667,28 @@ struct ABCBridgePass : public PassWrapper<ABCBridgePass, OperationPass<ModuleOp>
   // "MLIR's own pass-options parser" gotcha). Empty (the default) => the
   // hardcoded recipe below, byte-for-byte. Honoured by BOTH invocation paths,
   // so a custom recipe can be diffed subprocess-vs-in-process -- which is what
-  // the byte-identity check needs, since the production recipe's
-  // `&deepsyn -T 10` is a CPU-time budget and so is not reproducible across two
-  // runs by construction.
-  // `&deepsyn`'s CPU-time budget, in seconds. The historical value is 10, which
-  // is the default here so the assembled script stays byte-identical unless
-  // this is set explicitly. Measured on ibex: raising it to 1200 on the frozen
-  // post-recipe AIG takes 16,639 -> 16,104 AND nodes (-3.2%, CEC-equivalent)
-  // and shrinks the mapped netlist for a few ps of mapped delay -- a bigger win
-  // than every mapper-side lever in this project combined. It converges early
-  // (best iteration at 374 s of a 1,200 s budget), so most of the benefit is
-  // available well below the full budget. NOTE this makes the run even less
-  // reproducible than the default already is: -T is CPU time, so a larger
-  // budget means a larger load-dependent spread between instances.
+  // the byte-identity check needs.
+  //
+  // `&deepsyn` BOUND. `&deepsyn -J <n> -I <k> -S <s>` runs k chains (seeds
+  // s, s+1, ..) one after the other, each until n steps in a row brought no
+  // improvement; that bound depends on the input and the seed only, so the
+  // result is reproducible. The historical script also passed `-T <sec>`,
+  // which is a WALL-CLOCK limit per chain: a chain slowed by machine load was
+  // cut short and the same input gave another netlist. It is gone from the
+  // default. `deepsyn-no-improve` is -J. A larger value buys area at the
+  // price of runtime, deterministically (on ibex a very large budget took the
+  // post-recipe AIG from 16,639 to 16,104 AND nodes, CEC-equivalent).
+  Option<unsigned> deepsynNoImprove{
+      *this, "deepsyn-no-improve", llvm::cl::init(3),
+      llvm::cl::desc("&deepsyn -J: steps without improvement that end a "
+                     "chain of the built-in recipe (deterministic bound)")};
+  // Opt-in wall-clock limit, OFF by default (0): the result then depends on
+  // the machine load. Kept only to reproduce old measurements.
   Option<unsigned> deepsynTimeSec{
-      *this, "deepsyn-time-sec", llvm::cl::init(10),
-      llvm::cl::desc("CPU-second budget for &deepsyn in the built-in recipe "
-                     "(default 10 = the historical script)")};
+      *this, "deepsyn-time-sec", llvm::cl::init(0),
+      llvm::cl::desc("wall-clock seconds per &deepsyn chain of the built-in "
+                     "recipe (0 = none, the default; non-zero makes the "
+                     "netlist depend on the machine load)")};
   Option<std::string> abcScriptFile{
       *this, "abc-script-file", llvm::cl::init(""),
       llvm::cl::desc(
@@ -1085,8 +1090,12 @@ struct ABCBridgePass : public PassWrapper<ABCBridgePass, OperationPass<ModuleOp>
               : std::string();
       std::string body =
           ("strash; scorr; dc2"
-           "; &get -n; &deepsyn -J 100 -I 4 -S 200 -T " +
-           Twine(deepsynTimeSec.getValue()) + "; &put"
+           "; &get -n; &deepsyn -J " + Twine(deepsynNoImprove.getValue()) +
+           " -I 4 -S 200" +
+           (deepsynTimeSec.getValue()
+                ? (" -T " + Twine(deepsynTimeSec.getValue())).str()
+                : std::string()) +
+           "; &put"
            "; strash; &get -n; &dch -f; &if -C 32 -K 6; &put"
            "; strash; &get -n; &resub -N 2; &put" +
            classicalResubStep +

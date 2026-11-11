@@ -1,0 +1,16 @@
+# align_unit on ASAP7 RVT, shift_select on: three-term AND-OR cells (ASAP7 has
+# AO222/AOI222 but no four-term cell) and a recipe of three radix-2 digits plus
+# a last digit that takes the rest (four levels), whose cells take 3, 3, 3 and 2
+# terms. Exact options only.
+design:
+  top_module: align_unit
+  clock_period_ps: 400
+  manifest: manifest.yaml
+pdk:
+  profile: ../../techpack.yaml
+modes:
+  func: func.sdc
+shift_select:
+  min_arms: 8
+  wide: 1
+  recipes: "2,2,2@3,3,3,2"

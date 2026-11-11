@@ -151,3 +151,22 @@ def test_modules_are_buffered_on_their_own_rail():
     i = out.index("module top")
     assert out[i:] == text[text.index("module top"):]
     assert out.count("BUF fob_b") == 3 and "assign o = h;" in out
+
+
+def test_annotated_driver_keeps_its_loads_up_to_its_own_limit(tmp_path):
+    """A driver annotated circt_abc.max_fanout=N (mapper attribute, read from the mapped MLIR) is
+    left unbuffered up to N loads and buffered to N beyond; other nets keep the global limit."""
+    mlir = tmp_path / "x_mapped.mlir"
+    mlir.write_text('    %a = hw.instance "u_x/src" @DFF(CK: %c: i1, D: %d: i1) -> (Q: i1) '
+                    '{circt_abc.max_fanout = 24 : i32}\n')
+    lim = fanout.net_limits_from_mlir([mlir])
+    assert lim == {"u_x2Fsrc": 24}
+    text = _netlist(20).replace("DFF src", "DFF u_x2Fsrc")
+    out, st = fanout.buffer_fanout(text, CELLS, "BUF", "A", "Y", 8, net_limits=lim)
+    assert out == text and st.nets == 0           # 20 loads <= 24: untouched
+    out, st = fanout.buffer_fanout(text, CELLS, "BUF", "A", "Y", 8)
+    assert st.nets == 1                           # without the annotation: buffered
+    out, st = fanout.buffer_fanout(_netlist(60).replace("DFF src", "DFF u_x2Fsrc"), CELLS,
+                                   "BUF", "A", "Y", 8, net_limits=lim)
+    drv, ld, cell = _graph(out)
+    assert max(len(v) for v in ld.values()) <= 24

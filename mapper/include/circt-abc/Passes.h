@@ -140,6 +140,20 @@ createOutlineDatapathOpsPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createPruneUnusedResidualOutputsPass();
 
+/// See Passes.td's MapPrefixAdders description.
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createMapPrefixAddersPass();
+
+/// See Passes.td's MapShiftSelect description.
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createMapShiftSelectPass();
+
+/// See Passes.td's LowerCarryInAdds description.
+std::unique_ptr<mlir::OperationPass<circt::hw::HWModuleOp>>
+createLowerCarryInAddsPass();
+
+/// See Passes.td's LowerBarrelShifts description.
+std::unique_ptr<mlir::OperationPass<circt::hw::HWModuleOp>>
+createLowerBarrelShiftsPass();
+
 /// See Passes.td's SetAdderArch description.
 std::unique_ptr<mlir::OperationPass<circt::hw::HWModuleOp>>
 createSetAdderArchPass();

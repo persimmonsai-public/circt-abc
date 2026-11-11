@@ -179,6 +179,8 @@ def run(manifest: Path, prof: profile_mod.Profile, out_dir: Path,
 
     raw = out_dir / f"{top}.mlir"
     cmd = [circt_verilog, "--ir-llhd"]
+    if design.get("timescale"):
+        cmd += [f"--timescale={design['timescale']}"]
     for d in design.get("defines", []):
         cmd += ["-D", d]
     cmd += ["--top", top]

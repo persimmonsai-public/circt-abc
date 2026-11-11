@@ -7,8 +7,12 @@
 #  * &nf reads -D only with -l (giaNf.c, Nf_ManPerformMappingInt); without
 #    it the clock period has no effect on the mapping.
 # {period} is the flow's clock period in ps.
+#  * &deepsyn is bounded by -J 3 steps without improvement per chain and has no -T:
+#    -T is a wall-clock limit, so under machine load a chain was cut short and the
+#    same input gave another netlist. A -J bound depends on the input and the
+#    seed only.
 strash; scorr; dc2
-&get -n; &deepsyn -J 100 -I 4 -S 200 -T 10; &put
+&get -n; &deepsyn -J 3 -I 4 -S 200; &put
 strash; &get -n; &dch -f; &if -C 32 -K 6; &put
 strash; &get -n; &resub -N 2; &put
 # &resub is a stub in this ABC (Gia_ManResub2 returns NULL: "Transformation

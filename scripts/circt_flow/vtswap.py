@@ -30,6 +30,10 @@ corrects both with real timing, in one OpenSTA session:
      wherever a fast cell is not needed.
 
 The flavour regex captures the token in a cell name (default `_([A-Z]+)$`).
+It may have several groups for a ladder over more than one axis (Vt and
+a second flavour code, say): a token is then the groups' values joined by "/"
+("R/A"), the ladder lists them slowest first, and a step moves to the
+next listed token whose cell exists in the libraries (a gap is skipped).
 The libraries are the REAL per-flavour ones, never a priced mapping
 library. The netlist is rewritten with OpenSTA's write_verilog; the
 record lists every swap and the slack before and after. OpenSTA runs in
@@ -40,7 +44,9 @@ runs on the OpenSTA netlist after synthesis, before the STA stage, with
 the profile's setup-corner libraries for the run's rail (its mapping
 liberties when it has no corners, so such a pack must not list a priced
 library first), the tightest mode's SDC plus `false_from:` ports, and the
-pack's `vt_flavours:`. The unswapped netlist is kept as
+pack's `vt_flavours:`. With a wire model (flow.wire_model, wire_model.py) every
+net carries its expected wire in the session, so the fix and recovery steps
+size against loaded nets. The unswapped netlist is kept as
 <top>_preswap_openroad.v; the record goes to <out>/vt_swap.json.
 
 In a power flow (run_power, after the intent step and before STA) the swap
@@ -69,7 +75,7 @@ from typing import Optional, Sequence
 ORFS_IMAGE = "openroad/orfs:26Q3-277-gf9ec54a6d"
 STA_BIN = "/OpenROAD-flow-scripts/tools/install/OpenROAD/bin/sta"
 VT_SWAP_KEYS = {"enabled", "false_from", "paths", "max_iter", "recover",
-                "margin_ps"}
+                "margin_ps", "keep_clock_cells", "false_to"}
 
 
 class VtSwapError(RuntimeError):
@@ -86,6 +92,23 @@ class VtSwapSpec:
     # Setup slack to keep in hand (ps): fix until the worst slack is at
     # least this, recover only while it stays there; room for P&R.
     margin_ps: float = 0.0
+    # Leave clock cells (any cell other than a buffer or inverter that drives
+    # a clock net, i.e. the clock gates) at the flavour synthesis gave them:
+    # a faster flavour only adds clock-network leakage and internal power,
+    # and a gate's flavour does not set the data path's timing.
+    keep_clock_cells: bool = False
+    # Endpoints the swap ignores: port names, or "outputs" for every output
+    # port (set_false_path -to). A design whose output paths cannot close in
+    # this view (output delay beyond what the flop and its driver can do)
+    # otherwise has the fix spend the fastest flavours on them without ever
+    # reaching the margin, and recovery then starts from that.
+    false_to: tuple = ()
+
+
+def false_to_sdc(false_to) -> str:
+    return "".join("set_false_path -to [all_outputs]\n" if p == "outputs"
+                   else f"set_false_path -to [get_ports {p}]\n"
+                   for p in false_to)
 
 
 def parse_vt_swap(d, where) -> VtSwapSpec:
@@ -107,7 +130,11 @@ def parse_vt_swap(d, where) -> VtSwapSpec:
                        or d[k] < 1):
             raise VtSwapError(f"{where}: vt_swap.{k} must be a positive "
                               "integer")
-    for k in ("enabled", "recover"):
+    ft = d.get("false_to") or []
+    if isinstance(ft, str) or not all(isinstance(x, str) for x in ft):
+        raise VtSwapError(f"{where}: vt_swap.false_to must be a list of "
+                          "port names (or \"outputs\")")
+    for k in ("enabled", "recover", "keep_clock_cells"):
         if k in d and not isinstance(d[k], bool):
             raise VtSwapError(f"{where}: vt_swap.{k} must be true or false")
     mg = d.get("margin_ps", 0.0)
@@ -116,11 +143,14 @@ def parse_vt_swap(d, where) -> VtSwapSpec:
                           "ps >= 0")
     return VtSwapSpec(d.get("enabled", True), tuple(ff), d.get("paths", 200),
                       d.get("max_iter", 30), d.get("recover", True),
-                      float(mg))
+                      float(mg), d.get("keep_clock_cells", False), tuple(ft))
 
 
 def parse_flavours(d, where) -> Optional[dict]:
-    """A pack's `vt_flavours: {tokens: [slowest, ..., fastest], re: ...}`."""
+    """A pack's `vt_flavours: {tokens: [slowest, ..., fastest], re: ...}`.
+    The regex has one group (the token) or several (two axes, say Vt and
+    a second flavour code): a token then lists one value per group, joined by
+    "/" ("R/A"), and the tokens are the ladder in speed order."""
     if d is None:
         return None
     if not isinstance(d, dict) or set(d) - {"tokens", "re"}:
@@ -132,10 +162,17 @@ def parse_flavours(d, where) -> Optional[dict]:
                        "flavour tokens, slowest first")
     fre = d.get("re", r"_([A-Z]+)$")
     try:
-        if re.compile(fre).groups != 1:
-            raise re.error("needs exactly one group")
+        ngroups = re.compile(fre).groups
+        if ngroups < 1:
+            raise re.error("needs at least one group")
     except re.error as e:
         raise KeyError(f"{where}: vt_flavours.re: {e}")
+    if ngroups > 1:
+        for t in toks:
+            if t.count("/") != ngroups - 1:
+                raise KeyError(f"{where}: vt_flavours.re has {ngroups} "
+                               f"groups, so every token needs {ngroups} "
+                               f"'/'-separated parts (got {t!r})")
     return {"tokens": list(toks), "re": fre}
 
 
@@ -153,42 +190,121 @@ proc flav_select {name} {
     if {[string first $pre $name] == 0} { lassign $fl flavours fre; break }
   }
 }
+# A cell name's flavour: the regex's groups joined by "/" (one group, as
+# for a threshold-only ladder: just the group). The regex may have several
+# groups, e.g. a Vt letter and a second code; a ladder token then names
+# one value per group, "/"-separated, in group order.
+proc flav_token {name} {
+  global fre
+  set m [regexp -indices -inline -- $fre $name]
+  if {[llength $m] == 0} { return "" }
+  set parts {}
+  foreach g [lrange $m 1 end] {
+    lappend parts [string range $name [lindex $g 0] [lindex $g 1]]
+  }
+  return [join $parts /]
+}
 proc flav_index {name} {
-  global flavours fre
+  global flavours
   flav_select $name
   if {[llength $flavours] == 0} { return -1 }
-  if {![regexp -indices -- $fre $name all tok]} { return -1 }
-  set t [string range $name [lindex $tok 0] [lindex $tok 1]]
+  set t [flav_token $name]
+  if {$t eq ""} { return -1 }
   return [lsearch -exact $flavours $t]
 }
 proc flav_swap {name k} {
   global flavours fre
   flav_select $name
-  regexp -indices -- $fre $name all tok
-  return "[string range $name 0 [expr {[lindex $tok 0] - 1}]][lindex $flavours $k][string range $name [expr {[lindex $tok 1] + 1}] end]"
+  set m [regexp -indices -inline -- $fre $name]
+  set gs [lrange $m 1 end]
+  set tok [lindex $flavours $k]
+  if {[llength $gs] == 1} { set parts [list $tok] } else { set parts [split $tok /] }
+  for {set i [expr {[llength $gs] - 1}]} {$i >= 0} {incr i -1} {
+    lassign [lindex $gs $i] a b
+    set name "[string range $name 0 [expr {$a - 1}]][lindex $parts $i][string range $name [expr {$b + 1}] end]"
+  }
+  return $name
+}
+# vt_swap.keep_clock_cells: a clock cell is a non-buffer, non-inverter whose
+# output is a clock (cached per instance).
+set keep_clk %(keep_clk)d
+set clk_cell_cache [dict create]
+proc is_clock_cell {inst} {
+  global keep_clk clk_cell_cache
+  if {!$keep_clk} { return 0 }
+  set n [get_full_name $inst]
+  if {[dict exists $clk_cell_cache $n]} { return [dict get $clk_cell_cache $n] }
+  set r 0
+  set lc [get_property $inst liberty_cell]
+  if {$lc ne "" && ![get_property $lc is_buffer] && ![get_property $lc is_inverter]} {
+    foreach op [get_pins -of_objects $inst] {
+      if {[get_property $op direction] eq "output" && [sta::is_clock $op]} { set r 1; break }
+    }
+  }
+  dict set clk_cell_cache $n $r
+  return $r
 }
 proc lib_cell_of {name} {
   set c [get_lib_cells -quiet */$name]
   if {[llength $c] == 0} { return "" }
   return [lindex $c 0]
 }
+# A swap's veto: 1 lets `inst` go from cell `from` to cell `to`. The
+# default allows every swap.
+array set eco_stat {}
+set hold_ft {}
+set hold_rounds 1
+set bulk_iters %(max_iter)d
+proc sens_fix {max_iter paths margin} {}
+# Hold: is a floor broken (the worst hold slack below hfloor), and which
+# hold paths broke it. Filter on each path's own slack: -slack_max misses
+# min paths under a set_min_delay exception.
+proc hold_bad {} {
+  global hfloor
+  return [expr {[whs] < $hfloor - 1e-6}]
+}
+proc hold_begin {} {}
+proc hold_bad_paths {} {
+  global hfloor hold_ft
+  set l {}
+  foreach pe [find_timing_paths -path_delay min {*}$hold_ft -group_path_count %(paths)d \
+                -endpoint_path_count 1 -sort_by_slack] {
+    if {[sta::time_sta_ui [$pe slack]] >= $hfloor - 1e-6} { continue }
+    lappend l $pe
+  }
+  return $l
+}
+proc eco_ok {inst from to} { return 1 }
+set recover_leak 0
+set ladder_cap_idx -1
+set escalate_idx -1
+set close_margin 0
 # Worst setup slack in the libraries' time unit (worst_slack_cmd is SI).
 proc wns {} { return [sta::time_sta_ui [sta::worst_slack_cmd max]] }
 proc whs {} { return [sta::time_sta_ui [sta::worst_slack_cmd min]] }
 proc move {inst dir} {
-  # One flavour step (dir +1 faster, -1 slower); returns the new cell name
-  # or "" when there is none.
+  # One flavour step (dir +1 faster, -1 slower) to the next flavour whose
+  # cell exists in the libraries (a ladder may have gaps: a cell family
+  # that lacks one flavour steps over it); returns the new cell name or ""
+  # when there is none.
   set ref [get_property $inst ref_name]
   set k [flav_index $ref]
   if {$k < 0} { return "" }
-  set k2 [expr {$k + $dir}]
-  if {$k2 < 0 || $k2 >= [llength $::flavours]} { return "" }
-  set n [flav_swap $ref $k2]
-  set lc [lib_cell_of $n]
-  if {$lc eq ""} { return "" }
-  replace_cell $inst $lc
-  return $n
+  for {set k2 [expr {$k + $dir}]} {$k2 >= 0 && $k2 < [llength $::flavours]} \
+      {incr k2 $dir} {
+    if {$dir > 0 && $::ladder_cap_idx >= 0 && $k2 > $::ladder_cap_idx} { return "" }
+    set n [flav_swap $ref $k2]
+    set lc [lib_cell_of $n]
+    if {$lc ne "" && [eco_ok $inst $ref $n]} {
+      replace_cell $inst $lc
+      return $n
+    }
+  }
+  return ""
 }
+%(hooks)s
+proc tns {} { return [total_negative_slack -max] }
+set tns_accept %(tns_accept)d
 set margin %(margin)s
 set rec [open %(record)s w]
 set t0 [clock milliseconds]
@@ -202,9 +318,11 @@ puts $rec "start [format %%.6f $wns0] [total_negative_slack -max] [format %%.6f 
 # loaded paths) is undone, and the loop stops. So is one that takes the
 # worst hold slack below its floor: faster cells shorten short paths too.
 set hfloor [expr {$whs0 < 0 ? $whs0 : 0}]
+hold_begin
 set frozen [dict create]
-for {set it 0} {$it < %(max_iter)d} {incr it} {
+for {set it 0} {$it < $bulk_iters} {incr it} {
   set w [wns]
+  set tn [tns]
   if {$w >= $margin} { break }
   set seen [dict create]
   foreach pe [find_timing_paths -path_delay max -group_path_count %(paths)d \
@@ -213,6 +331,7 @@ for {set it 0} {$it < %(max_iter)d} {incr it} {
       set inst [$pin instance]
       if {$inst eq "" || $inst eq "NULL"} { continue }
       if {[$inst liberty_cell] eq "NULL"} { continue }
+      if {[is_clock_cell $inst]} { continue }
       dict set seen [get_full_name $inst] $inst
     }
   }
@@ -225,13 +344,10 @@ for {set it 0} {$it < %(max_iter)d} {incr it} {
   }
   # Hold: the moved cells on hold paths below the floor go back and stay
   # put from then on; the rest of the iteration stands.
-  if {[llength $moved] > 0 && [whs] < $hfloor - 1e-6} {
+  for {set round 0} {$round < $hold_rounds && [llength $moved] > 0 &&
+                     [hold_bad]} {incr round} {
     set onhold [dict create]
-    # Filter on each path's own slack: -slack_max misses min paths under
-    # a set_min_delay exception.
-    foreach pe [find_timing_paths -path_delay min -group_path_count %(paths)d \
-                  -endpoint_path_count 1 -sort_by_slack] {
-      if {[sta::time_sta_ui [$pe slack]] >= $hfloor - 1e-6} { continue }
+    foreach pe [hold_bad_paths] {
       foreach pin [[$pe path] pins] {
         set inst [$pin instance]
         if {$inst eq "" || $inst eq "NULL"} { continue }
@@ -250,9 +366,18 @@ for {set it 0} {$it < %(max_iter)d} {incr it} {
   }
   set w2 [wns]
   set why ""
-  if {[llength $moved] > 0 && [whs] < $hfloor - 1e-6} { set why hold }
-  if {[llength $moved] > 0 && $why eq "" && $w2 <= $w + 1e-6} {
+  if {[llength $moved] > 0 && [hold_bad]} { set why hold }
+  # An iteration that does not improve the worst slack is undone.
+  if {[llength $moved] > 0 && $why eq "" && $w2 <= $w + 1e-6 &&
+      !($tns_accept && [tns] > $tn + 1e-6)} {
     set why setup
+  }
+  if {$why eq "hold"} {
+    set k 0
+    foreach pe [hold_bad_paths] {
+      puts $rec "holdbad [get_full_name [$pe pin]] [format %%.6f [sta::time_sta_ui [$pe slack]]]"
+      if {[incr k] >= 5} break
+    }
   }
   if {$why ne ""} {
     foreach m $moved { replace_cell [lindex $m 0] [lib_cell_of [lindex $m 2]] }
@@ -263,13 +388,20 @@ for {set it 0} {$it < %(max_iter)d} {incr it} {
   puts $rec "iter $it [format %%.6f $w] moved [llength $moved]"
   if {[llength $moved] == 0} { break }
 }
+sens_fix %(max_iter)d %(paths)d $margin
+# 1b. Closing pass (opt-in): lift the cap and fix what is still short.
+if {$escalate_idx >= 0 && [wns] < $close_margin - 1e-9} {
+  puts $rec "close [format %%.6f [wns]] [total_negative_slack -max]"
+  set ladder_cap_idx $escalate_idx
+  set frozen [dict create]
+  sens_fix %(max_iter)d %(paths)d $close_margin
+}
 set wns1 [wns]
 lap fixed
 puts $rec "fixed [format %%.6f $wns1] [total_negative_slack -max] [format %%.6f [whs]]"
 # 2. Recover, in batches: a batch of cells moves one step slower at once
 # and stays if the worst slack holds; else it is undone and halved. Timing
 # updates then scale with the cells that must stay fast, not with all.
-proc tns {} { return [total_negative_slack -max] }
 proc holds {floor tfloor} {
   if {[wns] < $floor - 1e-6} { return 0 }
   if {$tfloor ne "" && [tns] < $tfloor - 1e-6} { return 0 }
@@ -306,7 +438,13 @@ if {%(recover)d} {
   while {$changed} {
     set cand {}
     foreach inst [get_cells -hierarchical *] {
-      if {[flav_index [get_property $inst ref_name]] > 0} { lappend cand $inst }
+      if {[flav_index [get_property $inst ref_name]] > 0 && ![is_clock_cell $inst]} { lappend cand $inst }
+    }
+    if {$recover_leak} {
+      set keyed {}
+      foreach inst $cand { lappend keyed [list [leak_of [get_property $inst ref_name]] $inst] }
+      set cand {}
+      foreach kv [lsort -real -decreasing -index 0 $keyed] { lappend cand [lindex $kv 1] }
     }
     set changed 0
     for {set i 0} {$i < [llength $cand]} {incr i 256} {
@@ -316,6 +454,7 @@ if {%(recover)d} {
 }
 lap recovered
 puts $rec "end [format %%.6f [wns]] [total_negative_slack -max] [format %%.6f [whs]]"
+foreach {k v} [array get eco_stat] { puts $rec "stat $k $v" }
 close $rec
 write_verilog %(out)s
 set rec [open %(record)s a]
@@ -343,14 +482,21 @@ def swap(netlist: Path, top: str, out: Path, libs: Sequence[Path],
          image: str = ORFS_IMAGE, margin: float = 0.0,
          hold_libs: Sequence[Path] = (), both_libs: Sequence[Path] = (),
          hold_both_libs: Sequence[Path] = (),
-         rail_flavours: Optional[dict] = None) -> dict:
+         rail_flavours: Optional[dict] = None,
+         wire_model=None, wire_scales=None,
+         keep_clock_cells: bool = False) -> dict:
     """Swap flavours in `netlist` (see the module docstring); writes `out`
-    and returns the record. `margin` is the slack to keep, in the
-    libraries' time unit. With `hold_libs`, `libs` time setup only
+    and returns the record.
+    `margin` is the slack to keep, in the libraries' time unit. With `hold_libs`, `libs` time setup only
     (`read_liberty -max`) and `hold_libs`, the same cells at the hold
     corner, time hold (`-min`). `both_libs` (level shifters) serve both;
     with `hold_both_libs` (the shifters at the hold corner) they time setup
-    only and `hold_both_libs` time hold, like `libs` and `hold_libs`."""
+    only and `hold_both_libs` time hold, like `libs` and `hold_libs`.
+    `wire_model` (wire_model.WireModel) puts an expected wire on every net,
+    for the whole session: the fix and recovery steps size against it.
+    `wire_scales` ({"": Scale} or {"-max": setup, "-min": hold}, from
+    wire_scales()) scales it to the corners' wire RC."""
+    from . import wire_model as wire_mod
     out = Path(out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     hold_libs = [Path(l).resolve() for l in hold_libs]
@@ -358,14 +504,17 @@ def swap(netlist: Path, top: str, out: Path, libs: Sequence[Path],
     hold_both_libs = [Path(l).resolve() for l in hold_both_libs]
     files = [Path(netlist).resolve(), *(Path(l).resolve() for l in libs),
              *hold_libs, *both_libs, *hold_both_libs]
+    rc_files = sorted({Path(f).resolve() for f in
+                       (getattr(wire_scales, "files", None) or [])})
     flag = "-max " if hold_libs else ""
     both_flag = "-max " if hold_both_libs else ""
     # Setup libraries first: lib_cell_of takes the first library's cell,
     # and OpenSTA times min paths with the -min library's cell of that name.
-    reads = ("".join(f"read_liberty {flag}{Path(l).resolve()}\n" for l in libs)
-             + "".join(f"read_liberty -min {l}\n" for l in hold_libs)
-             + "".join(f"read_liberty {both_flag}{l}\n" for l in both_libs)
-             + "".join(f"read_liberty -min {l}\n" for l in hold_both_libs))
+    reads = ("".join(f"read_liberty {flag}{Path(l).resolve()}\n"
+                     for l in libs)
+             + "".join(f"read_liberty -min {l}\n" for l in hold_libs))
+    reads += ("".join(f"read_liberty {both_flag}{l}\n" for l in both_libs)
+              + "".join(f"read_liberty -min {l}\n" for l in hold_both_libs))
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         # The record goes beside the output, so a failed or killed run
@@ -378,7 +527,11 @@ def swap(netlist: Path, top: str, out: Path, libs: Sequence[Path],
             reads
             + f"read_verilog {files[0]}\nlink_design {top}\n"
             + f"read_sdc {sdc}\n"
-            + TCL % {"flavours": " ".join(tokens), "fre": flavour_re,
+            + (wire_mod.tcl(wire_model, str(td / "wire_model.spef"),
+                            dict(wire_scales) if wire_scales else None)
+               )
+            + TCL % {"hooks": "", "tns_accept": 0,
+                     "flavours": " ".join(tokens), "fre": flavour_re,
                      "rails": " ".join(
                          "{%s__} {{%s} {%s}}" % (
                              r, " ".join(f["tokens"]) if f else "",
@@ -386,13 +539,14 @@ def swap(netlist: Path, top: str, out: Path, libs: Sequence[Path],
                          for r, f in sorted((rail_flavours or {}).items())),
                      "record": record, "out": out, "paths": paths,
                      "max_iter": max_iter, "recover": int(recover),
-                     "margin": f"{margin:g}"}
+                     "margin": f"{margin:g}",
+                     "keep_clk": int(keep_clock_cells)}
             + "exit\n")
         local = os.environ.get("OPENSTA")
         if local:
             cmd = [local, "-no_init", "-no_splash", "-exit", str(tcl)]
         else:
-            mounts = sorted({str(f.parent) for f in files}
+            mounts = sorted({str(f.parent) for f in [*files, *rc_files]}
                             | {str(td), str(out.parent)})
             cmd = ["docker", "run", "--rm", "-u",
                    f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp",
@@ -411,6 +565,11 @@ def swap(netlist: Path, top: str, out: Path, libs: Sequence[Path],
                           + "\n".join(bad[:10]))
     res = {"start": None, "fixed": None, "end": None, "iterations": [],
            "up": [], "down": []}
+    if wire_model is not None:
+        res["wire_model"] = wire_model.to_dict()
+        if wire_scales:
+            res["wire_rc"] = {f or "all": f"{sc.corner} against {sc.ref}"
+                              for f, sc in wire_scales.items() if sc}
     for l in lines:
         w = l.split()
         if w[0] in ("start", "fixed", "end"):
@@ -429,6 +588,8 @@ def swap(netlist: Path, top: str, out: Path, libs: Sequence[Path],
             res["up"].append({"inst": w[2], "from": w[3], "to": w[4]})
         elif w[0] == "down":
             res["down"].append({"inst": w[1], "from": w[2], "to": w[3]})
+        elif w[0] == "stat":
+            res.setdefault("eco_stat", {})[w[1]] = int(w[2])
         elif w[0] == "time":
             res.setdefault("seconds", {})[w[1]] = float(w[2])
     # OpenSTA's write_verilog renames and merges nets; keep the original
@@ -533,14 +694,19 @@ def rail_flavour_counts(text: str, rail_flavours: dict) -> dict:
     return out
 
 
+def flavour_key(m) -> str:
+    """The ladder token of a flavour-regex match: its groups, "/"-joined."""
+    return "/".join(g or "" for g in m.groups())
+
+
 def flavour_counts(text: str, tokens: Sequence[str], flavour_re: str) -> dict:
     """{token: instances} of a netlist's cells whose name carries one."""
     fre = re.compile(flavour_re)
     counts = {t: 0 for t in tokens}
     for m in re.finditer(r"^\s*(\w+)\s+\\?\S+\s*\(", text, re.M):
         f = fre.search(m.group(1))
-        if f and f.group(1) in counts:
-            counts[f.group(1)] += 1
+        if f and flavour_key(f) in counts:
+            counts[flavour_key(f)] += 1
     return counts
 
 
@@ -565,6 +731,8 @@ def summary(res: dict) -> str:
 
 
 def _fmt_counts(c: dict) -> str:
+    if any("/" in k for k in c):         # a two-axis token: keep it readable
+        return " ".join(f"{k}={v}" for k, v in c.items())
     return "/".join(f"{k}{v}" for k, v in c.items())
 
 
@@ -577,6 +745,31 @@ def wanted(cfg) -> Optional[VtSwapSpec]:
     if spec is not None and spec.enabled:
         return spec
     return None
+
+
+class WireScales(dict):
+    """{flag: wire_rc.Scale} with the RC files the scales read."""
+    files: list = []
+
+
+def wire_scales(d, setup: Optional[str], hold: Optional[str]):
+    """The wire model's per-corner scaling for a session timing setup at
+    `setup` and (when not None) hold at `hold`: {"": s} or {"-max": s_setup,
+    "-min": s_hold}; None without a pack wire_rc / wire_model.rc_corner."""
+    from . import wire_rc as wire_rc_mod
+    wm, rc = d.wire_model, getattr(d, "wire_rc", None)
+    if wm is None or rc is None or wm.rc_corner is None:
+        return None
+    s = wire_rc_mod.scale(rc, setup, wm.rc_corner)
+    if s is None:
+        return None
+    out = WireScales({"": s} if hold is None else
+                     {"-max": s, "-min": wire_rc_mod.scale(rc, hold,
+                                                           wm.rc_corner)})
+    out.files = [e.path for c in (setup, hold, wm.rc_corner)
+                 if c is not None for e in [rc.at(c)]
+                 if e is not None and e.path is not None]
+    return out
 
 
 def run(cfg, spec: VtSwapSpec) -> dict:
@@ -608,19 +801,24 @@ def run(cfg, spec: VtSwapSpec) -> dict:
     paths = intent.write_mode_sdcs(cfg.out_dir / "vt_swap_sdc", [tight],
                                    d.top_module, d.time_unit, d.clock_port)
     sdc = Path(paths[tight.name]).read_text() + "".join(
-        f"set_false_path -from [get_ports {p}]\n" for p in spec.false_from)
+        f"set_false_path -from [get_ports {p}]\n" for p in spec.false_from
+    ) + false_to_sdc(spec.false_to)
     keep = cfg.synth_dir / f"{d.top_module}_preswap_openroad.v"
     keep.write_text(nl.read_text())
     out = cfg.synth_dir / f"{d.top_module}_vtswap_openroad.v"
     res = swap(keep, d.top_module, out, libs, fl["tokens"],
                fl["re"], sdc, spec.paths, spec.max_iter,
                spec.recover, margin=spec.margin_ps / unit_ps(d.time_unit),
-               hold_libs=hold_libs)
+               hold_libs=hold_libs, wire_model=d.wire_model,
+               wire_scales=wire_scales(d, prof.setup_corner,
+                                       hold if hold_libs else None),
+               keep_clock_cells=spec.keep_clock_cells)
     out.replace(nl)
     res.update({"mode": tight.name, "libs": [str(l) for l in libs],
                 "setup_corner": prof.setup_corner, "hold_corner": hold,
                 "hold_libs": [str(l) for l in hold_libs],
                 "false_from": list(spec.false_from),
+                "false_to": list(spec.false_to),
                 "unswapped_netlist": str(keep), "netlist": str(nl)})
     (cfg.out_dir / "vt_swap.json").write_text(json.dumps(res, indent=2)
                                               + "\n")
@@ -718,14 +916,17 @@ def run_power(cfg, spec: VtSwapSpec, power_summary: dict) -> dict:
     for k, m in enumerate(order):
         sdc_text = Path(sdcs[m.name]).read_text() + "".join(
             f"set_false_path -from [get_ports {p}]\n"
-            for p in spec.false_from)
+            for p in spec.false_from) + false_to_sdc(spec.false_to)
         out = work / f"{top}_chip_{k}_{m.name}.v"
         # The tightest mode fixes and recovers; each later mode only fixes
         # what the earlier passes left failing in it.
         res = swap(cur, top, out, libs, tokens, fre, sdc_text,
                    spec.paths, spec.max_iter, spec.recover and k == 0,
                    margin=margin, hold_libs=hold_libs, both_libs=ls_libs,
-                   hold_both_libs=ls_hold, rail_flavours=rail_fl_arg)
+                   hold_both_libs=ls_hold, rail_flavours=rail_fl_arg,
+                   wire_model=d.wire_model,
+                   wire_scales=wire_scales(d, corner,
+                                           hold if hold_libs else None))
         rec["modes"][m.name] = res
         print(f"[vt_swap] chip, mode {m.name}"
               + (" (fix only)" if k else "") + f": {summary(res)}")

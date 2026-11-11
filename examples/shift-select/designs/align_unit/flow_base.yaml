@@ -1,0 +1,9 @@
+# align_unit on ASAP7 RVT, shift_select off.
+design:
+  top_module: align_unit
+  clock_period_ps: 400
+  manifest: manifest.yaml
+pdk:
+  profile: ../../techpack.yaml
+modes:
+  func: func.sdc

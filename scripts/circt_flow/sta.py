@@ -494,6 +494,13 @@ class View:
     module: str = ""
     warnings: List[str] = field(default_factory=list)
     result: dict = field(default_factory=dict)
+    # wire_model.WireModel put on every net of the view, or None.
+    wire: Optional[object] = None
+    # wire_rc.Scale: the model scaled to the view's corner's wire RC, and
+    # the RC files that reads (mounted into the container); None / empty
+    # without a pack wire_rc and wire_model.rc_corner.
+    wire_scale: Optional[object] = None
+    rc_files: List[Path] = field(default_factory=list)
 
 
 # Worst hold slack by path class: register to register, from inputs, to
@@ -516,11 +523,15 @@ puts "hold out [circtflow_ws -to [all_outputs]]"
 
 
 def _tcl(v: View, run_dir: Path) -> Path:
+    from . import wire_model
     t = run_dir / f"{v.label}.tcl"
     t.write_text(
         "".join(f"read_liberty {l}\n" for l in v.libs)
         + f"read_verilog {v.netlist}\nlink_design {v.top}\n"
         f"read_sdc {v.sdc}\n"
+        + wire_model.tcl(v.wire, str(run_dir / f"{v.label}.wire.spef"),
+                         {"": v.wire_scale} if v.wire_scale else None)
+        +
         "puts \"CIRCTFLOW-BEGIN\"\n"
         "report_worst_slack -max -digits 4\n"
         "report_tns -max -digits 4\n"
@@ -601,7 +612,7 @@ def run_views(views: List[View], sta_dir: Path, image: str) -> None:
     else:
         mounts = {str(sta_dir.resolve())}
         for v in views:
-            for p in [*v.libs, v.netlist, v.sdc]:
+            for p in [*v.libs, v.netlist, v.sdc, *v.rc_files]:
                 mounts.add(str(Path(p).resolve().parent))
         # Parents cover children: mount the minimal set.
         ms = sorted(mounts)
@@ -719,11 +730,24 @@ def run(cfg, spec: StaSpec, power_summary: Optional[dict] = None) -> Path:
                               mode_names, corners, mode_sdc, top_ins,
                               top_outs, sta_dir, spec, nl)
 
+    from . import wire_rc as wire_rc_mod
+    wm = cfg.design.wire_model
+    rc = getattr(d, "wire_rc", None)
+    for v in views:
+        v.wire = wm
+        if wm is not None:
+            v.wire_scale = wire_rc_mod.scale(rc, v.corner, wm.rc_corner)
+            if v.wire_scale is not None:
+                v.rc_files = [e.path for e in (rc.at(v.corner),
+                                               rc.at(wm.rc_corner))
+                              if e is not None and e.path is not None]
     run_views(views, sta_dir, spec.image)
     hold = (prof.hold_corner if prof is not None and prof.corner_names
             else corners[0])
     summary = _summarize(cfg, views, corners, mode_names, sta_dir, hold)
     summary["boundary_budget"] = spec.boundary_budget
+    summary["wire_model"] = wm.to_dict() if wm is not None else None
+    summary["wire_rc"] = rc.to_dict() if rc is not None else None
     js = sta_dir / "summary.json"
     js.write_text(json.dumps(summary, indent=2) + "\n")
     for line in table(summary):

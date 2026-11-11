@@ -24,6 +24,7 @@ import subprocess
 from pathlib import Path
 from typing import Sequence
 
+from . import shiftselect
 from .config import FlowConfig
 
 
@@ -162,6 +163,17 @@ def gen_stubs(cfg: FlowConfig) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _multibit_option(cfg: FlowConfig) -> str:
+    """register-mapper's multibit= option: the pack's spec, resolved by the
+    flow config, written beside the other stage outputs; empty when off."""
+    mb = cfg.design.multibit
+    if mb is None:
+        return ""
+    from . import multibit
+    path = multibit.write(mb, Path(cfg.out_dir).resolve() / "multibit.json")
+    return f" multibit={path}"
+
+
 def structural_mapping(cfg: FlowConfig) -> Path:
     print(
         "[circt_flow] narrow-array-registers + register-legalize + "
@@ -231,6 +243,18 @@ def structural_mapping(cfg: FlowConfig) -> Path:
                             "enable-specialize-constant-inputs=true",
                             "--canonicalize", "--cse")])
               if os.environ.get("CIRCT_FLOW_SPECIALIZE_INPUTS") == "1" else []),
+            # CIRCT_FLOW_SHIFT_SELECT_EARLY=1: build the shift-select network
+            # from the still-intact priority mux chain of a `case` over a
+            # shift amount, BEFORE clock-gate-inference and the first
+            # canonicalization turn the word-level chain into per-bit enable
+            # chains and bit-level muxes that no later pass can see as one
+            # shifter.
+            # Uses CIRCT_FLOW_SHIFT_SELECT_{MIN_ARMS,WIDE,RECIPES}.
+            # `shift_select:` in the flow config sets the same options
+            # (shiftselect.py); the variables win.
+            *(["--map-shift-select=" + _ss.format(lib=cfg.design.lib)]
+              if (_ss := shiftselect.pass_options(cfg.design.shift_select, True))
+              else []),
             "--lower-firmem",
             "--narrow-array-registers",
             # Aggregate-typed firregs -> integer firregs with a packed constant
@@ -268,6 +292,10 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             # CIRCT_FLOW_CG_BITLEVEL=0 disables.
             + ("" if os.environ.get("CIRCT_FLOW_CG_BITLEVEL") == "0"
                else " bit-level-enables=true")
+            # clock_gating: (clockgating.py): gate merging by enable
+            # function, a savings test, a depth limit. Off unless the flow
+            # config opts in.
+            + (f" {cfg.design.clock_gating}" if cfg.design.clock_gating else "")
             # CIRCT_FLOW_CG_SELECT_DC=1: rewrite each gated bit-level part's
             # load-mux selects under the part's own enable (ClockGateInference
             # select-dont-care). A counter clear `mux(start, 0, q+1)` whose
@@ -381,7 +409,8 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             # timing for area deliberately.
             *(["--dedup-registers=enable-register-dedup=true"]
               if os.environ.get("CIRCT_FLOW_DEDUP_REGISTERS") == "1" else []),
-            f"--register-mapper=liberty={cfg.design.lib}",
+            f"--register-mapper=liberty={cfg.design.lib}"
+            + _multibit_option(cfg),
             # Must sit between register-mapper and outline-residual-logic.
             # A negedge-clocked register keeps its clock as a `!seq.clock`
             # right up until register-mapper swaps it for a real DFF cell
@@ -462,9 +491,30 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             # was the timing loss this lever was closed on.
             *([f"--map-compressor-cells=enable-compressor-cells=true "
                f"liberty={cfg.design.lib}"
+               + (f" min-width={os.environ['CIRCT_FLOW_MUL_CELLS_MIN_WIDTH']}"
+                  if os.environ.get("CIRCT_FLOW_MUL_CELLS_MIN_WIDTH") else "")
+               + (" merge-adds=true"
+                  if os.environ.get("CIRCT_FLOW_MUL_CELLS_MERGE") == "1" else "")
+               + (" flatten-adds=true"
+                  + (" flatten-gated=false"
+                     if os.environ.get("CIRCT_FLOW_MUL_CELLS_FLATTEN_GATED") == "0" else "")
+                  if os.environ.get("CIRCT_FLOW_MUL_CELLS_FLATTEN") == "1" else "")
                + (" prefix-final-adder=true"
                   if os.environ.get("CIRCT_FLOW_MUL_CELLS_PREFIX") == "1" else "")]
               if os.environ.get("CIRCT_FLOW_MUL_CELLS") == "1" else []),
+            # CIRCT_FLOW_ADD_CARRY_IN=1: a + b + zext(c), the conditional-
+            # invert add/subtract form, becomes one {a,1} + {b,c} add so the
+            # architecture below applies to ONE carry-propagate add.
+            # CombToSynth otherwise lowers the three-operand add as two
+            # serial adds (an incrementer, then the adder) and drops the
+            # architecture attribute. OFF by default (project convention).
+            *(["--lower-carry-in-adds=enable=true"]
+              if os.environ.get("CIRCT_FLOW_ADD_CARRY_IN") == "1" else []),
+            # CIRCT_FLOW_BARREL_SHIFT=1: variable shifts become log2(width)
+            # stages of 2:1 muxes (CombToSynth builds a mux tree over every
+            # shifted copy: ~width^2 mux bits, same depth).
+            *(["--lower-barrel-shifts=enable=true"]
+              if os.environ.get("CIRCT_FLOW_BARREL_SHIFT") == "1" else []),
             *([f"--set-adder-arch=arch={os.environ.get('CIRCT_FLOW_ADDER_ARCH', 'BRENT-KUNG')}"]
               if os.environ.get("CIRCT_FLOW_ADDER_ARCH", "BRENT-KUNG") != "none" else []),
             # CIRCT_FLOW_ADDER_CELLS=<min-width>: lower comb.add at or above
@@ -477,8 +527,37 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             # is gone before the arch attribute matters. Unset = off.
             *([f"--map-adder-chains=liberty={cfg.design.lib} "
                f"enable-adder-chains=true "
-               f"min-width={os.environ['CIRCT_FLOW_ADDER_CELLS']}"]
+               f"min-width={os.environ['CIRCT_FLOW_ADDER_CELLS']}"
+               + (f" max-width={os.environ['CIRCT_FLOW_ADDER_CELLS_MAX']}"
+                  if os.environ.get("CIRCT_FLOW_ADDER_CELLS_MAX") else "")
+               # CIRCT_FLOW_ADDER_CELLS_INCREMENTS=0: leave `x + 1` (and the
+               # negate it comes from) to the logic mapper instead of an
+               # INV + half-adder ripple.
+               + (" increments=false"
+                  if os.environ.get("CIRCT_FLOW_ADDER_CELLS_INCREMENTS") == "0" else "")]
               if os.environ.get("CIRCT_FLOW_ADDER_CELLS") else []),
+            # CIRCT_FLOW_PREFIX_ADDERS=<min-width>: every comb.add (a+b,
+            # a+b+zext(c), a+b+1) at or above that width is built here as a
+            # parallel-prefix network of library cells, so ABC (whose
+            # scorr/dc2/&deepsyn fold a prefix adder back into a near-ripple
+            # chain) maps only the logic around it. CIRCT_FLOW_PREFIX_ARCH =
+            # SKLANSKEY (default) | KOGGE-STONE | HAN-CARLSON | BRENT-KUNG |
+            # attr (each op's synth.test.arch); CIRCT_FLOW_PREFIX_MAX_WIDTH
+            # bounds the range. OFF by default (project convention).
+            *([f"--map-prefix-adders=enable-prefix-adders=true "
+               f"liberty={cfg.design.lib} "
+               f"min-width={os.environ['CIRCT_FLOW_PREFIX_ADDERS']} "
+               f"max-width={os.environ.get('CIRCT_FLOW_PREFIX_MAX_WIDTH', '0')} "
+               f"arch={os.environ.get('CIRCT_FLOW_PREFIX_ARCH', 'SKLANSKEY')}"]
+              if os.environ.get("CIRCT_FLOW_PREFIX_ADDERS") else []),
+            # CIRCT_FLOW_SHIFT_SELECT=1: a decoded one-hot select over shifted
+            # copies of one word (decode-mux-chains' output for a `case` on a
+            # shift amount) becomes a radix-r AND-OR network of cells that ABC
+            # cannot turn back into a switching-heavy 2:1 mux ladder.
+            # CIRCT_FLOW_SHIFT_SELECT_MIN_ARMS / _RADIX tune it. OFF by default.
+            *(["--map-shift-select=" + _ss.format(lib=cfg.design.lib)]
+              if (_ss := shiftselect.pass_options(cfg.design.shift_select, False))
+              else []),
             "--canonicalize",
             f"--structural-mapper=liberty={cfg.design.lib}",
             "--cse",
@@ -595,12 +674,17 @@ def _abc_bridge_opt(cfg: FlowConfig, extra: str = "") -> str:
     # long tail of needlessly deep paths). Unset = upstream behaviour.
     if os.environ.get("CIRCT_FLOW_NF_RELAX"):
         opt += f" nf-relax-per-output={os.environ['CIRCT_FLOW_NF_RELAX']}"
-    # CIRCT_FLOW_DEEPSYN_SEC: &deepsyn's CPU-second budget (default 10).
-    # It is PER ABC RUN, so it must be scaled when the partition count
-    # changes -- 32 partitions at -T 10 give the design 320 CPU-seconds of
-    # restructuring, one partition at -T 10 gives it 10. Comparing partition
-    # counts without scaling this compares optimisation budgets, not
-    # partitioning. On ibex (one residual) -T 600 gave a measurable win.
+    # &deepsyn is bounded by -J steps without improvement (option
+    # deepsyn-no-improve, default 3; CIRCT_FLOW_DEEPSYN_J=<n>): deterministic,
+    # the result depends on the input and the seed only. There is NO
+    # wall-clock limit by default. CIRCT_FLOW_DEEPSYN_SEC=<n> adds `-T n`, a
+    # WALL-CLOCK limit per chain (opt-in; a loaded machine then gives another
+    # netlist) -- kept to reproduce old measurements. The work is PER ABC RUN
+    # (per partition), so it must be scaled when the partition count
+    # changes: comparing partition counts without scaling compares
+    # optimisation budgets, not partitioning.
+    if os.environ.get("CIRCT_FLOW_DEEPSYN_J"):
+        opt += f" deepsyn-no-improve={os.environ['CIRCT_FLOW_DEEPSYN_J']}"
     if os.environ.get("CIRCT_FLOW_DEEPSYN_SEC"):
         opt += f" deepsyn-time-sec={os.environ['CIRCT_FLOW_DEEPSYN_SEC']}"
     if getattr(cfg, "abc_read_lib_args", None):
@@ -959,6 +1043,10 @@ def opensta_compat_netlist(cfg: FlowConfig) -> Path | None:
     print(f"[circt_flow] split {n_split} initialized wire declarations into decl + assign")
     cfg.openroad_netlist.write_text(stripped)
     print(f"[circt_flow] OpenSTA-compatible netlist -> {cfg.openroad_netlist}")
+    from . import orfs_pnr as _pnr
+    warn = _pnr.untied_constants_warning(stripped, cfg.design.tie)
+    if warn:
+        print(f"[circt_flow] {warn}")
     return cfg.openroad_netlist
 
 
@@ -1011,8 +1099,33 @@ def orfs_pnr(cfg: FlowConfig) -> Path:
         argv += ["--no-vt-swap"]
     for pat in p.get("dont_use") or []:
         argv += ["--dont-use", str(pat)]
+    # Clock tree and repair controls. The pack's `pnr:` may declare its own
+    # clock buffers (`cts_buffers`, the only place cell names live); a
+    # flow.yaml value wins over the pack's.
+    def pick(key):
+        return p[key] if key in p else cfg.design.pack_pnr.get(key)
+    for cell in pick("cts_buffers") or []:
+        argv += ["--cts-buffer", str(cell)]
+    for key, flag in (("cts_cluster_size", "--cts-cluster-size"),
+                      ("cts_cluster_diameter", "--cts-cluster-diameter"),
+                      ("hold_margin", "--hold-margin"),
+                      ("setup_margin", "--setup-margin")):
+        if pick(key) is not None:
+            argv += [flag, str(pick(key))]
+    for arg in pick("cts_args") or []:
+        argv += ["--cts-arg", str(arg)]
     if "orfs_platform_dir" in cfg.design.pack_pnr:
         argv += ["--platform-dir", str(cfg.design.pack_pnr["orfs_platform_dir"])]
+    # The pack's wire RC at the setup corner replaces the platform's
+    # setRC.tcl (wire_rc.py); an inline (public pack) entry is written out.
+    rc = getattr(cfg.design, "wire_rc", None)
+    entry = rc.at(cfg.design.wire_rc_setup) if rc is not None else None
+    if entry is not None:
+        from . import wire_rc as wire_rc_mod
+        src = entry.path if entry.path is not None else \
+            wire_rc_mod.write_openroad_tcl(
+                entry, cfg.pnr_dir.resolve() / "wire_rc_inline.tcl")
+        argv += ["--wire-rc", str(src)]
     print(f"[circt_flow] ORFS P&R -> {cfg.pnr_dir}")
     rc = pnr_mod.main(argv)
     if rc != 0:
@@ -1054,9 +1167,15 @@ def pack_pnr(cfg: FlowConfig) -> Path:
            "--pack", str(cfg.design.pack_root)]
     log = out / "pnr.log"
     print(f"[circt_flow] tech pack P&R: {cmd[0]} -> {log}")
+    # The pack's wire RC: CIRCT_FLOW_WIRE_RC (setup corner) and
+    # CIRCT_FLOW_WIRE_RC_<CORNER> (wire_rc.pnr_env).
+    from . import wire_rc as wire_rc_mod
+    env = {**os.environ, **wire_rc_mod.pnr_env(
+        getattr(cfg.design, "wire_rc", None),
+        getattr(cfg.design, "wire_rc_setup", None), out)}
     with open(log, "w") as fh:
         rc = subprocess.run(cmd, cwd=cfg.design.pack_root, stdout=fh,
-                            stderr=subprocess.STDOUT).returncode
+                            stderr=subprocess.STDOUT, env=env).returncode
     metrics = (json.loads(metrics_path.read_text())
                if metrics_path.exists() else {})
     unknown = sorted(set(metrics) - set(pnr_mod.METRICS) - {"status"})

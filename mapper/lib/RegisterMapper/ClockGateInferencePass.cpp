@@ -128,14 +128,18 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
+#include <functional>
 #include <map>
 #include <optional>
 #include <tuple>
+#include <vector>
 
 using namespace mlir;
 using namespace circt;
@@ -196,14 +200,161 @@ struct EnableKey {
                                    // position so operand ORDER doesn't
                                    // affect equality/hashing, only the
                                    // multiset does.
+  // `merge-equivalent-enables`: the enable's function as a reduced ordered
+  // BDD node over the module's opaque leaf values (see BoolBdd); -1 when
+  // the option is off or the BDD budget ran out. Two keys that both carry
+  // one are equal exactly when the functions are.
+  int bdd = -1;
 
-  bool operator==(const EnableKey &other) const {
+  bool sameStructure(const EnableKey &other) const {
     if (kind != other.kind)
       return false;
     if (kind == 0)
       return value == other.value;
     return twoState == other.twoState && operands == other.operands;
   }
+  bool operator==(const EnableKey &other) const {
+    if (bdd >= 0 && other.bdd >= 0)
+      return bdd == other.bdd;
+    return sameStructure(other);
+  }
+};
+
+// A small reduced ordered BDD over i1 values, used to decide logical
+// equivalence of clock-gate enables (and tautology: an enable that is 1 on
+// every cycle gates nothing). The leaves are values that are not an i1
+// and/or/xor/mux/constant (a flop, a port, a comparator, ...), each a free
+// variable numbered in order of first appearance in this module, so two
+// enables built from the same leaves compare equal exactly when they are
+// the same Boolean function of them; that is a sound (never a false merge)
+// and cheap notion of equivalence: it does not look through the leaves.
+// Node count is capped; past it every query answers "unknown" (-1).
+class BoolBdd {
+public:
+  static constexpr int kFalse = 0, kTrue = 1;
+  explicit BoolBdd(size_t maxNodes = 200000) : limit(maxNodes) {
+    nodes.push_back({~0u, 0, 0});
+    nodes.push_back({~0u, 1, 1});
+  }
+  bool overflowed() const { return overflow; }
+
+  // Node of the i1 value `v`, or -1 when the budget is exceeded.
+  int fromValue(Value v, unsigned fuel = 96) {
+    if (overflow)
+      return -1;
+    auto it = memo.find(v);
+    if (it != memo.end())
+      return it->second;
+    int r = build(v, fuel);
+    if (overflow)
+      return -1;
+    return memo[v] = r;
+  }
+  int var(Value v) {
+    auto it = varOf.find(v);
+    unsigned idx;
+    if (it == varOf.end()) {
+      idx = varOf.size();
+      varOf[v] = idx;
+    } else {
+      idx = it->second;
+    }
+    return mk(idx, kFalse, kTrue);
+  }
+  int andOp(int a, int b) { return ite(a, b, kFalse); }
+  int orOp(int a, int b) { return ite(a, kTrue, b); }
+  int notOp(int a) { return ite(a, kFalse, kTrue); }
+  int xorOp(int a, int b) { return ite(a, notOp(b), b); }
+  int ite(int f, int g, int h) {
+    if (overflow)
+      return kFalse;
+    if (f == kTrue)
+      return g;
+    if (f == kFalse)
+      return h;
+    if (g == h)
+      return g;
+    if (g == kTrue && h == kFalse)
+      return f;
+    auto key = std::make_tuple(f, g, h);
+    auto it = iteMemo.find(key);
+    if (it != iteMemo.end())
+      return it->second;
+    unsigned top = std::min({nodes[f].var, nodes[g].var, nodes[h].var});
+    auto cof = [&](int n, bool hi) {
+      return nodes[n].var == top ? (hi ? nodes[n].hi : nodes[n].lo) : n;
+    };
+    int hi = ite(cof(f, true), cof(g, true), cof(h, true));
+    int lo = ite(cof(f, false), cof(g, false), cof(h, false));
+    int r = mk(top, lo, hi);
+    iteMemo[key] = r;
+    return r;
+  }
+
+private:
+  struct Node {
+    unsigned var;
+    int lo, hi;
+  };
+  int mk(unsigned var, int lo, int hi) {
+    if (lo == hi)
+      return lo;
+    auto key = std::make_tuple(var, lo, hi);
+    auto it = unique.find(key);
+    if (it != unique.end())
+      return it->second;
+    if (nodes.size() >= limit) {
+      overflow = true;
+      return kFalse;
+    }
+    nodes.push_back({var, lo, hi});
+    return unique[key] = nodes.size() - 1;
+  }
+  static bool isI1(Value v) {
+    auto t = dyn_cast<IntegerType>(v.getType());
+    return t && t.getWidth() == 1;
+  }
+  int build(Value v, unsigned fuel) {
+    if (!fuel || !isI1(v))
+      return var(v);
+    Operation *op = v.getDefiningOp();
+    if (!op)
+      return var(v);
+    if (auto c = dyn_cast<hw::ConstantOp>(op))
+      return c.getValue().isZero() ? kFalse : kTrue;
+    auto sub = [&](Value x) { return fromValue(x, fuel - 1); };
+    if (auto a = dyn_cast<comb::AndOp>(op)) {
+      int r = kTrue;
+      for (Value x : a.getInputs())
+        r = andOp(r, sub(x));
+      return r;
+    }
+    if (auto o = dyn_cast<comb::OrOp>(op)) {
+      int r = kFalse;
+      for (Value x : o.getInputs())
+        r = orOp(r, sub(x));
+      return r;
+    }
+    if (auto x = dyn_cast<comb::XorOp>(op)) {
+      int r = kFalse;
+      for (Value i : x.getInputs())
+        r = xorOp(r, sub(i));
+      return r;
+    }
+    if (auto m = dyn_cast<comb::MuxOp>(op))
+      if (isI1(m.getTrueValue()) && isI1(m.getFalseValue()))
+        return ite(sub(m.getCond()), sub(m.getTrueValue()),
+                   sub(m.getFalseValue()));
+    return var(v);
+  }
+
+  size_t limit;
+  bool overflow = false;
+  std::vector<Node> nodes;
+  std::map<std::tuple<unsigned, int, int>, int> unique;
+  std::map<std::tuple<int, int, int>, int> iteMemo;
+  llvm::DenseMap<Value, int> memo;
+  llvm::DenseMap<Value, unsigned> varOf;
 };
 
 // Recursively flattens same-kind (OpTy), same-`twoState` associative
@@ -260,6 +411,9 @@ struct EnableGroup {
   // Bit-level parts (plan index, part index) sharing this enable.
   SmallVector<std::pair<unsigned, unsigned>, 4> bitMembers;
   Value gatedClock; // set once the group is accepted and its ICG built
+  // The enable is the constant 1 (merge-equivalent-enables found it a
+  // tautology): the group's registers load every cycle, so no gate.
+  bool always = false;
 };
 
 //===----------------------------------------------------------------------===//
@@ -751,6 +905,7 @@ struct BitPart {
   Value clock;                    // group identity: (clock, groupIdx)
   unsigned groupIdx = 0;
   bool gated = false;             // decided once group widths are known
+  int bdd = -1;                   // merge-equivalent-enables: en's BDD node
   Value next;                     // materialized when gated
 };
 
@@ -781,6 +936,13 @@ struct ClockGateInferencePass
     bitLevelMaxWidth = other.bitLevelMaxWidth.getValue();
     verifyWithMux = other.verifyWithMux.getValue();
     selectDontCare = other.selectDontCare.getValue();
+    mergeEquivalentEnables = other.mergeEquivalentEnables.getValue();
+    minGateBits = other.minGateBits.getValue();
+    gateCostBits = other.gateCostBits.getValue();
+    gateIdleFraction = other.gateIdleFraction.getValue();
+    enableOpCostBits = other.enableOpCostBits.getValue();
+    holdMuxBits = other.holdMuxBits.getValue();
+    maxGateDepth = other.maxGateDepth.getValue();
   }
 
   StringRef getArgument() const final { return "clock-gate-inference"; }
@@ -862,6 +1024,56 @@ struct ClockGateInferencePass
                       "the part's enable (see simplifyLoad). OFF by default."),
       llvm::cl::init(false)};
 
+  // Opt-in clock-network economy levers (all OFF/0 by default: identical
+  // output to a run without them). A tech pack or flow config declares the
+  // numbers; nothing here names a cell.
+  Option<bool> mergeEquivalentEnables{
+      *this, "merge-equivalent-enables",
+      llvm::cl::desc("Share one clock gate between groups whose enables are "
+                      "the same Boolean function of the same leaf signals "
+                      "(checked with a BDD, not just operand multisets), "
+                      "and do not gate a group whose enable is a tautology "
+                      "(a gate that is always on). OFF by default."),
+      llvm::cl::init(false)};
+  Option<unsigned> minGateBits{
+      *this, "min-gate-bits",
+      llvm::cl::desc("Do not gate a group of fewer than this many register "
+                      "bits (its flops keep the hold-mux); stacks with "
+                      "min-group-width, the larger wins. 0: off."),
+      llvm::cl::init(0)};
+  Option<double> gateCostBits{
+      *this, "gate-cost-bits",
+      llvm::cl::desc("Estimated-savings test: the cost of one clock gate "
+                      "(its own clock pin, internal power and output wire) "
+                      "in units of one flop bit's clock-pin power. A group "
+                      "is gated only when bits * (gate-idle-fraction + "
+                      "hold-mux-bits) >= gate-cost-bits + enable-op-cost-"
+                      "bits * (new enable cells). 0: test off."),
+      llvm::cl::init(0.0)};
+  Option<double> gateIdleFraction{
+      *this, "gate-idle-fraction",
+      llvm::cl::desc("Assumed fraction of cycles a gated group is idle "
+                      "(used by gate-cost-bits)"),
+      llvm::cl::init(0.5)};
+  Option<double> enableOpCostBits{
+      *this, "enable-op-cost-bits",
+      llvm::cl::desc("Cost in flop-clock-pin units of each cell of a "
+                      "synthesized (bit-level) enable (used by "
+                      "gate-cost-bits)"),
+      llvm::cl::init(0.0)};
+  Option<double> holdMuxBits{
+      *this, "hold-mux-bits",
+      llvm::cl::desc("Saving per gated bit from deleting its hold-mux, in "
+                      "flop-clock-pin units (used by gate-cost-bits)"),
+      llvm::cl::init(0.0)};
+  Option<unsigned> maxGateDepth{
+      *this, "max-gate-depth",
+      llvm::cl::desc("Most clock gates in series on a register's clock "
+                      "path: a group whose clock already comes through "
+                      "this many gates (RTL-instantiated ones included) "
+                      "is not gated. 0: unlimited."),
+      llvm::cl::init(0)};
+
   hw::HWModuleExternOp getOrCreateIcgExternDecl(ModuleOp topModule,
                                                  const ICGCellPattern &cell) {
     if (icgExternDecl)
@@ -930,6 +1142,78 @@ struct ClockGateInferencePass
     llvm::DenseMap<Value, Value> rebuilt;
     BitLevelAnalyzer bitLevel;
     SmallVector<BitPlan, 8> plans;
+    // merge-equivalent-enables state (idle unless the option is on).
+    BoolBdd bdd;
+    size_t numMergedByEquivalence = 0, numTautologyGroups = 0;
+    size_t numBelowThreshold = 0, numNotWorthIt = 0, numTooDeep = 0;
+    // The BDD node of a DNF over the literals' values; -1: unknown.
+    auto dnfBdd = [&](const Dnf &d) -> int {
+      int r = BoolBdd::kFalse;
+      for (const Cube &c : d.cubes) {
+        int term = BoolBdd::kTrue;
+        for (const BitLit &l : c) {
+          int x = bdd.fromValue(l.v);
+          if (x < 0)
+            return -1;
+          term = bdd.andOp(term, l.neg ? bdd.notOp(x) : x);
+        }
+        r = bdd.orOp(r, term);
+      }
+      return bdd.overflowed() ? -1 : r;
+    };
+    // Clock gates in series ahead of a clock: an instance shaped like the
+    // pack's ICG (the pin names the liberty search found) counts one, and
+    // so does each such instance feeding its clock pin. A clock is a
+    // seq.to_clock of an i1, and a gate's clock pin is usually that i1
+    // itself (an RTL gate's output wired straight to the next gate's CK) or
+    // a seq.from_clock of a clock. RTL-instantiated gates are found this way.
+    llvm::DenseMap<Value, unsigned> depthMemo;
+    std::function<unsigned(Value)> depthOfI1 = [&](Value v) -> unsigned {
+      auto it = depthMemo.find(v);
+      if (it != depthMemo.end())
+        return it->second;
+      unsigned d = 0;
+      if (auto from = v.getDefiningOp<seq::FromClockOp>()) {
+        if (auto to = from.getInput().getDefiningOp<seq::ToClockOp>())
+          d = depthOfI1(to.getInput());
+      } else if (auto inst = v.getDefiningOp<hw::InstanceOp>()) {
+        auto names = [](ArrayAttr a) {
+          SmallVector<StringRef> n;
+          for (Attribute x : a)
+            n.push_back(cast<StringAttr>(x).getValue());
+          return n;
+        };
+        auto in = names(inst.getArgNames());
+        auto out = names(inst.getResultNames());
+        if (in.size() == 3 && out.size() == 1 && out[0] == icgCell.outputPin &&
+            llvm::is_contained(in, StringRef(icgCell.clockPin)) &&
+            llvm::is_contained(in, StringRef(icgCell.enablePin)) &&
+            llvm::is_contained(in, StringRef(icgCell.scanEnablePin)))
+          for (auto [name, operand] : llvm::zip(in, inst.getOperands()))
+            if (name == icgCell.clockPin)
+              d = 1 + depthOfI1(operand);
+      }
+      return depthMemo[v] = d;
+    };
+    auto clockDepth = [&](Value clock) -> unsigned {
+      if (auto to = clock.getDefiningOp<seq::ToClockOp>())
+        return depthOfI1(to.getInput());
+      return 0;
+    };
+    // Cells of a synthesized enable: and/or/xor/mux ops of its cone.
+    auto enableOps = [&](Value root) {
+      SmallPtrSet<Operation *, 32> seen;
+      SmallVector<Value, 16> work{root};
+      while (!work.empty() && seen.size() < 256) {
+        Operation *op = work.pop_back_val().getDefiningOp();
+        if (!op || !isa<comb::AndOp, comb::OrOp, comb::XorOp, comb::MuxOp>(op) ||
+            !seen.insert(op).second)
+          continue;
+        for (Value x : op->getOperands())
+          work.push_back(x);
+      }
+      return seen.size();
+    };
 
     // Index, never a pointer: `groupsByClock` is a MapVector whose value
     // type is a SmallVector, so inserting a later clock reallocates the
@@ -939,11 +1223,17 @@ struct ClockGateInferencePass
     // another register's replacement value, of another width.
     auto findOrCreateGroup = [&](Value clock, Value enable) -> unsigned {
       EnableKey key = canonicalizeEnable(enable);
+      if (mergeEquivalentEnables)
+        key.bdd = bdd.fromValue(enable);
       SmallVector<EnableGroup, 4> &clockGroups = groupsByClock[clock];
       for (auto [i, g] : llvm::enumerate(clockGroups))
-        if (g.key == key)
+        if (g.key == key) {
+          if (!g.key.sameStructure(key))
+            ++numMergedByEquivalence;
           return i;
+        }
       clockGroups.push_back(EnableGroup{key, enable, {}, {}, Value()});
+      clockGroups.back().always = key.bdd == BoolBdd::kTrue;
       return clockGroups.size() - 1;
     };
 
@@ -971,9 +1261,17 @@ struct ClockGateInferencePass
           plan.ungated.push_back(b);
           continue;
         }
+        int resBdd = mergeEquivalentEnables ? dnfBdd(res.en) : -1;
+        if (resBdd == BoolBdd::kTrue) {
+          // A tautology the DNF's absorption cannot see (the cubes of a
+          // mux tree in which every leg loads): never holds, no gate.
+          ++numTautologyGroups;
+          plan.ungated.push_back(b);
+          continue;
+        }
         BitPart *part = nullptr;
         for (BitPart &p : plan.parts)
-          if (p.en == res.en) {
+          if (p.en == res.en || (resBdd >= 0 && p.bdd == resBdd)) {
             part = &p;
             break;
           }
@@ -981,6 +1279,7 @@ struct ClockGateInferencePass
           plan.parts.push_back(BitPart());
           part = &plan.parts.back();
           part->en = res.en;
+          part->bdd = resBdd;
         }
         part->bits.push_back(b);
         part->loads.push_back(res.load);
@@ -1085,6 +1384,28 @@ struct ClockGateInferencePass
           totalWidth += plans[pi].parts[part].bits.size();
         if (totalWidth < minGroupWidth)
           continue;
+        if (group.always) {
+          ++numTautologyGroups;
+          continue;
+        }
+        if (totalWidth < minGateBits) {
+          ++numBelowThreshold;
+          continue;
+        }
+        if (maxGateDepth && clockDepth(clock) >= maxGateDepth) {
+          ++numTooDeep;
+          continue;
+        }
+        if (gateCostBits > 0) {
+          double ops = group.members.empty() ? enableOps(group.representativeEnable)
+                                             : 0;
+          double saving =
+              totalWidth * (gateIdleFraction + holdMuxBits);
+          if (saving < gateCostBits + enableOpCostBits * ops) {
+            ++numNotWorthIt;
+            continue;
+          }
+        }
 
         hw::HWModuleExternOp icgDecl =
             getOrCreateIcgExternDecl(topModule, icgCell);
@@ -1284,6 +1605,15 @@ struct ClockGateInferencePass
                                          " load select(s) rewritten").str()
                                       : std::string())
                    << "\n";
+    if (mergeEquivalentEnables || minGateBits || gateCostBits > 0 || maxGateDepth)
+      llvm::errs() << "[clock-gate-inference] " << module.getModuleName()
+                   << ": " << numMergedByEquivalence
+                   << " group(s) merged by enable equivalence, "
+                   << numTautologyGroups << " always-on enable(s) left "
+                   << "ungated, " << numBelowThreshold
+                   << " below min-gate-bits, " << numNotWorthIt
+                   << " failing the savings test, " << numTooDeep
+                   << " over max-gate-depth\n";
     return {numFirregsGated, numGroupsGated};
   }
 

@@ -1,0 +1,20 @@
+{
+  "default_family": "a",
+  "cross_register": true,
+  "overrides": [ {"reg": "^hot_", "family": "b"} ],
+  "families": {
+    "a": {
+      "clear": {"cell": "TMB{n}CLR_A", "widths": [2, 8, 4],
+                "clock": "CK", "reset": "R", "data": "D{i}", "out": "Q{i}",
+                "tie": {"SE": 0, "SI": 0}},
+      "none":  {"cell": "TMB{n}NRS_A", "widths": [8, 4, 2],
+                "clock": "CK", "data": "D{i}", "out": "Q{i}",
+                "tie": {"SE": 0, "SI": "last_q"}}
+    },
+    "b": {
+      "clear": {"cell": "TMB{n}CLR_B", "widths": [4, 2],
+                "clock": "CK", "reset": "R", "data": "D{i}", "out": "Q{i}",
+                "tie": {"SE": 0, "SI": 0}}
+    }
+  }
+}

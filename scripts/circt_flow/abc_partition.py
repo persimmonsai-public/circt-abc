@@ -203,11 +203,12 @@ def verify_against_serial(grouped: Path, results: Sequence[PartResult],
     exactly. (Partitioned-vs-unpartitioned is a different question, and they
     legitimately differ -- ABC optimises a different scope.)
 
-    Only meaningful with a DETERMINISTIC recipe. The shipped default carries
-    `&deepsyn -T 10`, a CPU-time budget, so two runs of the identical input
-    differ purely with machine load and this check reports a difference that
-    says nothing about the parallelism. Pass `abc_script_file=` pointing at a
-    convergent recipe (`-T 0`) before reading anything into a mismatch."""
+    Only meaningful with a DETERMINISTIC recipe. The shipped default is
+    bounded by `&deepsyn -J` (steps without improvement) and has no wall-clock
+    `-T`, so it qualifies; a recipe that passes `-T` (or the opt-in
+    `deepsyn-time-sec`) does not: two runs of the identical input then differ
+    with machine load and this check would report a difference that says
+    nothing about the parallelism."""
     serial = workdir / "serial"
     serial.mkdir(parents=True, exist_ok=True)
     for r in results:

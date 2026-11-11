@@ -53,6 +53,7 @@ struct MapAdderChainsPass
     libertyPath = o.libertyPath.getValue();
     enablePass = o.enablePass.getValue();
     minWidth = o.minWidth.getValue();
+    maxWidth = o.maxWidth.getValue();
   }
 
   Option<std::string> libertyPath{
@@ -66,6 +67,10 @@ struct MapAdderChainsPass
   Option<unsigned> minWidth{
       *this, "min-width", llvm::cl::init(8),
       llvm::cl::desc("only lower comb.add at or above this operand width")};
+  Option<unsigned> maxWidth{
+      *this, "max-width", llvm::cl::init(0),
+      llvm::cl::desc("only lower comb.add at or below this operand width "
+                     "(0 = no bound): short ripple chains only")};
   Option<bool> lowerIncrements{
       *this, "increments", llvm::cl::init(true),
       llvm::cl::desc("also lower `x + 1` into an INV + half-adder chain "
@@ -198,7 +203,8 @@ struct MapAdderChainsPass
         if (add.getNumOperands() != 2)
           return; // variadic adds are lowered to pairs upstream
         auto ty = dyn_cast<IntegerType>(add.getType());
-        if (!ty || ty.getWidth() < minWidth.getValue())
+        if (!ty || ty.getWidth() < minWidth.getValue() ||
+            (maxWidth.getValue() && ty.getWidth() > maxWidth.getValue()))
           return;
         // A constant operand is an increment, not a two-addend carry chain.
         // `x + 1` still has a real carry chain -- and it is exactly a chain of

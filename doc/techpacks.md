@@ -581,13 +581,233 @@ limit and, per module, the cell used. A flat run (`pdk.rail:`, or the
 default rail) reads the spec from that rail. `techpack check` prints each
 rail's buffer and fails when the cell is not in the rail's liberties.
 
+### Wire model: `flow.wire_model` and `wire_model:`
+
+Flow STA runs with ideal clocks and no parasitics, and so does the
+vt_swap stage's timing. After place and route every net also carries a
+wire, and on a deep-submicron node the wire capacitance is comparable to
+the pin capacitance. A design that the flow times as just meeting its clock can then
+miss it after P&R. A wire model puts an expected wire on every net before there is a
+placement, so the STA stage and vt_swap time, and size flavours, against
+something close to what P&R will extract.
+
+The pack declares it (a property of the node and the P&R recipe, fitted once
+from extracted parasitics: see `scripts/fit_wire_model.py` for the fit; the numbers
+in the examples of this page are illustrative):
+
+```yaml
+flow:
+  wire_model:
+    cap_per_fanout_ff: 0.3      # wire capacitance per load pin, fF (illustrative)
+    cap_base_ff: 0.2            # plus this per net, fF (illustrative)
+    res_per_fanout_ohm: 0       # optional wire resistance, ohm, per load pin
+    res_base_ohm: 0             # plus this per net
+```
+
+A net with `n` load pins (instance inputs and output ports, over the
+flattened netlist) gets `C = cap_base_ff + cap_per_fanout_ff * n`, as
+`set_load` on the net. With a resistance (`R = res_base_ohm +
+res_per_fanout_ohm * n`, from the driver to each load) the flow writes a SPEF
+with one pi model per net instead and reads it; it carries the capacitance
+too, because OpenSTA ignores a net's parasitics once `set_load` has given it
+a capacitance. Capacitance alone follows P&R's extraction well when the
+wire resistance is small against the cells' drive; add a resistance only if
+the extraction shows wire delay.
+
+The model is off unless the pack declares it, so existing packs are
+unchanged. A flow config's `wire_model:` overrides it: `false` turns a
+pack's off, `true` uses the pack's, and a mapping replaces the named keys
+(and can declare a model on a pack that has none).
+
+It applies to the STA stage (every view: domains, chip, corners; the
+summary's `wire_model` records it) and to the vt_swap stage (the whole
+OpenSTA session: the fix and recovery steps size against it; the record in
+`vt_swap.json` carries it, and so do `scripts/mvt/vt_swap.py`'s). It does not
+reach ABC's mapping, whose delay target stays `mapping_target`, nor the
+register-mapper's criticality list (`multibit_timing`). Because the swap
+then sees the wires, the flavours it chooses are faster than without the
+model, which costs leakage and may not be reachable at all when the mapped
+netlist's wire-free slack was spent by `mapping_target`; the wire-aware
+target is a different (lower) `mapping_target.scale`. A model is a
+per-net mean: a net P&R routes long still fails against it. `rc_corner: <corner>` (optional) names the
+pack `wire_rc:` corner the numbers were fitted at; each view then scales
+them to its own corner's wire RC (see "Wire RC" below).
+
+### Wire RC: `wire_rc:`
+
+A placed design's wire parasitics come from per-layer RC (OpenROAD's
+`set_layer_rc`) and, before routing, one RC per micron for every signal and
+clock wire (`set_wire_rc`). Those numbers belong to the node and the
+extraction corner, so the pack names them, one OpenROAD Tcl file per
+corner:
+
+```yaml
+wire_rc:
+  tt: ${MYTECH_RC}/rc_typical.tcl          # a path, or
+  ss:                                     # a path and its sha256 pin
+    path: ${MYTECH_RC}/rc_cmax.tcl
+    sha256: 3f5c...
+  ff: ${MYTECH_RC}/rc_cmin.tcl
+```
+
+A private pack names files only: the values stay in the PDK's (or the P&R
+flow's) tree and the pack carries at most their sha256, like the library
+provenance check. A `public: true` pack may give the values inline instead
+(ohm and fF per micron; `clock` defaults to `signal`):
+
+```yaml
+wire_rc:
+  tt:
+    signal: {res_ohm_per_um: 20, cap_ff_per_um: 0.2}
+    clock:  {res_ohm_per_um: 10, cap_ff_per_um: 0.1}
+    layers: {M2: {res_ohm_per_um: 25, cap_ff_per_um: 0.2}}
+    vias:   {V1: {res_ohm: 10}}
+```
+
+A pack without `corners:` gives one entry (`wire_rc: <path>`, or the
+mapping). With corners, every key is a corner name, and the setup and hold
+corners must be covered. Every corner is a file or every corner is inline,
+not a mix.
+
+`techpack check` prints each file with its size and sha256 and the pin's
+verdict, and fails when a file is missing or empty, when it no longer
+matches its pin, or when the setup or hold corner has no entry. With a
+local `tclsh` it also reads each file's `set_wire_rc -signal` (an error
+when a wire model scales by it, below; a warning otherwise).
+
+Who uses it:
+
+* **P&R.** The stage gives OpenROAD the setup corner's file. ORFS gets a
+  copy in the run directory as `SET_RC_TCL` on the make command line, which
+  overrides the platform `config.mk`'s own `setRC.tcl`. A pack's own P&R
+  command gets `CIRCT_FLOW_WIRE_RC` (the setup corner's file) and
+  `CIRCT_FLOW_WIRE_RC_<CORNER>` for every corner in its environment.
+* **STA and vt_swap**, with a wire model that names the corner it was
+  fitted at:
+
+  ```yaml
+  flow:
+    wire_model: {cap_base_ff: 0.2, cap_per_fanout_ff: 0.3, rc_corner: tt}
+  ```
+
+  These stages time a netlist without a placement, so RC per micron cannot
+  be applied directly; instead each view scales the model to its corner:
+  capacitances by the view corner's signal capacitance per micron over
+  `rc_corner`'s, resistances likewise. The factors are read from the files
+  inside the OpenSTA session (a child interpreter where `set_layer_rc` /
+  `set_wire_rc` only record their arguments, and a helper that an RC file may call to read environment overrides is stubbed),
+  so the files' units cancel; all of a pack's files must use the same
+  units. vt_swap times setup at the setup corner and hold at the hold
+  corner, so it puts `-max` loads scaled to the first and `-min` loads
+  scaled to the second. A view at a corner with no `wire_rc` entry fails.
+  The STA summary records each file and its sha256 (`wire_rc`), and the
+  view logs print the factors (`circtflow wire rc: ss against tt: C x ..`).
+
+Without `rc_corner` the wire model is not scaled, and without `wire_rc`
+nothing changes: P&R uses the platform's RC.
+
+### Multibit flops: `flow.multibit` and `multibit:`
+
+A pack that has multibit flop cells declares them under `flow:`; a flow config turns the mapping on with `multibit: true`. The register mapper then packs bits that share clock, reset and flop class into banks of the declared widths before ABC (design in `doc/passes.md`, "multibit banking"). The pack names every cell, pin and width; the pass names none.
+
+```yaml
+flow:
+  multibit:
+    default_family: a
+    cross_register: false        # true: pool leftover bits across registers
+    families:
+      a:
+        clear:                   # async clear-to-0 bits
+          cell: TBK{n}_CLR_A  # {n} = width
+          widths: [8, 4, 2]
+          clock: CK
+          reset: R
+          reset_active_high: true
+          data: "D{i}"           # {i} = bit within the bank
+          out: "Q{i}"
+          tie: {SE: 0, SI: last_q}   # 0, 1 or last_q (the bank's own last output)
+        none: {cell: TBK{n}_NRS_A, widths: [8, 4, 2], clock: CK, data: "D{i}", out: "Q{i}", tie: {SE: 0, SI: last_q}}
+      single: {}                 # a family with no classes keeps bits single-bit
+```
+
+The flow config's `multibit:` takes `true` or a mapping: `default_family`, `cross_register`, `overrides` (`{reg: <regex on the register name>, family: <name>}`, first match wins; names are module-local), `overrides_file` (a JSON list of the same) and `activity` (`{file: rates.json, hot_family, hot_toggle_rate}`; `python -m circt_flow.multibit_activity <tcf>` makes the rates file). `activity` also takes `rule: energy` (below). `python -m circt_flow.multibit_timing <out_dir> --margin 0.05` (an example margin, in ns) reads a finished run's OpenSTA view and writes an `overrides_file` that sends the registers on near-critical paths to the `single` family: a multibit cell's clk-to-Q and setup can differ from the single-bit flop's, so banking everything can cost slack that a rerun with that list gets back. `circt_flow techpack check` verifies every declared cell is in the rail's liberties. Cells with inverted outputs, async-set classes and enable flops are not mapped (bits of those stay single-bit).
+
+#### Activity-driven family choice: `multibit.energy` and `activity: {rule: energy}`
+
+A library's multibit families trade clock-pin energy against data energy, leakage and area, and which one is cheapest depends on how often a register is clocked and how often its bits change. A pack declares a per-bit energy model next to the families (the numbers below are example values only):
+
+```yaml
+flow:
+  multibit:
+    energy:
+      period_ns: 1.0                  # default; the activity file may set its own
+      area_weight_nw_per_um2: 5       # what one unit of area is worth in nW (0: power only)
+      families:                       # only the families to compare
+        a: {clock_aj: 10, q_aj: 10, d_aj: 10, leak_nw: 1, area_um2: 2}
+        b: {clock_aj: 10, q_aj: 100, d_aj: 10, leak_nw: 2, area_um2: 1}
+```
+
+`clock_aj` is the internal energy per clock pulse and bit, `q_aj` per output toggle, `d_aj` per input toggle. The flow config's `multibit: {activity: {file: act.json, rule: energy, candidates: [a, b], area_weight_nw_per_um2: ...}}` then gives every register the family that minimises `(clk*clock_aj + q*q_aj + d*d_aj)/period_ns + leak_nw + area_weight*area_um2` (nW per bit); ties and registers missing from the file stay on `default_family`. The terms scale with the register's own activity, so which family is cheapest differs between busy and quiet registers; with the example values above the area term decides for quiet ones. Without `rule: energy` nothing changes (the threshold rule and the static default are as before).
+
+The file comes from a simulation of an earlier run's netlist: `python -m circt_flow.multibit_activity --netlist run.v nets.tsv --cycles N -o act.json` (or a TCF in place of the TSV; a TSV is `net block toggles ...`, block 0 the whole span). The netlist supplies the register-mapper's own instance names (`<reg>_mb<a>_<b>`, `<reg>_bit<k>`), the clock pin and the output/input pin names (`--clock-pin`, `--out-pin-re`, `--in-pin-re`); the file is `{"period_ns": T, "registers": {reg: {"q", "d", "clk", "bits"}}}` with names as the mapper sees them. The coefficients are the pack's own numbers; the flow code names no cell.
+
+### Clock-gate economy: `flow.clock_gating` and `clock_gating:`
+
+`clock-gate-inference` builds one clock gate per (clock, enable) group. On a
+design whose enables are many spellings of a few functions that is far more
+gates than needed, and every gate costs clock-network power (its own clock pin,
+internal power, the clock buffers CTS builds on its output). The economy
+options trim them; none names a cell, and nothing happens unless the flow
+config opts in with `clock_gating:` (`true`, or a mapping that overrides the
+pack's values). A pack declares what a gate costs on its library, in units of
+one flop bit's clock-pin power:
+
+```yaml
+flow:                                  # the pack (example values)
+  clock_gating:
+    merge_equivalent_enables: true     # one gate per enable FUNCTION
+    gate_cost_bits: 4.0                # a gate costs 4 flop clock pins
+    gate_idle_fraction: 0.4            # share of cycles a gated group idles
+    enable_op_cost_bits: 0.5           # per synthesized enable cell
+    hold_mux_bits: 0.0                 # saving per bit of the hold mux
+    min_gate_bits: 4                   # never gate fewer bits
+    max_gate_depth: 3                  # gates in series on a clock path
+```
+
+```yaml
+clock_gating: true                     # the flow config
+```
+
+The options are described in `doc/passes.md`.
+
+### Slow-cell filter: `flow.slow_cell_filter`
+
+ABC's load-aware delay model is optimistic for cells whose delay is dominated
+by a tall transistor stack (4-input NAND/NOR, wide AOI, and so on), so area
+recovery can pick them although a netlist with more levels of 2-input cells is
+faster after placement. `flow.slow_cell_filter: {ratio: 1.3, slew_ps: 30,
+load_ff: 2.5}` (example values; opt-in; absent means off, or `CIRCT_FLOW_SLOW_CELL_RATIO=<ratio>`)
+lists the combinational single-output cells whose delay at one reference slew
+and load exceeds `ratio` times the median of all of them and hands them to
+ABC's `read_lib` as `-X <cell>`. Nothing in it knows a cell name: delays come
+from the liberty's NLDM tables, and the pack's `vt_flavours` regex makes a cell
+and its flavour twins one family, judged by its slowest member.
+
+### Shift select: `shift_select:`
+
+A flow config's `shift_select:` section turns on the `map-shift-select` pass
+(a `case` over a shift amount as a network of AND-OR cells) without environment
+variables; the options, the one that is not exact (`default_dont_care`) and the
+example `examples/shift-select` are in `doc/passes.md`. The key lives in the
+flow config only, never in a pack.
+
 ### Threshold-voltage swap: `--vt-swap` and `vt_swap:`
 
 ```yaml
 # the tech pack: how a cell name carries its flavour, slowest first
 vt_flavours:
   tokens: [R, L, SL]
-  re: '_(SL|R|L)_'           # one group: the token (default `_([A-Z]+)$`)
+  re: '_(SL|R|L)_'           # the token is the group (default `_([A-Z]+)$`)
 
 # the flow config: the section turns the stage on; or pass --vt-swap
 vt_swap:
@@ -596,7 +816,14 @@ vt_swap:
   max_iter: 30
   recover: true
   margin_ps: 0               # setup slack to keep in hand for P&R
+  keep_clock_cells: false    # leave clock gates at the flavour synthesis gave them
+  false_to: [outputs]        # endpoints whose paths are not timed (ports, or `outputs`)
 ```
+
+`keep_clock_cells: true` leaves every cell other than a buffer or inverter that
+drives a clock net (the clock gates) at its synthesized flavour; `false_to`
+lists output ports (or the word `outputs`) whose paths the swap ignores, like
+`false_from` does for input ports.
 
 ABC chooses flavours on its own delay model, which can be far from the
 libraries' (by a factor of two or more on some libraries), and the
@@ -632,8 +859,9 @@ not list a priced library first) and the tightest mode's SDC plus
    every candidate (one update per cell is far too slow on a large
    netlist).
 
-Flavours of one cell share area, footprint and pins, so the swap renames
-cell types and nothing else. The unswapped netlist is kept as
+The swap assumes the flavours of one cell have the same pins, so it renames
+cell types and nothing else (a flavour with another area changes the
+netlist's area). The unswapped netlist is kept as
 `<top>_preswap_openroad.v`, and `<out>/vt_swap.json` lists every swap with
 the slack before and after. `scripts/mvt/vt_swap.py` runs the same swap on
 any netlist.
@@ -827,6 +1055,10 @@ inside that image `SV2V` is set and no image is needed.
 `--pnr` runs place and route after synthesis, from the flow config's
 `pnr:` section (`clock_port` is required; `platform`, `clock_period`,
 `clock_latency`, `utilization`, `place_density` and `set:` are ORFS's).
+The ORFS stage also takes clock-tree and margin controls from the flow
+config's `pnr:` (`cts_buffers`, `cts_cluster_size`, `cts_cluster_diameter`,
+`cts_args`, `hold_margin`, `setup_margin`); a pack's `pnr:` may give the same
+keys as defaults, and the flow config's value wins.
 What runs depends on the pack's own `pnr:`:
 
 * **Nothing:** stock ORFS on the built-in platform the flow config names.

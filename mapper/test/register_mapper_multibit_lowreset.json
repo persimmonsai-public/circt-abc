@@ -1,0 +1,10 @@
+{
+  "default_family": "odd",
+  "families": {
+    "odd": {
+      "clear": {"cell": "TMB{n}CLRN", "widths": [3, 2],
+                "clock": "CK", "reset": "RN", "reset_active_high": false,
+                "data": "D{i}", "out": "Q{i}"}
+    }
+  }
+}

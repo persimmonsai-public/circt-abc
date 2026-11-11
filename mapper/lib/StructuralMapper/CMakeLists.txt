@@ -13,6 +13,10 @@ add_mlir_library(CirctAbcStructuralMapper
   ResubMappedPass.cpp
   LimitFanoutPass.cpp
   DecodeMuxChainsPass.cpp
+  LowerBarrelShiftsPass.cpp
+  LowerCarryInAddsPass.cpp
+  MapPrefixAddersPass.cpp
+  MapShiftSelectPass.cpp
   SetAdderArchPass.cpp
   PruneUnusedResidualOutputsPass.cpp
   NarrowExtendedMultipliesPass.cpp

@@ -83,7 +83,20 @@ FLOW_DEFAULTS = {"sv2v_docker_image": str, "abc_script_file": Path,
                  "mapping_target": dict,
                  # Pre-placement fanout buffering (fanout.py): the buffer
                  # cell, its pins and the fanout limit.
-                 "fanout_buffer": dict}
+                 "fanout_buffer": dict,
+                 # Slow-cell filter for ABC's library (slowcells.py): cells
+                 # whose liberty delay at a reference slew/load is more than
+                 # `ratio` x the median are passed to read_lib as -X.
+                 "slow_cell_filter": dict,
+                 # The multibit flop families (multibit.py); a flow config's
+                 # `multibit:` turns the mapping on.
+                 "multibit": dict,
+                 # A pre-placement wire model for the STA and vt_swap
+                 # stages (wire_model.py).
+                 "wire_model": dict,
+                 # Clock-gate economy numbers (clockgating.py); a flow
+                 # config's `clock_gating:` turns them on.
+                 "clock_gating": dict}
 ENV_PREFIX = "CIRCT_FLOW_"
 # The one rail of a schema-1 pack or a repo profile.
 IMPLICIT_RAIL = "default"
@@ -172,6 +185,9 @@ class Profile:
     # for the roles in CORNER_ROLES. Both empty without corners.
     corner_names: List[str] = field(default_factory=list)
     corner_roles: Dict[str, str] = field(default_factory=dict)
+    # `wire_rc:` (wire_rc.WireRc): the per-corner wire RC Tcl the P&R, STA
+    # and vt_swap stages use; None without one.
+    wire_rc: Optional[object] = None
 
     @property
     def setup_corner(self) -> Optional[str]:
@@ -352,13 +368,19 @@ def expand(value: str, base: Path) -> Path:
 def _pnr_section(d: dict, base: Path, path: Path) -> dict:
     """A pack's `pnr:`: orfs_platform_dir (a directory, relative to the
     pack) or command (argv; `./` and `../` words are relative to the pack,
-    every word has ${VAR} expanded), not both."""
+    every word has ${VAR} expanded), not both. A pack may also give defaults
+    for the ORFS stage's clock-tree and margin controls (`cts_buffers`,
+    `cts_cluster_size`, `cts_cluster_diameter`, `cts_args`, `hold_margin`,
+    `setup_margin`); a flow config's own `pnr:` value wins."""
     p = dict(d.get("pnr") or {})
-    unknown = set(p) - {"orfs_platform_dir", "command"}
+    ctl = {"cts_buffers", "cts_cluster_size", "cts_cluster_diameter",
+           "cts_args", "hold_margin", "setup_margin"}
+    unknown = set(p) - {"orfs_platform_dir", "command"} - ctl
     if unknown:
         raise KeyError(f"{path}: pnr.{sorted(unknown)[0]} is not a pack "
-                       "P&R key; allowed: orfs_platform_dir, command")
-    if len(p) > 1:
+                       "P&R key; allowed: orfs_platform_dir, command, "
+                       + ", ".join(sorted(ctl)))
+    if len([k for k in p if k not in ctl]) > 1:
         raise ValueError(f"{path}: pnr: give orfs_platform_dir or command, "
                          "not both")
     if "orfs_platform_dir" in p:
@@ -427,6 +449,15 @@ def _flow_section(flow_d: dict, base: Path, where: str,
         elif k == "fanout_buffer":
             from .fanout import parse_spec
             parse_spec((pack_flow or {}).get("fanout_buffer"), v, where)
+        elif k == "multibit":
+            from .multibit import parse_pack
+            parse_pack(v, f"{where}.multibit")
+        elif k == "wire_model":
+            from .wire_model import parse_pack as parse_wire
+            v = parse_wire(v, f"{where}.wire_model")
+        elif k == "clock_gating":
+            from .clockgating import parse_pack as parse_cg
+            parse_cg(v, f"{where}.clock_gating")
         elif k == "env":
             bad = [e for e in v if not e.startswith(ENV_PREFIX)]
             if bad:
@@ -624,7 +655,8 @@ def _vt_flavours(d: dict, path: Path) -> Optional[dict]:
     return parse_flavours(d.get("vt_flavours"), f"{path}")
 
 
-def load(path: Path | str, image: Optional[str] = None) -> Profile:
+def load(path: Path | str, image: Optional[str] = None,
+         audit: bool = False) -> Profile:
     path = Path(path)
     if not path.exists() and "/" not in str(path):
         path = resolve(str(path))
@@ -686,13 +718,19 @@ def load(path: Path | str, image: Optional[str] = None) -> Profile:
                                icg=dict(icg), tie=dict(tie),
                                dont_use=list(dont_use))}
     ls_libs, ls_corners = _level_shifters(d, base, path, corner_names)
+    from . import wire_rc as wire_rc_mod
+    if "wire_rc" in d and not pack:
+        raise KeyError(f"{path}: wire_rc is a tech-pack key (schema: 1|2)")
+    wire_rc = wire_rc_mod.parse(d.get("wire_rc"), base, corner_names,
+                                bool(d.get("public", False)),
+                                f"{path}: wire_rc")
     return Profile(name=d["name"], liberties=list(liberties),
                    time_unit=d.get("time_unit", "ns"), icg=dict(icg),
                    dont_use=list(dont_use),
                    orfs_platform=(orfs or {}).get("platform"),
                    tie=dict(tie),
                    root=base if pack else None, flow=dict(flow),
-                   pnr=_pnr_section(d, base, path) if pack else {},
+                   pnr=_pnr_section(d, base, path) if pack and not audit else {},
                    deny_terms=list(d.get("deny_terms", [])),
                    deny_exceptions=list(d.get("deny_exceptions", [])),
                    public=bool(d.get("public", False)),
@@ -700,7 +738,7 @@ def load(path: Path | str, image: Optional[str] = None) -> Profile:
                    default_rail=default,
                    level_shifters=ls_libs, level_shifter_corners=ls_corners,
                    corner_names=corner_names, corner_roles=corner_roles,
-                   vt_flavours=_vt_flavours(d, path))
+                   vt_flavours=_vt_flavours(d, path), wire_rc=wire_rc)
 
 
 if __name__ == "__main__":

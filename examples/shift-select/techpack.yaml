@@ -1,0 +1,29 @@
+# The shift-select example's pack: ASAP7 RVT only, mapped load-aware and
+# timing-driven (abc/rvt.abc) on the real library (examples/asap7-mvt/lib/
+# make_libs.py builds lib/ from the ORFS platform).
+schema: 2
+name: asap7_rvt_shift
+time_unit: ps
+icg: {cell: ICGx1_ASAP7_75t_R, clk: CLK, en: ENA, test_en: SE, out: GCLK}
+dont_use: ["*x1p*_ASAP7*", "*xp*_ASAP7*", "SDF*", "ICG*"]
+tie: {hi: "TIEHIx1_ASAP7_75t_R:H", lo: "TIELOx1_ASAP7_75t_R:L"}
+public: true
+corners:
+  names: [tt, ss, ff]
+  setup: tt
+  leakage: ss
+  hold: ff
+flow:
+  abc_read_lib_args: "-l"
+  abc_script_file: abc/rvt.abc
+  mapping_target: {scale: 0.5}
+  fanout_buffer: {cell: BUFx2_ASAP7_75t_R, input: A, output: Y, max_fanout: 32}
+default_rail: VDD
+rails:
+  VDD:
+    voltage: 0.7
+    liberties: [lib/asap7_rvt_tt.lib]
+    corners:
+      tt: [lib/asap7_rvt_tt.lib]
+      ss: [lib/asap7_rvt_ss.lib]
+      ff: [lib/asap7_rvt_ff.lib]

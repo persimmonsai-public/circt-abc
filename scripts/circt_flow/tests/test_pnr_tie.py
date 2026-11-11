@@ -46,3 +46,18 @@ def test_pnr_tie_without_pack_tie(tmp_path, monkeypatch):
 def test_no_tie_cells_no_flags(tmp_path, monkeypatch):
     argv = _run(tmp_path, monkeypatch, {"clock_port": "clk"}, None)
     assert _tie(argv) == (None, None)
+
+
+def test_untied_constants_warning():
+    net = "module t(a, y);\n  assign z = 1'h0;\n  X u (.A(1'h1), .Y(y));\nendmodule\n"
+    assert pnr_mod.count_constants(net) == 2
+    w = pnr_mod.untied_constants_warning(net, {})
+    assert "2 constant" in w and "tie" in w
+    assert pnr_mod.untied_constants_warning(net, {"hi": "TH:H", "lo": "TL:L"}) == ""
+    assert pnr_mod.untied_constants_warning("module t; endmodule\n", {}) == ""
+
+
+def test_tied_netlist_has_no_literals():
+    net = "module t(a, y);\n  assign z = 1'h0;\n  X u (.A(1'h1), .Y(y));\nendmodule\n"
+    out, n = pnr_mod.tie_constants(net, ("TH", "H"), ("TL", "L"))
+    assert n == 2 and pnr_mod.count_constants(out) == 0

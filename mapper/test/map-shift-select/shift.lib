@@ -1,0 +1,80 @@
+/* Hermetic liberty for the shift-select test: inverting compound cells are cheaper than their
+   non-inverting forms, as in real CMOS. */
+library(shift_cells) {
+  cell(TINV) {
+    area : 0.02 ;
+    pin(A) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!A)" ;
+    }
+  }
+  cell(TNAND2) {
+    area : 0.03 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!(A&B))" ;
+    }
+  }
+  cell(TNAND3) {
+    area : 0.04 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(C) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!(A&B&C))" ;
+    }
+  }
+  cell(TNAND4) {
+    area : 0.05 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(C) { direction : input ; }
+    pin(D) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!(A&B&C&D))" ;
+    }
+  }
+  cell(TNOR2) {
+    area : 0.03 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!(A|B))" ;
+    }
+  }
+  cell(TAND2) {
+    area : 0.04 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(A&B)" ;
+    }
+  }
+  cell(TOR2) {
+    area : 0.04 ;
+    pin(A) { direction : input ; }
+    pin(B) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(A|B)" ;
+    }
+  }
+  cell(TAOI22) {
+    area : 0.05 ;
+    pin(A1) { direction : input ; }
+    pin(A2) { direction : input ; }
+    pin(B1) { direction : input ; }
+    pin(B2) { direction : input ; }
+    pin(Y) {
+      direction : output ;
+      function : "(!((A1&A2)|(B1&B2)))" ;
+    }
+  }
+}
