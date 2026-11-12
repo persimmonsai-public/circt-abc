@@ -2058,3 +2058,40 @@ def test_a_recycled_group_id_does_not_block_later_runs(tmp_path):
     finally:
         victim.kill()
         victim.wait()
+
+
+def test_checks_read_final_over_the_top_level_and_dotted_paths():
+    cs = L.Accept().checks
+    m = {"setup_ws": -5.0, "hold_ws": 1.0, "drc_errors": 0, "final": {"setup_ws": 3.0}}
+    assert L.check_metrics(m, cs) == (L.ACCEPTED, [])
+    v, why = L.check_metrics({**m, "final": {"setup_ws": -2.0}, "setup_ws": 5.0}, cs)
+    assert v == L.REJECTED and "setup_ws -2 < 0" in why[0]
+    dotted = (L.Check("group.value", min=0.0),)
+    assert L.check_metrics({"group": {"value": 3.0}}, dotted) == (L.ACCEPTED, [])
+    v, why = L.check_metrics({"setup_ws": 1}, dotted)
+    assert v == L.UNVERIFIED and "group.value not reported" in why[0]
+    assert L.check_metrics({"group": {"value": float("nan")}}, dotted)[0] == L.UNVERIFIED
+
+
+def test_the_record_format_was_bumped_with_the_judging_rule():
+    assert L.FORMAT >= 3
+
+
+def test_a_variable_in_a_jobs_environment_is_on_the_submit_line(tmp_path, monkeypatch):
+    monkeypatch.delenv("JOB_ONLY_VAR", raising=False)
+    out = tmp_path / "seen.txt"
+    r = L.Runner(tmp_path, submit="env -i PATH=\"$PATH\" {cmd}")
+    job = L.Job("j", ["bash", "-c", f'echo "$JOB_ONLY_VAR" > {out}'],
+                {**os.environ, "JOB_ONLY_VAR": "7"}, tmp_path, tmp_path / "j.log")
+    assert r.spawn(job).wait(threading.Event()) == 0
+    assert out.read_text().split()[0] == "7"
+
+
+def test_a_variable_with_a_changed_value_is_on_the_submit_line(tmp_path, monkeypatch):
+    monkeypatch.setenv("JOB_ONLY_VAR", "old")
+    out = tmp_path / "seen.txt"
+    r = L.Runner(tmp_path, submit="env -i PATH=\"$PATH\" {cmd}")
+    job = L.Job("j", ["bash", "-c", f'echo "$JOB_ONLY_VAR" > {out}'],
+                {**os.environ, "JOB_ONLY_VAR": "new"}, tmp_path, tmp_path / "j.log")
+    assert r.spawn(job).wait(threading.Event()) == 0
+    assert out.read_text().split()[0] == "new"

@@ -63,7 +63,7 @@ NO_MARKER = -1000
 # Bumped when the meaning of a saved placement or rung record changes (the
 # verdict logic, the restart copy, what the plans hash): old ones are then
 # not honoured.
-FORMAT = 2
+FORMAT = 3
 
 
 class LadderError(ValueError):
@@ -655,8 +655,12 @@ class Runner:
             inner = [sys.executable, "-m", "circt_flow.ladder", "--exec",
                      str(status), token, "--", *job.argv]
             e2 = _package_env(env)
+            # the ladder's variables, PYTHONPATH, and every variable the flow
+            # set or changed for the job (absent from, or different in, the
+            # submitting process's environment)
             kv = [f"{k}={v}" for k, v in e2.items()
-                  if k.startswith("CIRCT_FLOW_") or k == "PYTHONPATH"]
+                  if k.startswith("CIRCT_FLOW_") or k == "PYTHONPATH"
+                  or os.environ.get(k) != v]
             line = shlex.join(["env", *kv, *inner])
             cmd = self.submit.format(
                 cmd=line, cmdq=shlex.quote(line), name=jobname,
@@ -805,12 +809,35 @@ def ends_in_traceback(text: str) -> bool:
     return all(l[0] in " \t" or l.startswith(chain) for l in lines[:-1])
 
 
+def judged_view(metrics: dict) -> dict:
+    """The numbers the checks read: the top-level keys of the metrics, with
+    the keys of a `final` mapping (when the pack's command writes one) taking
+    precedence."""
+    final = metrics.get("final")
+    return {**metrics, **final} if isinstance(final, dict) else metrics
+
+
+def metric_value(metrics: dict, key: str):
+    """The value a check key names: the key itself, else a dotted path into
+    nested mappings (`group.name`); None when it is absent."""
+    if key in metrics:
+        return metrics[key]
+    cur = metrics
+    for part in key.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
 def check_metrics(metrics: dict, checks: Sequence[Check]) -> tuple:
-    """(verdict, reasons) of the built-in checks on a metrics dict. A number
-    that is absent or not finite cannot be judged: unverified, never a pass."""
+    """(verdict, reasons) of the built-in checks on a metrics dict, read as
+    `judged_view` gives it. A number that is absent or not finite cannot be
+    judged: unverified, never a pass."""
     rejected, missing = [], []
+    metrics = judged_view(metrics)
     for c in checks:
-        v = metrics.get(c.key)
+        v = metric_value(metrics, c.key)
         if isinstance(v, bool) or not isinstance(v, (int, float)) \
                 or not math.isfinite(v):
             missing.append(f"{c.key} not reported")

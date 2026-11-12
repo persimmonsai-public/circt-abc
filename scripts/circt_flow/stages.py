@@ -1217,7 +1217,8 @@ def pack_finish(cfg: FlowConfig, out: Path, rc: int, cmd: list,
     metrics_path = Path(out) / "pnr_metrics.json"
     metrics = (json.loads(metrics_path.read_text())
                if metrics_path.exists() else {})
-    unknown = sorted(set(metrics) - set(pnr_mod.METRICS) - {"status"})
+    unknown = sorted(k for k in set(metrics) - set(pnr_mod.METRICS) - {"status", "final"}
+                     if not isinstance(metrics[k], dict))
     if unknown:
         print(f"[circt_flow] WARNING: pack P&R wrote unknown metric(s) "
               f"{', '.join(unknown)}")

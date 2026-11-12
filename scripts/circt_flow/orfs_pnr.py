@@ -101,12 +101,13 @@ latency per design.
 from __future__ import annotations
 
 import argparse
+import bisect
+import itertools
 import json
 import os
 import re
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 DEFAULT_IMAGE = "openroad/orfs:26Q3-277-gf9ec54a6d"
@@ -246,6 +247,221 @@ def _tokens(text: str) -> list:
     return out
 
 
+# ---- fast analysis -------------------------------------------------------
+#
+# The exact tokenizer above visits every token of the file (millions on a big
+# netlist) and holds them all in memory. The constants that matter are a few
+# hundred. `_analyze` finds them with C-speed searches (`str.find`, one regex
+# pass for comments, strings and attributes) and runs the exact tokenizer only
+# on the statement that holds each one, so its answers equal the exact ones
+# (`_analyze_exact`; the tests compare them on many generated texts).
+
+_HIDE = re.compile(r"""//[^\n]*|/\*.*?(?:\*/|\Z)|\(\*(?!\s*\)).*?(?:\*\)|\Z)"""
+                   r"""|"(?:[^"\\\n]|\\.)*"?|\\\S+""", re.S)
+_CAND = re.compile(r"'\s*[sS]?[bBoOdDhH]\s*([01])_*(?![0-9a-fA-FxXzZ?_])")
+_BACK1 = re.compile(r"1\s*$")
+_WORD = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_$"
+_SKIP_WORDS = ("function", "task", "generate", "specify", "primitive", "table",
+               "parameter", "localparam", "defparam")
+_INERT = ("ws", "lcomment", "bcomment", "attr")
+_BLANKS = (" ", "\n", "\t", "\r", "\f", "\v")
+
+
+class _Lex:
+    """Where the text is not code (comments, attributes, strings), the
+    regions the tokenizer skips, and the depth of `generate` blocks: all by
+    position, found without tokenizing the text."""
+
+    def __init__(self, text):
+        self.text = text
+        self.ok = "`" not in text           # directive lines: exact path
+        self.hs, self.he = [], []
+        if self.ok:
+            for m in _HIDE.finditer(text):
+                c = text[m.start()]
+                if c == "\\":
+                    continue
+                if c == '"' and text.find("\n", m.start(), m.end()) >= 0:
+                    self.ok = False         # a string over several lines
+                    break
+                self.hs.append(m.start())
+                self.he.append(m.end())
+        self.skips = []                     # [(start, end)] of skipped code
+        self.skip_starts = []
+        self.gen = []                       # [(position, depth after)]
+        if self.ok:
+            self._skips()
+
+    def hidden(self, pos):
+        i = bisect.bisect_right(self.hs, pos) - 1
+        return i >= 0 and pos < self.he[i]
+
+    def in_esc(self, pos):
+        """pos is inside an escaped identifier (a visible backslash before
+        in the same run of non-blank characters)."""
+        t = self.text
+        lo, span = max(0, pos - 128), 128
+        while True:                  # the blank before pos, searched outwards
+            r = max(t.rfind(c, lo, pos) for c in _BLANKS)
+            if r >= 0 or lo == 0:
+                break
+            span *= 4
+            lo = max(0, pos - span)
+        b = t.rfind("\\", r + 1, pos)
+        while b >= 0:
+            if not self.hidden(b):
+                return True
+            b = t.rfind("\\", r + 1, b)
+        return False
+
+    def visible(self, pos):
+        return not self.hidden(pos) and not self.in_esc(pos)
+
+    def skipped(self, pos):
+        i = bisect.bisect_right(self.skip_starts, pos) - 1
+        return i >= 0 and pos < self.skips[i][1]
+
+    def _word_hits(self, word):
+        t, n, p = self.text, len(word), 0
+        while True:
+            p = t.find(word, p)
+            if p < 0:
+                return
+            if (p == 0 or t[p - 1] not in _WORD) and \
+                    (p + n >= len(t) or t[p + n] not in _WORD) \
+                    and self.visible(p):
+                yield p
+            p += n
+
+    def _skips(self):
+        t = self.text
+        hits = []
+        for w in _SKIP_WORDS:
+            hits += [(p, w) for p in self._word_hits(w)]
+        p = t.find("#")
+        while p >= 0:
+            if self.visible(p):
+                hits.append((p, "#"))
+            p = t.find("#", p + 1)
+        hits.sort()
+        events, end = [], 0
+        for p, w in hits:
+            if w == "generate":
+                events.append((p, 1))
+            if p < end:
+                continue
+            e = _skip_end(t, p, w)
+            if e is not None:
+                self.skips.append((p, e))
+                end = e
+        for p in self._word_hits("endgenerate"):
+            events.append((p, -1))
+        events.sort()
+        depth, g = 0, []
+        for p, d in events:
+            depth = max(0, depth + d)
+            g.append((p, depth))
+        self.gen = g
+        self.gen_pos = [p for p, _ in g]
+        self.skip_starts = [a for a, _ in self.skips]
+
+    def generate_depth(self, pos):
+        i = bisect.bisect_left(self.gen_pos, pos) - 1
+        return self.gen[i][1] if i >= 0 else 0
+
+    def prev_sync(self, pos, use_skips=True):
+        """Start of the statement that holds pos: just after the nearest
+        visible `;` before it that is not in skipped code (0 if none)."""
+        t, q = self.text, pos
+        while True:
+            q = t.rfind(";", 0, q)
+            if q < 0:
+                return 0
+            if self.visible(q) and not (use_skips and self.skipped(q)):
+                return q + 1
+
+    def next_sync(self, pos, use_skips=True):
+        t, q = self.text, pos
+        while True:
+            q = t.find(";", q)
+            if q < 0:
+                return len(t)
+            if self.visible(q) and not (use_skips and self.skipped(q)):
+                return q + 1
+            q += 1
+
+
+def _skip_end(text, a, word):
+    """End of the skipped construct that starts with the token at a (the
+    exact tokenizer's rule), or None when the token starts none."""
+    it = (m for m in _TOKEN.finditer(text, a) if m.lastgroup not in _INERT)
+    first = next(it, None)
+    if first is None:
+        return None
+    if word == "#":
+        nxt = next(it, None)
+        if nxt is None or nxt.group() != "(":
+            return None
+        depth, last = 0, nxt
+        for m in itertools.chain([nxt], it):
+            if m.lastgroup == "punct" and m.group() == "(":
+                depth += 1
+            elif m.lastgroup == "punct" and m.group() == ")":
+                depth -= 1
+                if depth == 0:
+                    return m.end()
+            last = m
+        return last.end()
+    if word in ("parameter", "localparam", "defparam"):
+        stop = lambda m: m.lastgroup == "punct" and m.group() == ";"
+    else:
+        end = _SKIP_TO[word]
+        stop = lambda m: m.lastgroup == "ident" and m.group() == end
+    last = first
+    for m in itertools.chain([first], it):
+        if stop(m):
+            return m.end()
+        last = m
+    return last.end()
+
+
+def _scan_tokens(text, toks):
+    """(ties, number of one-bit literals) among the tokens of one piece of
+    text; ties as in `_find_ties`."""
+    txt = [text[a:b] for _, a, b in toks]
+    found, ones = [], 0
+    for i, (k, a, b) in enumerate(toks):
+        if k != "number":
+            continue
+        m = _ONE_BIT.match(txt[i])
+        if not m:
+            continue
+        ones += 1
+        val = m.group(1)
+        prev = txt[i - 1] if i else ""
+        nxt = txt[i + 1] if i + 1 < len(toks) else ""
+        if i >= 3 and txt[i - 3] == "assign" and prev == "=" and nxt == ";" \
+                and toks[i - 2][0] in ("ident", "esc"):
+            found.append(("assign", toks[i - 3][1], toks[i + 1][2], val,
+                          txt[i - 2]))
+        elif prev == "(" and nxt == ")" and i >= 3 and txt[i - 3] == ".":
+            found.append(("net", a, b, val, None))
+        elif prev in ("{", ",") and nxt in (",", "}", ")"):
+            found.append(("net", a, b, val, None))
+        elif prev == "(" and nxt == "," and not (i >= 3 and txt[i - 3] == "."):
+            found.append(("net", a, b, val, None))
+        elif prev == "=" and nxt in (";", ",") \
+                and not (i >= 2 and txt[i - 2] in ("=", "!", "<", ">")):
+            j = i - 1
+            while j > 0 and txt[j - 1] not in (";", "endmodule", ")") \
+                    and not (txt[j - 1] == "begin" or txt[j - 1] == "end"):
+                j -= 1
+            if txt[j] in ("assign", "wire", "tri", "wand", "wor", "supply0",
+                          "supply1") and txt[j] != "":
+                found.append(("net", a, b, val, None))
+    return found, ones
+
+
 def _find_ties(text: str) -> list:
     """The literals `tie_constants` drives: [(kind, start, end, value, extra)],
     in text order. kind is `assign` (`assign x = 1'b0;`, one target token; the
@@ -260,50 +476,173 @@ def _find_ties(text: str) -> list:
     (an operand of an operator, a ternary branch, a lone parenthesis, an event)
     is an expression, not a net: it is not rewritten, and `remaining_constants`
     reports it."""
+    return _info(text).found
+
+
+class _Info:
+    def __init__(self, found, ones, gpins):
+        self.found, self.ones, self.gpins = found, ones, gpins
+        self.heads = self.used = None
+
+
+_CACHE: dict = {}          # (length, hash) of a text -> _Info, last few texts
+_REMAINING: dict = {}      # (length, hash) of a tied text -> remaining count
+
+
+def _key(text):
+    return (len(text), hash(text))
+
+
+def _info(text: str) -> _Info:
+    key = _key(text)
+    got = _CACHE.get(key)
+    if got is None:
+        got = _analyze(text)
+        if len(_CACHE) >= 3:
+            _CACHE.pop(next(iter(_CACHE)))
+        _CACHE[key] = got
+    return got
+
+
+def _analyze_exact(text: str) -> _Info:
+    """The reference: tokenize everything (slow, large)."""
     toks = _tokens(text)
+    found, ones = _scan_tokens(text, toks)
+    info = _Info(found, ones, _generate_pin_literals(text))
     txt = [text[a:b] for _, a, b in toks]
-    found = []
-    for i, (k, a, b) in enumerate(toks):
-        if k != "number":
-            continue
-        m = _ONE_BIT.match(txt[i])
-        if not m:
-            continue
-        val = m.group(1)
-        prev = txt[i - 1] if i else ""
-        nxt = txt[i + 1] if i + 1 < len(toks) else ""
-        if i >= 3 and txt[i - 3] == "assign" and prev == "=" and nxt == ";" \
-                and toks[i - 2][0] in ("ident", "esc"):
-            found.append(("assign", toks[i - 3][1], toks[i + 1][2], val,
-                          txt[i - 2]))
-        elif prev == "(" and nxt == ")" and i >= 3 and txt[i - 3] == ".":
-            found.append(("net", a, b, val, None))
-        elif prev in ("{", ",") and nxt in (",", "}", ")"):
-            found.append(("net", a, b, val, None))
-        elif prev == "(" and nxt == "," and not (i >= 3 and txt[i - 3] == "."):
-            found.append(("net", a, b, val, None))       # first positional port
-        elif prev == "=" and nxt in (";", ",") \
-                and not (i >= 2 and txt[i - 2] in ("=", "!", "<", ">")):
-            # the right-hand side of a continuous assignment or a net
-            # declaration: look back to the first token of the statement
-            j = i - 1
-            while j > 0 and txt[j - 1] not in (";", "endmodule", ")") \
-                    and not (txt[j - 1] == "begin" or txt[j - 1] == "end"):
-                j -= 1
-            if txt[j] in ("assign", "wire", "tri", "wand", "wor", "supply0",
-                          "supply1") and txt[j] != "":
-                found.append(("net", a, b, val, None))
-    return found
+    info.used = {t.lstrip("\\") for (k, _a, _b), t in zip(toks, txt)
+                 if k in ("ident", "esc")}
+    info.heads = _module_heads(text, toks, txt)
+    return info
+
+
+def _module_heads(text, toks, txt):
+    heads = []                       # end of each module header (its `;`)
+    for i, t in enumerate(txt):
+        if toks[i][0] == "ident" and t in ("module", "macromodule"):
+            depth, j = 0, i + 1
+            while j < len(toks):
+                if txt[j] == "(":
+                    depth += 1
+                elif txt[j] == ")":
+                    depth -= 1
+                elif txt[j] == ";" and depth == 0:
+                    break
+                j += 1
+            heads.append(toks[min(j, len(toks) - 1)][2])
+    return heads
+
+
+def _analyze(text: str) -> _Info:
+    lex = _Lex(text)
+    if not lex.ok:
+        return _analyze_exact(text)
+    found, ones, gpins = [], 0, 0
+    covered = 0
+    p = text.find("'")
+    while p >= 0:
+        m = _CAND.match(text, p)
+        b = _BACK1.search(text, max(0, p - 64), p) if m else None
+        if b and (b.start() == 0 or text[b.start() - 1] not in _WORD) \
+                and lex.visible(p) and lex.visible(b.start()):
+            start = b.start()
+            if lex.generate_depth(start) > 0:
+                gpins += _generate_pin(lex, start)
+            if start >= covered and not lex.skipped(start):
+                s = lex.prev_sync(start)
+                e = lex.next_sync(start)
+                w = text[s:e]
+                f, o = _scan_tokens(w, _tokens(w))
+                found += [(k, a + s, b2 + s, v, x) for k, a, b2, v, x in f]
+                ones += o
+                covered = e
+        p = text.find("'", p + 1)
+    info = _Info(found, ones, gpins)
+    info.lex = lex
+    return info
+
+
+def _generate_pin(lex, start):
+    """1 when the one-bit literal at `start` (inside a `generate` block) is a
+    pin connection `.P(1'b0)`; the exact rule of `_generate_pin_literals`."""
+    t = lex.text
+    s = lex.prev_sync(start, use_skips=False)
+    e = lex.next_sync(start, use_skips=False)
+    w = t[s:e]
+    toks = [(m.lastgroup, m.start(), m.end()) for m in _TOKEN.finditer(w)
+            if m.lastgroup not in _INERT]
+    txt = [w[a:b] for _, a, b in toks]
+    for i, (k, a, _b) in enumerate(toks):
+        if a == start - s:
+            if i >= 3 and txt[i - 1] == "(" and txt[i - 3] == "." \
+                    and i + 1 < len(toks) and txt[i + 1] == ")":
+                return 1
+            return 0
+    return 0
+
+
+def _heads_used(text: str, info: _Info):
+    """Module header ends and the names the text uses, for `tie_constants`."""
+    if info.heads is not None:
+        return info.heads, info.used
+    lex = info.lex
+    t = text
+    heads = []
+    for w in ("module", "macromodule"):
+        for p in lex._word_hits(w):
+            if lex.skipped(p):
+                continue
+            e = lex.next_sync(p)
+            while True:
+                win = t[p:e]
+                toks = _tokens(win)
+                txt = [win[a:b] for _, a, b in toks]
+                depth, j = 0, 1
+                while j < len(toks):
+                    if txt[j] == "(":
+                        depth += 1
+                    elif txt[j] == ")":
+                        depth -= 1
+                    elif txt[j] == ";" and depth == 0:
+                        break
+                    j += 1
+                if j < len(toks) or e >= len(t):
+                    heads.append(p + toks[min(j, len(toks) - 1)][2])
+                    break
+                e = lex.next_sync(e)
+    heads.sort()
+    used, q = set(), t.find("tie_const_")
+    while q >= 0:
+        if not lex.hidden(q) and not lex.skipped(q):
+            a = q
+            while a > 0 and t[a - 1] in _WORD:
+                a -= 1
+            z = q
+            while z < len(t) and t[z] in _WORD:
+                z += 1
+            if not lex.in_esc(q):
+                used.add(t[a:z])
+            else:
+                r = max(t.rfind(c, max(0, q - 4096), q) for c in _BLANKS)
+                b = t.find("\\", r + 1, q)
+                zz = z
+                while zz < len(t) and not t[zz].isspace():
+                    zz += 1
+                used.add(t[b:zz].lstrip("\\"))
+        q = t.find("tie_const_", q + 1)
+    info.heads, info.used = heads, used
+    return heads, used
 
 
 def remaining_constants(text: str) -> int:
     """How many one-bit literals of the design are left that `tie_constants`
     does not rewrite (operands, ternary branches, lone parentheses, events):
     a P&R tool may read such a literal as a supply, so they are warned about."""
-    toks = _tokens(text)
-    n = sum(1 for k, a, b in toks if k == "number"
-            and _ONE_BIT.match(text[a:b]))
-    return n - len(_find_ties(text)) + _generate_pin_literals(text)
+    got = _REMAINING.get(_key(text))
+    if got is not None:
+        return got
+    info = _info(text)
+    return info.ones - len(info.found) + info.gpins
 
 
 def _generate_pin_literals(text: str) -> int:
@@ -371,26 +710,11 @@ def tie_constants(text: str, hi: tuple[str, str], lo: tuple[str, str]
     order across the whole text, skipping any number whose names the text
     already uses, so a second pass over a tied netlist ties nothing."""
     cells = {"1": hi, "0": lo}
-    found = _find_ties(text)
+    info = _info(text)
+    found = info.found
     if not found:
         return text, 0
-    toks = _tokens(text)
-    txt = [text[a:b] for _, a, b in toks]
-    used = {t.lstrip("\\") for (k, _a, _b), t in zip(toks, txt)
-            if k in ("ident", "esc")}
-    heads = []                       # end of each module header (its `;`)
-    for i, t in enumerate(txt):
-        if toks[i][0] == "ident" and t in ("module", "macromodule"):
-            depth, j = 0, i + 1
-            while j < len(toks):
-                if txt[j] == "(":
-                    depth += 1
-                elif txt[j] == ")":
-                    depth -= 1
-                elif txt[j] == ";" and depth == 0:
-                    break
-                j += 1
-            heads.append(toks[min(j, len(toks) - 1)][2])
+    heads, used = _heads_used(text, info)
     edits = []                       # (start, end, replacement)
     decls: dict = {}                 # header end -> declaration lines
     k = 0
@@ -418,7 +742,11 @@ def tie_constants(text: str, hi: tuple[str, str], lo: tuple[str, str]
         out.append(r)
         pos = b
     out.append(text[pos:])
-    return "".join(out), len(found)
+    res = "".join(out)
+    if len(_REMAINING) >= 3:
+        _REMAINING.pop(next(iter(_REMAINING)))
+    _REMAINING[_key(res)] = info.ones - len(found) + info.gpins
+    return res, len(found)
 
 
 # The ORFS steps that run repair_design / repair_timing, as their

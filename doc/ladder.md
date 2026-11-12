@@ -90,7 +90,10 @@ the first rejection stops the others.
   neutral: `setup_ws >= 0`, `hold_ws >= 0`, `drc_errors <= 0`. Giving `accept.metrics` **replaces** the default set: list every number you want checked. Slack bounds are
   in the platform's time unit, like the metrics themselves. A pack command
   that does not write one of the named numbers leaves the rung unverified; list
-  the numbers it does write.
+  the numbers it does write. A key may be a dotted path into a nested mapping
+  of `pnr_metrics.json` (`group.name`). When the pack's command writes a
+  `final` mapping, its entries are what the checks read in place of the same
+  top-level keys; without one nothing changes.
 * **Corner checks** (ORFS backend). `accept.corners.<name>` times the rung's
   routed netlist, SDC and SPEF with the listed Liberty files (OpenSTA in the
   ORFS image, or `$OPENSTA`) and bounds `setup_ws` / `hold_ws` of that corner.
@@ -268,7 +271,7 @@ outlive a change of: they are hashed into the placement's manifest.
 
 **What the command backend's manifest covers**: the whole command line, the
 content of every word of it that is a file (the script), the netlist and SDC
-the flow gives it, the environment the flow itself builds for it (the pack's wire RC files and what they name, the recipe variables: values and file content), every option of the flow config's `pnr:` section (the
+the flow gives it, the environment the flow itself builds for it (the pack's wire RC files and what they name, the variables the flow built for the command: values and file content), every option of the flow config's `pnr:` section (the
 command cannot say which of them act before the restart stage, so all count as
 acting before it; only the ladder parameter is left out), and the
 `stage_inputs`. It does **not** cover anything else the command reads (data it
@@ -292,7 +295,11 @@ By default every job (the placement, each rung, each user check) is a local
 process in its own process group, and `jobs` bounds how many rungs run at
 once. With `submit` each job runs through a template instead. `{cmd}` (required)
 is the job's command line, shell-quoted and prefixed with `env` and the
-`CIRCT_FLOW_*` variables it needs; `{name}` is a unique job name for this run;
+variables the job needs: the `CIRCT_FLOW_*` variables, `PYTHONPATH`, and every
+variable the flow set or changed for the job (absent from, or different in,
+the submitting process's environment). These values are written on the job's
+command line, where process listings and scheduler records can show them: keep
+secrets out of a job's environment and let the command read them from a file; `{name}` is a unique job name for this run;
 `{cmdq}` is the same line as one quoted word (for `sbatch --wrap`); `{log}` and
 `{cwd}` are its log file and directory. The template runs under
 `bash -c` and **must block until the job has finished and exit with its
