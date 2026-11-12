@@ -1,0 +1,46 @@
+{
+  "default_family": "a",
+  "cross_register": true,
+  "overrides": [],
+  "families": {
+    "a": {
+      "clear": {
+        "cell": "TMB{n}CLR_A",
+        "widths": [
+          8,
+          4
+        ],
+        "clock": "CK",
+        "reset": "R",
+        "data": "D{i}",
+        "out": "Q{i}",
+        "tie": {
+          "SE": 0,
+          "SI": 0
+        },
+        "single": {
+          "cell": "TSB1CLR_A",
+          "data": "D",
+          "out": "Q"
+        }
+      },
+      "none": {
+        "cell": "TMB{n}NRS_A",
+        "widths": [
+          8,
+          4
+        ],
+        "clock": "CK",
+        "data": "D{i}",
+        "out": "Q{i}",
+        "tie": {
+          "SE": 0,
+          "SI": "last_q"
+        },
+        "single": {
+          "cell": "TSB1NRS_A"
+        }
+      }
+    }
+  }
+}

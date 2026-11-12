@@ -43,7 +43,10 @@ cells. The pass names no cell: the spec (families, cell-name templates with
 unused pins) comes from the tech pack's `flow.multibit:` section
 (`scripts/circt_flow/multibit.py` documents the schema; the flow writes the JSON
 and passes it). `cross_register: true` pools leftover bits of different
-registers. Banks are created in the order of the first bit of each group, so
+registers. A class may name a single-bit cell (`single: {cell, data, out}`
+in the spec): its leftover bits then become instances of that cell, with
+the class's clock, reset and tie pins, instead of the liberty's plain flop
+(the flow passes it only with `multibit: {single: true}`). Banks are created in the order of the first bit of each group, so
 the result does not depend on how the compiler allocated its objects (see
 "Determinism"). Off unless the flow config says `multibit:`.
 

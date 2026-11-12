@@ -47,6 +47,7 @@ under `out/ibex/pnr/`, summarised in `out/ibex/pnr/pnr_metrics.json`.
 | `examples/shift-select/` | a `case` over a shift amount, with `map-shift-select` off and on, on ASAP7 |
 | `doc/techpacks.md` | tech packs: format, lookup, P&R from a pack, the leak audit |
 | `doc/ladder.md` | the closure ladder: one placement, several variants of the later P&R stages in parallel, the lowest one that passes is the result |
+| `doc/postlayout.md` | post-layout flavour recovery on a placed netlist and its parasitics |
 | `patches/` | patches to CIRCT, ABC and mockturtle (see `patches/README`) |
 | `scripts/verify/` | equivalence checks: register-mapper miter, top-level miter |
 | `Dockerfile` | the circt-abc image |
@@ -98,18 +99,80 @@ against ORFS's own synthesis are next.
 
 ## Changes in this release
 
-* Closure ladder (`doc/ladder.md`): a metric name in `accept.metrics` may be a
-  dotted path into a nested mapping of `pnr_metrics.json` (`group.name`). A
-  `final` mapping in the metrics, when a pack's command writes one, is what the
-  checks read in place of the same top-level keys; without one nothing changes.
-* Closure ladder: besides the `CIRCT_FLOW_*` variables and `PYTHONPATH`, the
-  submit line carries every variable the flow set or changed for the job
-  (absent from, or different in, the submitting process's environment). Their
-  values appear on the job's command line.
-* The ORFS stage's tie rewrite finds one-bit constants in one shared pass: its
-  cost no longer grows out of proportion with the size of the netlist, the
-  warning is computed once per netlist content instead of once per call, and
-  the output is the same as before.
+* Post-layout flavour recovery (`doc/postlayout.md`, `pnr.post_layout`):
+  on a placed netlist and its SPEF (written by a tech pack's own P&R
+  command, or given to `python3 -m circt_flow.postlayout` from any P&R
+  result; the built-in ORFS stage refuses the key), OpenSTA moves
+  cells along the pack's flavour ladder to close setup and back down to give
+  leakage back, with the clock network frozen and only footprint-equal swaps,
+  so the placement stays (`eco.tcl` applies the swaps to the database).
+  Options: sensitivity fix, leakage-ordered recovery, a ladder cap with a
+  closing pass, pair recovery, hold tolerance, false paths to and from
+  ports, a second parasitic view. The result's `final` timing is what a
+  closure ladder judges. The synthesis-time `vt_swap:` takes the same leakage controls.
+* P&R recipe options (`doc/techpacks.md`, `circt_flow/pnr_recipe.py`):
+  minimum input delay and a given SDC (also on the ORFS stage), gated-clock
+  net skipping, clock-gate sizing by measured arrival (optionally with a
+  separate tolerance for gates that clock registers in the fan-in of an
+  output port), root-buffer flattening, a
+  don't-use list for the post-clock-tree repair, dual-corner hold repair,
+  and a placement check that reads the logs for a failed legalization (also
+  on the ORFS stage). The clock-tree and hold-corner options act only
+  through a tech pack's own P&R command, which receives them as environment
+  variables and sources the Tcl procedures in
+  `circt_flow/pnr_tcl/cts_recipe.tcl`; the ORFS stage refuses them.
+* Checks around a pack's P&R command: the pin-node capacitance OpenROAD's
+  global-route SPEF writer leaves out is restored (`circt_flow/spef_pincap.py`,
+  `pnr_tcl/spef_export.tcl`), an SDF with too few net-delay entries, or
+  with nearly all of them zero, is reported (`circt_flow/sdf_tools.py`), and escaped names a SPEF reader may skip are
+  reported (`circt_flow/netlist_names.py`).
+* Closure ladder (`doc/ladder.md`, "Steps a flow adds"): code that runs the
+  ladder can give it hooks: `finish_rung` after each rung's P&R result
+  (raising `ladder.RungRejected` rejects the rung), `check_shared_placement`
+  once on the shared placement before any rung, and `earlier_stage`, which
+  refuses a laddered key that acts before the restart stage. The hooks are
+  for code that runs the ladder from Python; the built-in stages use none of
+  the three.
+* Behaviour change: fan-out buffering now sees the member pins of a liberty
+  `bundle` (a multibit register's `Q0..Qn`, `D0..Dn`) by default, so on a
+  design with multibit banks the nets the banks drive are buffered like
+  those of single-bit flops. `fanout_buffer: {bundle_pins: false}` restores
+  the earlier behaviour; a liberty without bundle groups is unaffected.
+* `multibit: {single: true}` (opt-in): the bits no bank takes become
+  instances of a single-bit cell the pack declares for that class
+  (`single: {cell, data, out}`), with the class's clock, reset and tie
+  pins, instead of the liberty's plain flop.
+* `multibit: {tie: {<pin>: 0|1|last_q}}` (opt-in): for a pin the pack's
+  classes tie, gives the tie value in every class that ties that pin,
+  instead of the pack's value.
+* Behaviour change for packs with their own P&R command: after a
+  successful command the flow rewrites in place a `*.spef` under the P&R
+  directory when the export helper `spef_export_global_route` wrote it (a
+  log there holds the helper's lines for the file's path, with the size and
+  CRC-32 the file still has), its `*CAP` lines sum to
+  less than its `*D_NET` totals (the pin-node capacitance OpenROAD's
+  global-route estimate leaves out), it has `*CAP` entries and no coupling
+  capacitors, and it parses completely; the original is kept as
+  `<file>.spef.orig`. Every other SPEF is left as written and reported in
+  one line. On by default; `pnr: {spef_restore_pincap: false}` turns it
+  off. A file the check cannot read or parse is reported and never fails
+  the stage.
+* A pack command's environment now always carries `CTS_RECIPE_TCL`,
+  `SPEF_EXPORT_TCL` and `SPEF_RESTORE_PINCAP`, and `hold_margin`,
+  `setup_margin` and `cts_args` set `HOLD_MARGIN`, `SETUP_MARGIN` and
+  `CTS_EXTRA_ARGS` for it; these replace variables of the same name in the
+  calling shell.
+* Fan-out buffering with `bundle_pins` (above) also counts the member
+  input pins of bundled cells as loads.
+* Closure-ladder placements and rung records made by the previous release
+  are made again once after the upgrade.
+* New warnings: escaped netlist names that a SPEF reader may skip (before a
+  pack command), and an SDF with too few net-delay entries or with nearly
+  all of them zero (after it).
+* `pnr.hold_margin`, `pnr.setup_margin` and `vt_swap.margin_ps` must be
+  finite numbers: an infinite or NaN value, passed on before, is now
+  refused when the configuration is read (a quoted number is accepted as
+  before). The new time keys are checked the same way.
 
 ## License
 

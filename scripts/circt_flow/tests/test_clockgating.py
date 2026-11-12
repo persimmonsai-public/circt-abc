@@ -46,5 +46,5 @@ def test_vt_swap_keep_clock_cells_key():
 
 def test_vt_swap_tcl_skips_clock_cells_and_names_no_cell():
     t = vtswap.TCL
-    assert t.count("is_clock_cell $inst") == 2      # fix and recover
+    assert t.count("is_clock_cell $inst") == 3      # fix, recover and pair recovery
     assert "%(keep_clk)d" in t

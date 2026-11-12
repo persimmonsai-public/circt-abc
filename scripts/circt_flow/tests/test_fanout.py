@@ -170,3 +170,59 @@ def test_annotated_driver_keeps_its_loads_up_to_its_own_limit(tmp_path):
                                    "BUF", "A", "Y", 8, net_limits=lim)
     drv, ld, cell = _graph(out)
     assert max(len(v) for v in ld.values()) <= 24
+
+
+def test_multibit_register_output_is_buffered_unless_bundle_pins_off():
+    """A multibit register's Q0..Qn are bundle members: known to the cell under `bundle_pins`, not `pins` (which names the group).
+    Seen by default; with bundle_pins=False the member pins are unknown (the net is not seen)."""
+    mb = SimpleNamespace(pins={"CK": "input", "D": "input", "Q": "output"}, clock_pins={"CK"},
+                         bundle_pins={"D0": "input", "Q0": "output", "Q1": "output"})
+    cells = dict(CELLS, MB=mb)
+    lines = ["module top (clk, a, y);", "  input clk;", "  input a;", "  output y;", "  wire hot;"]
+    lines += [f"  wire o{i};" for i in range(20)]
+    lines.append("  MB src (.CK(clk), .D0(a), .Q0(hot));")
+    lines += [f"  INV \\u_x/g{i}  (.A(hot), .Y(o{i}));" for i in range(20)]
+    lines.append("endmodule")
+    text = "\n".join(lines) + "\n"
+    out0, st0 = fanout.buffer_fanout(text, cells, "BUF", "A", "Y", 8, bundle_pins=False)
+    assert st0.nets == 0 and out0 == text            # switched off: the net is not seen
+    out1, st1 = fanout.buffer_fanout(text, cells, "BUF", "A", "Y", 8)
+    assert st1.nets == 1 and st1.buffers >= 2 and st1.worst_fanout == 20
+    out2, st2 = fanout.buffer_fanout(text, cells, "BUF", "A", "Y", 8, bundle_pins=True)
+    assert out2 == out1 and st2.nets == 1            # the explicit key gives the default's netlist
+    # a cell without bundle members (single-bit flops, plain gates) is not affected by the switch
+    plain = text.replace("MB src (.CK(clk), .D0(a), .Q0(hot));", "DFF src (.CK(clk), .D(a), .Q(hot));")
+    assert fanout.buffer_fanout(plain, cells, "BUF", "A", "Y", 8, bundle_pins=False)[0] == \
+        fanout.buffer_fanout(plain, cells, "BUF", "A", "Y", 8)[0]
+
+
+def test_parse_spec_bundle_pins_key():
+    sp = fanout.parse_spec(None, {"cell": "BUF", "bundle_pins": True}, "t")
+    assert sp.bundle_pins is True
+    assert fanout.parse_spec(None, {"cell": "BUF"}, "t").bundle_pins is True      # the default
+    assert fanout.parse_spec(None, {"cell": "BUF", "bundle_pins": False}, "t").bundle_pins is False
+    # the pack can switch it off and a flow config back on, key by key
+    assert fanout.parse_spec({"cell": "BUF", "bundle_pins": False}, None, "t").bundle_pins is False
+    assert fanout.parse_spec({"cell": "BUF", "bundle_pins": False}, {"bundle_pins": True}, "t").bundle_pins is True
+    for bad in ("yes", 1, None):
+        with pytest.raises(KeyError, match="bundle_pins"):
+            fanout.parse_spec(None, {"cell": "BUF", "bundle_pins": bad}, "t")
+
+
+def test_power_flow_modules_see_bundle_pins():
+    """buffer_modules (the power flow's per-module stage) follows the spec's bundle_pins like the flat stage."""
+    mb = SimpleNamespace(pins={"CK": "input", "D": "input", "Q": "output"}, clock_pins={"CK"},
+                         bundle_pins={"D0": "input", "Q0": "output"})
+    cells = dict(CELLS, MB=mb)
+    lines = ["module top (clk, a);", "  input clk;", "  input a;", "  wire hot;"]
+    lines += [f"  wire o{i};" for i in range(20)]
+    lines.append("  MB src (.CK(clk), .D0(a), .Q0(hot));")
+    lines += [f"  INV g{i} (.A(hot), .Y(o{i}));" for i in range(20)]
+    lines.append("endmodule")
+    text = "\n".join(lines) + "\n"
+    on = fanout.FanoutSpec(cell="BUF")
+    off = fanout.FanoutSpec(cell="BUF", bundle_pins=False)
+    out_on, per_on = fanout.buffer_modules(text, "top", {"top": "R"}, {"R": cells}, on)
+    out_off, per_off = fanout.buffer_modules(text, "top", {"top": "R"}, {"R": cells}, off)
+    assert per_on["top"]["nets"] == 1 and out_on != text
+    assert per_off == {} and out_off == text

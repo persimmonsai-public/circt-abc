@@ -244,6 +244,36 @@ class DesignConfig:
             from . import vtswap as vtswap_mod
             vt_swap_spec = vtswap_mod.parse_vt_swap(cfg["vt_swap"],
                                                     config_path)
+            if prof is not None and vt_swap_spec.enabled and (
+                    vt_swap_spec.ladder_cap or vt_swap_spec.ladder_escalate):
+                fl = prof.flavours_at(rail)
+                if fl:
+                    vtswap_mod.check_ladder_tokens(
+                        vt_swap_spec.ladder_cap, vt_swap_spec.ladder_escalate,
+                        fl["tokens"], f"{config_path}: vt_swap")
+        # The flow config's pnr margins are checked here too (a pack's are
+        # checked when the pack is read); the P&R stage checks them again.
+        if isinstance(cfg.get("pnr"), dict):
+            from . import pnr_recipe as pnr_recipe_mod
+            for k in ("hold_margin", "setup_margin"):
+                if cfg["pnr"].get(k) is not None:
+                    pnr_recipe_mod._margin(cfg["pnr"][k], k)
+        # pnr.post_layout is checked here, before any stage runs (it acts
+        # only after a pack's P&R command).
+        pl_cfg = (cfg.get("pnr") or {}).get("post_layout") \
+            if isinstance(cfg.get("pnr"), dict) else None
+        if pl_cfg:
+            from . import postlayout as postlayout_mod, vtswap as vtswap_mod
+            pl = postlayout_mod.parse_post_layout(pl_cfg, str(config_path))
+            if pl.enabled:
+                fl = prof.flavours_at(rail) if prof is not None else None
+                if not fl:
+                    raise vtswap_mod.VtSwapError(
+                        f"{config_path}: pnr.post_layout needs a tech pack "
+                        "with vt_flavours:")
+                vtswap_mod.check_ladder_tokens(
+                    pl.ladder_cap, pl.ladder_escalate, fl["tokens"],
+                    f"{config_path}: pnr.post_layout")
         from . import fanout as fanout_mod
         fanout_spec = fanout_mod.parse_spec(
             flow_defaults.get("fanout_buffer"), cfg.get("fanout_buffer"),

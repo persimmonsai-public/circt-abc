@@ -94,6 +94,9 @@ class LibCell:
     related_power: Dict[str, str] = field(default_factory=dict)
     related_ground: Dict[str, str] = field(default_factory=dict)
     clock_pins: set = field(default_factory=set)  # pins with clock : true
+    # member pins of a bundle/bus group (a multibit register's D0..Dn, Q0..Qn): pin -> direction. Kept apart from `pins`, which names the
+    # group (D, Q) and which the power-intent checks read.
+    bundle_pins: Dict[str, str] = field(default_factory=dict)
 
 
 def liberty_cells(paths: Iterable[Path], only: Optional[set] = None
@@ -138,6 +141,8 @@ def liberty_cells(paths: Iterable[Path], only: Optional[set] = None
                         if sub.kind == "pin" and sub.attrs.get("direction"):
                             c.pins.setdefault(pg.args[0],
                                               sub.attrs["direction"])
+                            if sub.args:
+                                c.bundle_pins[sub.args[0]] = sub.attrs["direction"]
             c.is_level_shifter = g.attrs.get("is_level_shifter",
                                              "").lower() == "true"
             c.ls_type = g.attrs.get("level_shifter_type") or None

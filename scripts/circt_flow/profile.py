@@ -365,27 +365,55 @@ def expand(value: str, base: Path) -> Path:
     return base / expand_vars(value)
 
 
+# Recipe options (pnr_recipe.py) a pack may set as defaults for the flow
+# config's `pnr:`; each is validated here by pnr_recipe.parse.
+_PNR_DEFAULTS = ("placement_check", "cts_gate_port_tol", "cts_skip_fanout_le",
+                 "cts_size_gates", "cts_flatten_root", "repair_dont_use",
+                 "hold_corner")
+
+
 def _pnr_section(d: dict, base: Path, path: Path) -> dict:
     """A pack's `pnr:`: orfs_platform_dir (a directory, relative to the
     pack) or command (argv; `./` and `../` words are relative to the pack,
     every word has ${VAR} expanded), not both. A pack may also give defaults
     for the ORFS stage's clock-tree and margin controls (`cts_buffers`,
     `cts_cluster_size`, `cts_cluster_diameter`, `cts_args`, `hold_margin`,
-    `setup_margin`); a flow config's own `pnr:` value wins. A pack with its
-    own P&R command may declare `stage_restart: [<stage>, ...]`, the stages
-    the command can stop after and restart at (the closure ladder,
-    doc/ladder.md); `stage_inputs: [path, ...]` lists the files and directories
-    (relative to the pack) the command reads, so that the ladder's manifest
-    covers them."""
+    `setup_margin`) and for the recipe options of pnr_recipe
+    (`_PNR_DEFAULTS`: `cts_skip_fanout_le`, `cts_size_gates`,
+    `cts_gate_port_tol`, `cts_flatten_root`, `repair_dont_use`,
+    `hold_corner`, `placement_check`), each validated as pnr_recipe validates it; a flow config's
+    own `pnr:` value wins (0 / false / empty, where the key allows, cancels a
+    pack default). A pack with its own P&R command may declare
+    `stage_restart: [<stage>, ...]`, the stages the command can stop after
+    and restart at (the closure ladder, doc/ladder.md); `stage_inputs:
+    [path, ...]` lists the files and directories (relative to the pack) the
+    command reads, so that the ladder's manifest covers them."""
     p = dict(d.get("pnr") or {})
     ctl = {"cts_buffers", "cts_cluster_size", "cts_cluster_diameter",
            "cts_args", "hold_margin", "setup_margin", "stage_restart",
-           "stage_inputs"}
+           "stage_inputs", "results", "placement_logs", *_PNR_DEFAULTS}
     unknown = set(p) - {"orfs_platform_dir", "command"} - ctl
     if unknown:
         raise KeyError(f"{path}: pnr.{sorted(unknown)[0]} is not a pack "
                        "P&R key; allowed: orfs_platform_dir, command, "
                        + ", ".join(sorted(ctl)))
+    from . import pnr_recipe
+    try:
+        pnr_recipe.result_files(p)
+        pnr_recipe.placement_logs(p)
+    except pnr_recipe.RecipeError as e:
+        raise ValueError(f"{path}: {e}")
+    without = [k for k in ("results", "placement_logs") if k in p]
+    if without and "command" not in p:
+        raise ValueError(f"{path}: pnr.{without[0]} describes what a pack's own "
+                         "P&R command leaves; it needs pnr.command")
+    for k in (*_PNR_DEFAULTS, "hold_margin", "setup_margin"):
+        if k in p:
+            try:   # each key alone, except the ones that need cts_size_gates
+                pnr_recipe.parse({}, {k: p[k], **({"cts_size_gates":
+                    p["cts_size_gates"]} if "cts_size_gates" in p else {})})
+            except pnr_recipe.RecipeError as e:
+                raise ValueError(f"{path}: {e}")
     if len([k for k in p if k not in ctl]) > 1:
         raise ValueError(f"{path}: pnr: give orfs_platform_dir or command, "
                          "not both")

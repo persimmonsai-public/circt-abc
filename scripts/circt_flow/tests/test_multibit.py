@@ -216,3 +216,71 @@ def test_threshold_rule_accepts_both_file_shapes(tmp_path):
                                                 "hot_toggle_rate": 0.1}}, tmp_path, "t")
     assert [o["family"] for o in spec["overrides"]] == ["b"]
     assert "hot" in spec["overrides"][0]["reg"]
+
+
+def test_single_cell_declared_and_checked():
+    pack = json.loads(json.dumps(PACK))
+    pack["families"]["a"]["clear"]["single"] = {"cell": "TSB_C_A", "data": "D", "out": "Q"}
+    pack["families"]["a"]["none"]["single"] = {"cell": "TSB_N_A"}
+    assert multibit.parse_pack(pack, "t") is pack
+    names = multibit.cell_names(pack)
+    assert "TSB_C_A" in names and "TSB_N_A" in names
+    assert multibit.check_cells(pack, set(names)) == []
+    assert multibit.check_cells(pack, set(names) - {"TSB_C_A"}) == \
+        ["multibit cell TSB_C_A is not in the liberties"]
+    for bad in ({"cell": "TSB_{n}"}, {"cell": "X", "pin": "D"}, {"data": "D"}):
+        p2 = json.loads(json.dumps(pack))
+        p2["families"]["a"]["clear"]["single"] = bad
+        with pytest.raises(KeyError, match="single"):
+            multibit.parse_pack(p2, "t")
+
+
+def test_single_cells_are_opt_in(tmp_path):
+    pack = json.loads(json.dumps(PACK))
+    pack["families"]["a"]["clear"]["single"] = {"cell": "TSB_C_A"}
+    off = multibit.resolve(pack, True, tmp_path, "t")
+    assert "single" not in off["families"]["a"]["clear"]
+    on = multibit.resolve(pack, {"single": True}, tmp_path, "t")
+    assert on["families"]["a"]["clear"]["single"] == {"cell": "TSB_C_A"}
+    assert "single" in pack["families"]["a"]["clear"]   # the pack itself is not modified
+
+
+def test_a_null_family_or_class_does_not_break_the_default(tmp_path):
+    """A pack may leave a family or a class null; resolving without `single: true` must not trip over it."""
+    for edit in (lambda p: p["families"].__setitem__("spare", None),
+                 lambda p: p["families"]["a"].__setitem__("spare", None)):
+        pack = json.loads(json.dumps(PACK)); edit(pack)
+        try:
+            ref = multibit.parse_pack(pack, "t")
+        except KeyError:
+            continue                       # this shape is refused when the pack is read: nothing to resolve
+        spec = multibit.resolve(pack, True, tmp_path, "t")
+        assert spec["families"]["a"]["clear"]["tie"] == {"SE": 0, "SI": "last_q"}
+
+
+def test_tie_override_is_opt_in_and_checked(tmp_path):
+    base = multibit.resolve(PACK, True, tmp_path, "t")
+    assert base["families"]["a"]["clear"]["tie"] == {"SE": 0, "SI": "last_q"}
+    spec = multibit.resolve(PACK, {"tie": {"SI": 0}}, tmp_path, "t")
+    assert spec["families"]["a"]["clear"]["tie"] == {"SE": 0, "SI": 0}
+    assert "tie" not in spec["families"]["a"]["none"]          # a class that ties nothing stays so
+    assert "tie" not in spec["families"]["b"]["clear"]
+    assert PACK["families"]["a"]["clear"]["tie"]["SI"] == "last_q"  # the pack's dict is untouched
+    for bad in ({"SI": 2}, {"SI": True}, {"SI": "q"}, {}, [0]):
+        with pytest.raises(KeyError, match="tie"):
+            multibit.resolve(PACK, {"tie": bad}, tmp_path, "t")
+
+
+def test_defaults_give_the_mapper_the_same_spec_file(tmp_path):
+    """Without `single: true` and without `tie:` in the flow config the file the register mapper reads is byte-identical
+    to the one of a pack that declares no single-bit cells: neither option changes a default run."""
+    with_single = json.loads(json.dumps(PACK))
+    for fam in with_single["families"].values():
+        for c in (fam or {}).values():
+            c["single"] = {"cell": "TSB_" + c["cell"].replace("{n}", ""), "data": "D", "out": "Q"}
+    def spec(pack, cfg):
+        return multibit.write(multibit.resolve(pack, cfg, tmp_path, "t"), tmp_path / "s.json").read_bytes()
+    for cfg in (True, {"cross_register": True}, {"single": False}, {"default_family": "a"}):
+        assert spec(with_single, cfg) == spec(PACK, cfg), cfg          # declared single cells are inert
+    assert spec(PACK, {"single": True}) == spec(PACK, True)            # and so is the key on a pack without them
+    assert spec(PACK, {"cross_register": True}) != spec(PACK, {"cross_register": True, "tie": {"SI": 0}})

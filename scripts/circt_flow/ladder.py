@@ -86,6 +86,12 @@ class LadderFailed(RuntimeError):
         self.code = code
 
 
+class RungRejected(RuntimeError):
+    """Raised by a flow's step after a rung's run (LadderHooks.finish_rung, or
+    the finishing step of a pack command) to reject that rung with its
+    message; on the shared placement it stops the ladder."""
+
+
 # ---------------------------------------------------------------------------
 # The declaration
 # ---------------------------------------------------------------------------
@@ -868,7 +874,7 @@ def combine(results: Sequence[tuple]) -> tuple:
 
 def decide(verdicts: Sequence[Optional[str]]) -> tuple:
     """The ladder's outcome from the rungs' verdicts in rung order (None: not
-    yet known). ("pending", None) until the answer is fixed; ("accepted", i)
+    yet known). ("pending", None) until the answer is known; ("accepted", i)
     for the lowest accepted rung once every rung below it is rejected;
     ("unverified" | "error", i) when the first rung that is not rejected could
     not be judged or failed (no higher rung can be accepted past it);
@@ -906,9 +912,83 @@ class Backend:
         """The part of a plan a placement depends on: what a rung may not
         change. Default: all of it."""
         return plan
-    def metrics(self, d: Path) -> dict: ...
+    def metrics(self, d: Path, value) -> dict:
+        """The result of the run in d, made with the parameter at `value`
+        (given by the ladder: the run's own value, whichever process started
+        the run)."""
     def corner_job(self, d: Path, corner: CornerCheck) -> Job: ...
     def corner_result(self, d: Path, corner: CornerCheck) -> dict: ...
+
+    def check_shared_placement(self, place_dir: Path) -> Optional[int]:
+        """A check of the shared placement, once, before any rung: raises
+        LadderFailed to stop the ladder; a number it returns is recorded in
+        the report as `placement_failures`. Default: none."""
+        return None
+
+
+@dataclass(frozen=True)
+class LadderHooks:
+    """Steps a flow adds around the ladder's P&R runs, given to run_flow (or
+    to a backend). Each is optional; one that is None does nothing."""
+    # finish_rung(cfg, rung_dir): after a rung's result is read (for a pack
+    # command after the flow's finishing step), with the rung's own config.
+    # It may add entries to <rung_dir>/pnr_metrics.json; RungRejected rejects
+    # the rung, any other exception makes it an error.
+    finish_rung: Optional[Callable] = None
+    # check_shared_placement(cfg, place_dir) -> number or None: the shared
+    # placement, once before any rung (cfg: the first rung's). RungRejected
+    # stops the ladder; a number is recorded as `placement_failures`.
+    check_shared_placement: Optional[Callable] = None
+    # earlier_stage(param, from_stage) -> stage or None: the stage a pack
+    # command's `pnr:` key acts in when that is before from_stage; such a
+    # parameter is refused for a restart.
+    earlier_stage: Optional[Callable] = None
+    # Seam: param_env_names(cfg, param, values, run_dir) -> the names of the
+    # command's environment variables the parameter controls (not compared).
+    param_env_names: Optional[Callable] = None
+    # Seam: hash_env_value(cfg, name, value) -> the content hash(es) of the
+    # files an environment value names, None for none.
+    hash_env_value: Optional[Callable] = None
+
+
+def flow_hooks() -> LadderHooks:
+    """The hooks the flow's stage module supplies (stages.ladder_hooks)."""
+    from .stages import ladder_hooks
+    return ladder_hooks() or LadderHooks()
+
+
+class _FlowBackend(Backend):
+    """What the two backends share: the flow config and the hooks. A run's
+    config is rebuilt from the base config and the run's value, never looked
+    up from what this process started: a resumed ladder finishes a rung with
+    the same config as the process that started it."""
+
+    def __init__(self, cfg, spec: LadderSpec, hooks: Optional[LadderHooks]):
+        self.cfg, self.spec = cfg, spec
+        self.hooks = hooks if hooks is not None else flow_hooks()
+
+    def _cfg_at(self, value):
+        """The flow config with the parameter at `value` (a rung's own)."""
+        return _with_pnr(self.cfg, apply_param(self.cfg.design.pnr,
+                                               self.spec.param, value))
+
+    def _finish(self, d: Path, value) -> bool:
+        """The flow's finish_rung on d, with the config at `value`; True when
+        it ran."""
+        if self.hooks.finish_rung is None:
+            return False
+        self.hooks.finish_rung(self._cfg_at(value), d)
+        return True
+
+    def check_shared_placement(self, place_dir: Path) -> Optional[int]:
+        if self.hooks.check_shared_placement is None:
+            return None
+        try:
+            return self.hooks.check_shared_placement(
+                self._cfg_at(self.spec.values[0]), place_dir)
+        except RungRejected as e:
+            raise LadderFailed(f"closure ladder: the shared placement "
+                               f"({place_dir}): {e}", EXIT_RUNG_FAILED)
 
 
 # ---------------------------------------------------------------------------
@@ -1186,12 +1266,22 @@ class Ladder:
                 res.seconds = time.monotonic() - t0
                 return res
             try:
-                res.metrics = be.metrics(d)
+                res.metrics = be.metrics(d, v)
+            except RungRejected as e:
+                # a flow step after the run refused the result: the rung is
+                # rejected with its words, on the metrics it left
+                try:
+                    res.metrics = json.loads(
+                        (d / "pnr_metrics.json").read_text())
+                except (OSError, ValueError):
+                    res.metrics = {}
+                res.verdict, res.reasons = REJECTED, [str(e)]
             except Exception as e:
                 res.verdict, res.reasons = ERROR, [f"no result: {e}"]
                 res.seconds = time.monotonic() - t0
                 return res
-            res.verdict, res.reasons = self._judge(i, d, res.metrics, stop)
+            else:
+                res.verdict, res.reasons = self._judge(i, d, res.metrics, stop)
             res.seconds = time.monotonic() - t0
             if res.verdict in (ACCEPTED, REJECTED):
                 _write_atomic(d / "rung_result.json", json.dumps(
@@ -1307,8 +1397,10 @@ class Ladder:
             plan = self.check_plans()
             plan_hash = self._manifest_hash({"format": FORMAT,
                                              "key": be.key(plan)})
+            placement_failures = None
             if restart:
                 place_s, reused = self._place(plan)
+                placement_failures = be.check_shared_placement(self.place_dir)
             else:
                 place_s, reused = 0.0, False
                 self.log("[closure ladder] the P&R command does not declare stage "
@@ -1339,6 +1431,8 @@ class Ladder:
                   "restart": restart, "wall_seconds": round(wall, 1),
                   "place_seconds": round(place_s, 1) if restart else None,
                   "rungs": [r.as_dict() for r in self.results]}
+        if placement_failures is not None:
+            report["placement_failures"] = placement_failures
         _write_atomic(result, json.dumps(report, indent=1, sort_keys=True,
                                          default=str) + "\n")
         self._print(report)
@@ -1402,7 +1496,7 @@ class Ladder:
                     break
                 self.done.wait(timeout=0.5)
         interrupted = self.stop.is_set() and st == "pending"
-        # The outcome is fixed: the rungs above it are not needed.
+        # The outcome is decided: the rungs above it are not needed.
         for j in range(n):
             if k is None or j > k or interrupted:
                 self.rung_stop[j].set()
@@ -1513,10 +1607,11 @@ def _tcl_word(s) -> str:
     return "".join("\\" + c if c in " \t\n$[]{}\"\\;" else c for c in str(s))
 
 
-class OrfsBackend(Backend):
-    def __init__(self, cfg, spec: LadderSpec):
-        self.cfg, self.spec = cfg, spec
+class OrfsBackend(_FlowBackend):
+    def __init__(self, cfg, spec: LadderSpec,
+                 hooks: Optional[LadderHooks] = None):
         self.stage = orfs_from_stage(spec)
+        super().__init__(cfg, spec, hooks)
         self.platform = str(cfg.design.pnr.get("platform", "asap7"))
 
     def _argv(self, d: Path, value) -> list:
@@ -1556,10 +1651,12 @@ class OrfsBackend(Backend):
         from . import orfs_pnr as pnr_mod
         return pnr_mod.restart_key(plan, self.stage)
 
-    def metrics(self, d: Path) -> dict:
+    def metrics(self, d: Path, value) -> dict:
         m = json.loads((d / "pnr_metrics.json").read_text())
         if m.get("status") != "ok":
             raise RuntimeError(f"status {m.get('status')!r}")
+        if self._finish(d, value):
+            m = json.loads((d / "pnr_metrics.json").read_text())
         return m
 
     def corner_job(self, d: Path, corner: CornerCheck) -> Job:
@@ -1644,7 +1741,7 @@ def _with_pnr(cfg, pnr: dict):
     return c
 
 
-class CommandBackend(Backend):
+class CommandBackend(_FlowBackend):
     """The pack's `pnr.command`, run once per stage split with
 
         CIRCT_FLOW_STOP_AFTER=<stage>                    (the placement run)
@@ -1654,9 +1751,10 @@ class CommandBackend(Backend):
     command can stop after and start at, in order) and `from_stage` is one of
     them. Without that every rung is a full run."""
 
-    def __init__(self, cfg, spec: LadderSpec):
-        self.cfg, self.spec = cfg, spec
-        self._jobs: dict = {}
+    def __init__(self, cfg, spec: LadderSpec,
+                 hooks: Optional[LadderHooks] = None):
+        super().__init__(cfg, spec, hooks)
+        self._param_vars: Optional[set] = None   # plan(): the parameter's variables
         stages = cfg.design.pack_pnr.get("stage_restart") or []
         st = spec.from_stage
         self.supports_restart = bool(st and st in stages
@@ -1668,6 +1766,18 @@ class CommandBackend(Backend):
                 "ladder.from_stage: required with a pack P&R command: the "
                 "first stage the parameter acts in (one of "
                 + ", ".join(stages) + ")")
+        if self.supports_restart and self.hooks.earlier_stage is not None:
+            # A restart reuses one placement: a key the flow says acts before
+            # the restart stage is refused.
+            acts = self.hooks.earlier_stage(spec.param, st)
+            if acts:
+                raise LadderError(
+                    f"ladder.param: {spec.param} acts from the {acts} "
+                    f"stage, before from_stage {st}: a restart from {st} would "
+                    "reuse a placement made with one value of it. Use "
+                    f"from_stage: {acts} (if the pack can restart there), or "
+                    "leave stage_restart out of the pack so every rung is a "
+                    "full run")
 
     def _env(self, base: dict, value, i: Optional[int]) -> dict:
         e = dict(base)
@@ -1682,32 +1792,41 @@ class CommandBackend(Backend):
         # The command sees the rung's value in its `pnr:` section as well
         # (and so in whatever the flow derives from it), not only in
         # CIRCT_FLOW_LADDER_VALUE.
-        cmd, env = pack_command(
-            _with_pnr(self.cfg, apply_param(self.cfg.design.pnr,
-                                            self.spec.param, value)), d)
+        cmd, env = pack_command(self._cfg_at(value), d)
         (d / "pnr_metrics.json").unlink(missing_ok=True)
         env = self._env(env, value, i)
         env.update(extra_env)
-        job = Job(name, cmd, env, Path(self.cfg.design.pack_root).resolve(),
-                  d / "pnr.log")
-        self._jobs[d] = job
-        return job
+        return Job(name, cmd, env, Path(self.cfg.design.pack_root).resolve(),
+                   d / "pnr.log")
 
     def plan(self, d: Path, value) -> dict:
         from .stages import pack_command
-        cmd, env = pack_command(
-            _with_pnr(self.cfg, apply_param(self.cfg.design.pnr,
-                                            self.spec.param, value)), d)
+        if self._param_vars is None:
+            # the environment variables the parameter itself controls are the
+            # rung's own: left out of every plan by name
+            f = self.hooks.param_env_names
+            self._param_vars = (set(f(self.cfg, self.spec.param,
+                                      self.spec.values, d)) if f else set())
+        cmd, env = pack_command(self._cfg_at(value), d)
         top = self.cfg.design.top_module
         # The environment the flow itself builds for the command (the tech
-        # pack's wire RC files, the recipe variables): the values, and the
-        # content of the files they name. The user's own environment is not
-        # part of it.
+        # pack's wire RC files, and whatever else the flow adds): the values,
+        # and the content of the files they name. The user's own environment
+        # is not part of it.
         here = str(Path(d).resolve())
         flow_env = {k: v.replace(here, "<dir>") for k, v in env.items()
-                    if os.environ.get(k) != v}
-        flow_env_files = {k: _path_sha(Path(env[k])) for k in flow_env
-                          if env[k] and os.path.exists(env[k])}
+                    if os.environ.get(k) != v and k not in self._param_vars}
+        hash_value = self.hooks.hash_env_value
+        flow_env_files = {}
+        for k in flow_env:
+            if hash_value is not None:
+                got = hash_value(self.cfg, k, env[k])
+            elif env[k] and os.path.exists(env[k]):
+                got = _path_sha(Path(env[k]))
+            else:
+                got = None
+            if got:
+                flow_env_files[k] = got
         p = apply_param(self.cfg.design.pnr, self.spec.param, None)
         words = cmd[:-len(["--netlist", "", "--sdc", "", "--top", "",
                            "--out", "", "--pack", ""])]
@@ -1754,13 +1873,16 @@ class CommandBackend(Backend):
     def diff(self, placed: dict, plan: dict) -> list:
         return [] if placed == plan else ["the P&R command's inputs differ"]
 
-    def metrics(self, d: Path) -> dict:
+    def metrics(self, d: Path, value) -> dict:
         """After the rung's command: the flow's own finishing step for a pack
-        command (stages.pack_finish), then its metrics."""
+        command (stages.pack_finish), the flow's finish_rung, then its
+        metrics. Both get the config at `value`, the rung's own options as
+        its command had them; the command's log is <d>/pnr.log (_job)."""
         from .stages import pack_finish
-        job = self._jobs.get(d)
-        f = pack_finish(self.cfg, d, 0, job.argv if job else [],
-                        job.log if job else None)
+        cfg = self._cfg_at(value)
+        f = pack_finish(cfg, d, 0, list(cfg.design.pack_pnr["command"]),
+                        d / "pnr.log")
+        self._finish(d, value)
         return json.loads(Path(f).read_text())
 
     def corner_job(self, d: Path, corner: CornerCheck) -> Job:
@@ -1856,10 +1978,12 @@ def _resolve_command(spec: LadderSpec, base: Optional[Path]) -> LadderSpec:
 
 
 def run_flow(cfg, mode: Optional[str] = None, jobs: Optional[int] = None,
-             log=None, fresh: bool = False) -> Path:
+             log=None, fresh: bool = False,
+             hooks: Optional[LadderHooks] = None) -> Path:
     """Run the ladder the flow config's `pnr.ladder` declares on the flow's
     netlist. Returns <out>/pnr/pnr_metrics.json of the accepted rung; raises
-    LadderFailed (with the exit code) when no rung was accepted."""
+    LadderFailed (with the exit code) when no rung was accepted. `hooks`:
+    the flow's steps around the runs (default: flow_hooks())."""
     spec = parse_ladder(cfg.design.pnr["ladder"])
     over = {}
     if mode:
@@ -1886,7 +2010,7 @@ def run_flow(cfg, mode: Optional[str] = None, jobs: Optional[int] = None,
                           "job is stopped by signalling its process group)")
     spec = _resolve_command(spec, getattr(cfg.design, "config_dir", None))
     backend = (CommandBackend if "command" in cfg.design.pack_pnr
-               else OrfsBackend)(cfg, spec)
+               else OrfsBackend)(cfg, spec, hooks)
     out = Path(cfg.pnr_dir).resolve()        # every path below is absolute
     out.mkdir(parents=True, exist_ok=True)
     preflight(spec, backend, cfg)

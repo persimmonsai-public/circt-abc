@@ -101,6 +101,10 @@ struct MbClass {
   SmallVector<unsigned, 4> widths; // descending
   // Pin -> 0 / 1 / -1 (own last output).
   SmallVector<std::pair<std::string, int>, 2> ties;
+  // Optional single-bit cell of the class (`single: {cell, data, out}`): a
+  // bit this class's banker leaves over becomes one instance of it, with the
+  // class's clock, reset and tie pins, instead of the liberty's plain flop.
+  std::shared_ptr<MbClass> single;
 };
 struct MbFamily {
   std::string name;
@@ -201,6 +205,17 @@ struct MbSpec {
             else
               return "tie values are 0, 1 or \"last_q\"";
           }
+        if (auto *so = co->getObject("single")) {
+          auto sc = std::make_shared<MbClass>(c);
+          sc->cellTmpl = so->getString("cell").value_or("").str();
+          sc->data = so->getString("data").value_or("D").str();
+          sc->out = so->getString("out").value_or("Q").str();
+          if (sc->cellTmpl.empty())
+            return "class " + ck.first.str() + " of " + fam.name +
+                   ": single needs a cell";
+          sc->widths.assign(1, 1);
+          c.single = std::move(sc);
+        }
         fam.classes[ck.first.str()] = std::move(c);
       }
       families[fam.name] = std::move(fam);
@@ -706,6 +721,18 @@ struct RegisterMapperPass
         chunk(cls, pool, /*onlyMax=*/false, singles);
     }
 
+    // Bits of a class that declares a single-bit cell: width-1 banks.
+    {
+      SmallVector<unsigned> rest;
+      for (unsigned k : singles) {
+        if (const MbClass *sc = bits[k].cls->single.get())
+          banks.push_back({sc, SmallVector<unsigned>(1, k)});
+        else
+          rest.push_back(k);
+      }
+      singles = std::move(rest);
+    }
+
     unsigned counter = 0;
     for (Bank &bk : banks) {
       const MbClass &c = *bk.cls;
@@ -749,10 +776,12 @@ struct RegisterMapperPass
       for (unsigned m : bk.members)
         sameReg &= bits[m].reg == first.reg;
       std::string instName =
-          (pend[first.reg].name + "_mb" + Twine(first.bit) + "_" +
-           Twine(bits[bk.members.back()].bit) +
-           (sameReg ? "" : "_x" + Twine(counter++)))
-              .str();
+          n == 1 && c.widths.size() == 1 && c.widths[0] == 1
+              ? (pend[first.reg].name + "_bit" + Twine(first.bit)).str()
+              : (pend[first.reg].name + "_mb" + Twine(first.bit) + "_" +
+                 Twine(bits[bk.members.back()].bit) +
+                 (sameReg ? "" : "_x" + Twine(counter++)))
+                    .str();
       auto inst = hw::InstanceOp::create(builder, loc, ext,
                                          builder.getStringAttr(instName),
                                          operands);
@@ -763,9 +792,17 @@ struct RegisterMapperPass
         pend[m.reg].qBits[m.bit] = inst.getResult(b);
         --pend[m.reg].open;
       }
-      ++perBankCounts[MbSpec::subst(c.cellTmpl, "n", n)];
-      bankedBits += n;
-      ++totalBanks;
+      if (n == 1 && c.widths.size() == 1 && c.widths[0] == 1) {
+        // A pack's single-bit cell for a bit the banker left over: counted
+        // with the single-bit cells, and named in a clause of its own.
+        ++perSingleCounts[MbSpec::subst(c.cellTmpl, "n", n)];
+        ++packSingles;
+        ++leftoverSingles;
+      } else {
+        ++perBankCounts[MbSpec::subst(c.cellTmpl, "n", n)];
+        bankedBits += n;
+        ++totalBanks;
+      }
     }
     // Bits the banker left single.
     for (unsigned k : singles) {
@@ -813,7 +850,8 @@ struct RegisterMapperPass
     anonFirRegCounter = 0;
     mb = MbSpec();
     perBankCounts.clear();
-    totalBanks = bankedBits = leftoverSingles = 0;
+    perSingleCounts.clear();
+    totalBanks = bankedBits = leftoverSingles = packSingles = 0;
     if (!multibitPath.empty()) {
       std::string err = mb.load(multibitPath);
       if (!err.empty()) {
@@ -858,9 +896,22 @@ struct RegisterMapperPass
       }
       llvm::errs() << "[register-mapper] multibit: " << totalBanks
                    << " bank(s) holding " << bankedBits << " bit(s) ("
-                   << bo.str() << "); " << (totalBitInstances) << " single-bit"
-                   << " cell(s), of which " << leftoverSingles
-                   << " were bank candidates left over\n";
+                   << bo.str() << "); " << (totalBitInstances + packSingles)
+                   << " single-bit cell(s), of which " << leftoverSingles
+                   << " were bank candidates left over";
+      if (packSingles) {
+        std::string ss;
+        llvm::raw_string_ostream so(ss);
+        bool g = true;
+        for (auto &e : perSingleCounts) {
+          so << (g ? "" : ", ") << e.second << " " << e.first;
+          g = false;
+        }
+        llvm::errs() << "; " << packSingles
+                     << " of the single-bit cells are the pack's (" << so.str()
+                     << ")";
+      }
+      llvm::errs() << "\n";
     }
   }
 
@@ -868,8 +919,9 @@ private:
   llvm::StringMap<hw::HWModuleExternOp> externDecls;
   llvm::StringMap<unsigned> perCellCounts;
   std::map<std::string, unsigned> perBankCounts;
+  std::map<std::string, unsigned> perSingleCounts;
   MbSpec mb;
-  size_t totalBanks = 0, bankedBits = 0, leftoverSingles = 0;
+  size_t totalBanks = 0, bankedBits = 0, leftoverSingles = 0, packSingles = 0;
   size_t totalBitInstances = 0;
   size_t numFirregsMapped = 0;
   unsigned anonFirRegCounter = 0;

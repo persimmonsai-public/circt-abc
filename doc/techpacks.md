@@ -518,6 +518,16 @@ flow:
 fanout_buffer: {max_fanout: 32}      # or: fanout_buffer: false
 ```
 
+The pin directions come from the liberty, including the member pins of a
+`bundle` group (a multibit register's `Q0..Qn`, `D0..Dn`): with
+`bundle_pins: true`, the default, a net driven by one bit of a multibit
+register is buffered like a net driven by a single-bit flop, and loads on
+member input pins are counted. With `fanout_buffer: {bundle_pins: false}`
+(in the pack or the flow config) only the cells' own pins count: member
+pins are unknown to the stage, so a net driven by a multibit register is
+not buffered and loads on member input pins are not counted. A liberty
+without bundle groups gives the same netlist either way.
+
 ABC maps each partition on its own and never sees a net that leaves it,
 and the register and clock-gate logic outside ABC buffers nothing either,
 so a flop or gate driving hundreds of pins across partitions reaches STA
@@ -732,6 +742,10 @@ flow:
 
 The flow config's `multibit:` takes `true` or a mapping: `default_family`, `cross_register`, `overrides` (`{reg: <regex on the register name>, family: <name>}`, first match wins; names are module-local), `overrides_file` (a JSON list of the same) and `activity` (`{file: rates.json, hot_family, hot_toggle_rate}`; `python -m circt_flow.multibit_activity <tcf>` makes the rates file). `activity` also takes `rule: energy` (below). `python -m circt_flow.multibit_timing <out_dir> --margin 0.05` (an example margin, in ns) reads a finished run's OpenSTA view and writes an `overrides_file` that sends the registers on near-critical paths to the `single` family: a multibit cell's clk-to-Q and setup can differ from the single-bit flop's, so banking everything can cost slack that a rerun with that list gets back. `circt_flow techpack check` verifies every declared cell is in the rail's liberties. Cells with inverted outputs, async-set classes and enable flops are not mapped (bits of those stay single-bit).
 
+A class may also declare a single-bit cell of its own, `single: {cell: <literal name>, data: D, out: Q}` (data and out default to `D` and `Q`), under `clear` or `none`. With `multibit: {single: true}` in the flow config, the bits of that class no bank takes (the tail of a register, or what `cross_register` pooling leaves) become instances of that cell, with the class's clock, reset and `tie` pins, instead of the liberty's plain flop; it is off by default, and without it the declared cells are ignored. These bits count as leftover single-bit cells in the pass's summary line.
+
+`multibit: {tie: {<pin>: 0|1|last_q}}` in the flow config sets the tie value of a pin that the pack's classes tie (the pin names come from the classes' `tie:` above) in every class that ties that pin, instead of the pack's value; `last_q` is the cell's own last output, and a class that does not tie the pin is left alone. Without the key the pack's ties apply.
+
 #### Activity-driven family choice: `multibit.energy` and `activity: {rule: energy}`
 
 A library's multibit families trade clock-pin energy against data energy, leakage and area, and which one is cheapest depends on how often a register is clocked and how often its bits change. A pack declares a per-bit energy model next to the families (the numbers below are example values only):
@@ -824,6 +838,12 @@ vt_swap:
 drives a clock net (the clock gates) at its synthesized flavour; `false_to`
 lists output ports (or the word `outputs`) whose paths the swap ignores, like
 `false_from` does for input ports.
+The section also takes the leakage controls of the post-layout stage
+(`fix`, `sens_frac`, `recover_order`, `ladder_cap`, `ladder_escalate`,
+`close_margin_ps`, `allow_footprint_change`; [`postlayout.md`](postlayout.md)).
+Absent, the swap works as described below; with any of them it also changes
+its hold protection, its acceptance of a fix iteration and its footprint
+rule, as `postlayout.md` lists.
 
 ABC chooses flavours on its own delay model, which can be far from the
 libraries' (by a factor of two or more on some libraries), and the
@@ -1086,12 +1106,161 @@ What runs depends on the pack's own `pnr:`:
   and every word has `${VAR}` expanded. The template's `pnr/run.py` is a
   stand-in that only counts cells.
 
+  The command may leave result files for the steps after it in the same
+  directory: the placed netlist, its SPEF and a list of LEF files (one path
+  per line), named `placed.v`, `placed.spef` and `placed.lef.list` unless the
+  pack's `pnr:` names them otherwise with `results: {netlist: ..., spef: ...,
+  lef_list: ...}` (file names, no directory part). Post-layout recovery
+  ([`postlayout.md`](postlayout.md)) reads them.
+
+  The pack may name the logs its command writes in `pnr: {placement_logs:
+  [logs/*.log, ...]}`: glob patterns relative to the P&R output directory,
+  read in that order; `placement_check` then reads only those (not the
+  command's console log). Under `placement_check: fail`,
+  patterns that match nothing are an error.
+
+  Besides the arguments, the flow **sets** these variables in the command's
+  environment, each only when its key is set (nothing in this repository
+  reads them; the command decides what to do with them):
+
+  | variable | from | content |
+  | :--- | :--- | :--- |
+  | `HOLD_MARGIN`, `SETUP_MARGIN` | `hold_margin`, `setup_margin` | slack in the libraries' time unit |
+  | `CTS_EXTRA_ARGS` | `cts_args` | extra `clock_tree_synthesis` flags, space separated |
+  | `CTS_RECIPE_TCL`, `SPEF_EXPORT_TCL` | always | paths of `circt_flow/pnr_tcl/cts_recipe.tcl` and `spef_export.tcl` |
+  | `CTS_*`, `REPAIR_DONT_USE_RE`, `LIB_FILES_HOLD`, `LIB_FILES_TT`, `SPEF_RESTORE_PINCAP` | the recipe options below | read by those two Tcl files |
+
+  The built-in ORFS stage does not use these: it passes the same keys to
+  ORFS as ORFS's own `HOLD_SLACK_MARGIN`, `SETUP_SLACK_MARGIN` and
+  `CTS_ARGS`. The two Tcl files are offered to a command that runs
+  OpenROAD: they hold procedures (`cts_recipe_skip_nets`,
+  `cts_recipe_flatten_root`, `cts_recipe_size_gates`, `cts_recipe_dont_use`,
+  `cts_recipe_read_corners`; `spef_export_global_route <file>`,
+  `spef_export_placement <file>`), and the header of `cts_recipe.tcl` shows
+  where a script calls each.
+
   A pack whose command can stop after a stage and restart from one declares
   `stage_restart: [place, cts, route]` in its `pnr:` (stage names in flow
   order); the flow's closure ladder (`pnr: {ladder: ...}`,
   [`doc/ladder.md`](ladder.md)) then places once and runs the variants of a
   later-stage option from that placement. Without it the ladder runs every
   variant in full.
+
+  Code that runs the ladder with hooks of its own should start from the
+  flow's (`stages.ladder_hooks()`) and replace only what it implements:
+
+  ```python
+  import dataclasses
+  from circt_flow import ladder, stages
+  hooks = dataclasses.replace(stages.ladder_hooks(), finish_rung=my_finish)
+  ladder.run_flow(cfg, hooks=hooks)
+  ```
+
+  **Recipe options** (opt-in, `circt_flow/pnr_recipe.py`; every key absent
+  leaves the stage unchanged). Times are in the libraries' (and the SDC's)
+  time unit: ps for ASAP7, ns for most other open libraries, so the same
+  setting is written a thousand times smaller on an ns library. The
+  docstring of `pnr_recipe.py` shows each key with an illustrative value. A pack's `pnr:` may give `cts_skip_fanout_le`,
+  `cts_size_gates`, `cts_gate_port_tol`, `cts_flatten_root`,
+  `repair_dont_use`, `hold_corner` and `placement_check` as defaults (the
+  others are the flow config's only); the flow config's value wins, and `0` /
+  `false` / empty, where the key allows, cancels a pack default.
+
+  * `input_delay_min: T` appends `set_input_delay -min T -clock <clock>
+    [all_inputs -no_clocks]` to the SDC every later stage reads (the ORFS
+    stage too): hold then sees T as the earliest input arrival. The clock
+    is the one the SDC's own `set_input_delay` commands use (`clk`,
+    `"clk"` and `[get_clocks clk]` are one clock; a variable is kept as
+    written when the SDC sets it once), else the SDC's one `create_clock`:
+    its `-name`, or without one its source when that is a single port or
+    pin written out (`clk`, `[get_ports clk]`, `[get_pins u/Q]`). Several
+    clocks, none, or a name only substitution gives (`-name $n`) are
+    refused; the SDC then carries its own `set_input_delay -min`.
+    `sdc_file:` (relative to the flow config) is used instead of the
+    generated SDC; the appended line goes to either.
+  * `cts_skip_fanout_le: N` leaves gated clock nets of at most N loads
+    (register clock pins or further clock gates) to their gate
+    (`set_cts_config -skip_nets`).
+  * `cts_size_gates: {drive_re, drives, tolerance, variants, variant_re}`
+    picks each clock gate's drive after clock-tree synthesis by the clock
+    arrival measured at its output: the smallest listed drive within
+    `tolerance` of the fastest. `drive_re` is the pack's regular expression
+    with three groups (prefix, drive, suffix) of a cell name, so generic
+    code needs no cell name; `variants` / `variant_re` also try the gate's other
+    flavours. `cts_gate_port_tol: T` (same unit) uses T instead of
+    `tolerance` for a clock gate whose output clocks at least one register
+    in the fan-in of an output port, that is a register with a
+    combinational path to a top-level output. The rule is unchanged: the
+    smallest listed drive whose clock arrival at the gate's output is within
+    T of the fastest is kept. The registers are found from the netlist
+    (`get_fanin -to [all_outputs]`); no output constraint of the SDC is
+    read.
+  * `cts_flatten_root: true` removes a lone root buffer that only feeds
+    further buffers.
+  * `repair_dont_use: [<regex>, ...]`: liberty cells whose names match are
+    `set_dont_use` for the post-clock-tree repair, so the resizer cannot move
+    a register to another cell family; instances already of such a cell stay.
+  * `hold_corner: true` (or a corner name), with `hold_margin` /
+    `setup_margin`: the pack's hold-corner libraries become a second STA
+    corner, so hold repair fixes the fast corner while setup stays met at
+    the slow one.
+  * `placement_check: warn|fail` reads the stage's logs for a failed
+    legalization (`python3 -m circt_flow.placement_health` by hand), writes
+    `placement_failures` and `placement_attempts` into `pnr_metrics.json`,
+    and with `fail` stops the stage when the final legalization failed or the
+    logs show no legalization attempt at all (`warn` only reports both).
+    Stock ORFS already stops when detailed placement fails, so on the ORFS
+    stage the check mainly confirms that legalization ran and reported no
+    failure (it reads the `Placement Analysis` table detailed placement
+    prints, and the failure lines). With a closure ladder on the ORFS stage
+    the key is refused: the ladder's ORFS rungs run no finishing step. It
+    applies to the ORFS stage and to a pack's own command.
+  * `spef_restore_pincap: true|false` (default true): see below.
+  * `post_layout:` flavour recovery after P&R ([`postlayout.md`](postlayout.md)).
+
+  The ORFS stage takes `input_delay_min`, `sdc_file`, `placement_check`,
+  `cts_args` and the margins; it stops with an error when any other option
+  of this list (or `post_layout`) is set, because only a pack's own P&R
+  command implements them. A pack's own command receives the options as
+  environment variables (`CTS_SKIP_FANOUT_LE`, `CTS_EXTRA_ARGS`,
+  `CTS_SIZE_GATES`, `CTS_GATE_DRIVE_RE`, `CTS_GATE_DRIVES`, `CTS_GATE_TOL`,
+  `CTS_GATE_PORT_TOL`, `CTS_GATE_VARIANTS`, `CTS_GATE_VARIANT_RE`,
+  `CTS_FLATTEN_ROOT`, `REPAIR_DONT_USE_RE`, `LIB_FILES_HOLD`, `LIB_FILES_TT`,
+  `HOLD_MARGIN`, `SETUP_MARGIN`, `SPEF_RESTORE_PINCAP`), plus
+  `CTS_RECIPE_TCL`, the path of `circt_flow/pnr_tcl/cts_recipe.tcl`, and
+  `SPEF_EXPORT_TCL`. The command's OpenROAD clock-tree script sources the
+  first and calls `cts_recipe_skip_nets` before `clock_tree_synthesis`,
+  `cts_recipe_flatten_root` right after it, `cts_recipe_dont_use` before its
+  repair, `cts_recipe_size_gates` after it (propagated clocks, parasitics
+  estimated) and `cts_recipe_read_corners` instead of its own liberty
+  reading.
+
+  **Global-route SPEF.** OpenROAD's `estimate_parasitics -global_routing
+  -spef_file` writes each net's `*D_NET` total right but leaves the
+  capacitance held on pin nodes out of the `*CAP` lines, so OpenSTA reading
+  the file times the design optimistically (a placement-estimate SPEF has no
+  pin-node capacitance and is exact). A command that exports through
+  `spef_export_global_route <file.spef>` (`SPEF_EXPORT_TCL`) prints the
+  estimator's lines between `SPEF_EXPORT_BEGIN/END <path>` lines on
+  stdout (the file's normalized path), then `SPEF_EXPORT_FILE <size>
+  <crc32> <path>` for the file it wrote; keep that log under the output
+  directory. After the command the flow rewrites in place each `*.spef`
+  below the output directory that this helper wrote: a log there holds
+  these whole lines for the file's path (when OpenROAD ran with the
+  directory mounted under another path, the logged path must end with the
+  file's path below the output directory), and the file still has the
+  logged size and CRC-32, so a file another tool wrote, or one changed
+  after the export, is not rewritten. It must also have `*CAP` lines that
+  fall short of the totals, `*CAP` entries and no coupling capacitors, and
+  parse completely: its
+  `*CAP` lines then sum to the totals (the original kept as
+  `<file>.spef.orig`), the capacitance weighted per pin by the logged stub
+  length and the layer capacitance of the pack's `wire_rc` file, or split
+  equally when the log has no estimator lines. Every other SPEF, and one
+  that cannot be read or parsed, is left as written with a one-line report;
+  the check never fails the stage. By hand:
+  `python3 -m circt_flow.spef_pincap check|restore FILE.spef [--est-rc-log
+  LOG --layer-rc RC.tcl]`.
 
 The flow config's `pnr:` section also takes four options for the ORFS
 stage (they do not apply to a pack's own `command`):

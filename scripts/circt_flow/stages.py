@@ -15,6 +15,7 @@ script) instead of silently continuing.
 """
 from __future__ import annotations
 
+import math
 import re
 import shutil
 import os
@@ -25,6 +26,7 @@ from typing import Optional, Sequence
 
 from . import shiftselect
 from .config import FlowConfig
+from .ladder import RungRejected
 
 
 def _run(cmd: Sequence[str | Path], *, stdout: Path | None = None, env=None) -> None:
@@ -1073,15 +1075,40 @@ def orfs_pnr(cfg: FlowConfig) -> Path:
             "its docker image); ORFS reads that netlist, not the raw one")
     if p.get("ladder"):
         from . import ladder as ladder_mod
+        if "command" not in cfg.design.pack_pnr and (
+                p.get("placement_check")
+                or cfg.design.pack_pnr.get("placement_check")):
+            # The ORFS backend of the ladder runs no finishing step, so the
+            # check would not run on the rungs: refused, not ignored.
+            raise ValueError(
+                "pnr.placement_check with pnr.ladder on the ORFS stage: the "
+                "closure ladder does not run the check on ORFS rungs; drop "
+                "one of the two (a pack's own P&R command runs it per rung)")
         return ladder_mod.run_flow(cfg)
     if "command" in cfg.design.pack_pnr:
         return pack_pnr(cfg)
     argv = orfs_argv(cfg, p, cfg.pnr_dir)
+    from . import pnr_recipe
+    ropts = pnr_recipe.parse(p, cfg.design.pack_pnr)
     print(f"[circt_flow] ORFS P&R -> {cfg.pnr_dir}")
     rc = pnr_mod.main(argv)
     if rc != 0:
         raise subprocess.CalledProcessError(rc, ["orfs_pnr", *argv])
+    if ropts.get("placement_check"):
+        _placement_guard(ropts["placement_check"], cfg.pnr_dir.resolve(), [],
+                         cfg.pnr_dir / "pnr_metrics.json")
     return cfg.pnr_dir / "pnr_metrics.json"
+
+
+def ladder_hooks():
+    """The steps this flow adds around the closure ladder's P&R runs
+    (ladder.LadderHooks): for a pack's own P&R command, which environment
+    variables the laddered `pnr:` key controls (each rung has its own: left
+    out of the placement's plan) and the content hashes of the files the
+    recipe's environment values name (in the placement's manifest)."""
+    from .ladder import LadderHooks
+    return LadderHooks(param_env_names=_ladder_param_env_names,
+                       hash_env_value=_ladder_hash_env_value)
 
 
 _VALUE_OPTIONS = {
@@ -1089,7 +1116,7 @@ _VALUE_OPTIONS = {
     "--utilization", "--place-density", "--set", "--tie-hi", "--tie-lo",
     "--dont-use", "--cts-buffer", "--cts-cluster-size",
     "--cts-cluster-diameter", "--hold-margin", "--setup-margin", "--sdc",
-    "--platform-dir", "--wire-rc"}
+    "--platform-dir", "--wire-rc", "--input-delay-min"}
 
 
 def _equals_form(argv: list) -> list:
@@ -1154,6 +1181,28 @@ def orfs_argv(cfg: FlowConfig, p: dict, out: Path) -> list:
         # `=` form: argparse reads a separate value that starts with `-` as
         # an option (the usual value, -no_insertion_delay, does)
         argv += [f"--cts-arg={arg}"]
+    # Opt-in SDC edits (pnr_recipe.py): a given SDC file, and a minimum
+    # input delay appended to it.
+    from . import pnr_recipe
+    ropts = pnr_recipe.parse(p, cfg.design.pack_pnr)
+    # Options only a pack's own P&R command implements are refused here, so
+    # a configured key is never silently ignored.
+    pack_only = sorted(k for k in ropts if k in pnr_recipe.PACK_COMMAND_ONLY)
+    if "spef_restore_pincap" in p:
+        pack_only.append("spef_restore_pincap")
+    if p.get("post_layout"):
+        pack_only.append("post_layout")
+    if pack_only:
+        raise ValueError(
+            "pnr." + ", pnr.".join(pack_only) + ": needs a tech pack's own P&R "
+            "command (pnr.command, doc/techpacks.md); the ORFS stage does not "
+            "implement it. For post-layout recovery on an ORFS result run "
+            "`python3 -m circt_flow.postlayout` on its netlist and SPEF "
+            "(doc/postlayout.md).")
+    if "sdc_file" in ropts:
+        argv += ["--sdc", str(_recipe_sdc_path(cfg, ropts["sdc_file"]))]
+    if "input_delay_min" in ropts:
+        argv += ["--input-delay-min", str(ropts["input_delay_min"])]
     if "orfs_platform_dir" in cfg.design.pack_pnr:
         argv += ["--platform-dir",
                  str(Path(cfg.design.pack_pnr["orfs_platform_dir"]).resolve())]
@@ -1170,11 +1219,77 @@ def orfs_argv(cfg: FlowConfig, p: dict, out: Path) -> list:
     return _equals_form(argv)
 
 
+class PlacementFailed(RungRejected):
+    """pnr.placement_check: fail found an unlegalized placement. A closure
+    ladder rejects the rung whose finishing step raises it (a
+    RungRejected)."""
+
+
+def _placement_guard(mode: str, out: Path, extra_logs: list,
+                     metrics_path: Path, patterns: Optional[list] = None
+                     ) -> None:
+    """pnr.placement_check: run placement_health on the stage's logs, add
+    placement_failures (final count, only when a legalization was found) and
+    placement_attempts to the metrics file, print one line; `fail` raises when
+    the final legalization failed. `patterns`: the pack's
+    pnr.placement_logs (glob patterns relative to `out`, the logs its
+    command leaves); without them placement_health's directory layouts and
+    `extra_logs`. Under `fail`, patterns that match no file are an error."""
+    import json
+
+    from . import placement_health as ph
+
+    rs = ph.runs([str(out)], patterns, [Path(f) for f in extra_logs])
+    if patterns is not None and not rs:
+        msg = (f"pnr.placement_logs {patterns} matched no log in {out}")
+        print(f"[circt_flow] placement_check: {msg}"
+              f"{' (fail)' if mode == 'fail' else ''}")
+        if mode == "fail":
+            raise PlacementFailed(f"pnr.placement_check: fail: {msg}")
+    res = ph.check_runs(rs) if rs else None
+    final = res["final_failures"] if res else None
+    attempts = (sum(len(s["attempts"]) for s in res["stages"])
+                if res else 0)
+    m = json.loads(metrics_path.read_text()) if metrics_path.exists() else {}
+    m["placement_attempts"] = attempts
+    if final is not None:
+        m["placement_failures"] = final
+    metrics_path.write_text(json.dumps(m, indent=2, sort_keys=True) + "\n")
+    if final is None:
+        print(f"[circt_flow] placement_check: no legalization attempt found "
+              f"in the logs{' (fail)' if mode == 'fail' else ''}")
+        if mode == "fail":
+            raise PlacementFailed("pnr.placement_check: fail found no "
+                                  "legalization attempt in the logs")
+        return
+    print(f"[circt_flow] placement_check: {final} placement failure(s) in the "
+          f"final legalization, {attempts} attempt(s)")
+    if mode == "fail" and final > 0:
+        raise PlacementFailed(f"pnr.placement_check: detailed placement left "
+                              f"{final} instance(s) unlegalized")
+
+
+def pick_cts_args(cfg: FlowConfig) -> list:
+    """`pnr.cts_args` (the flow config's, else the pack's)."""
+    p = cfg.design.pnr or {}
+    return (p["cts_args"] if "cts_args" in p
+            else cfg.design.pack_pnr.get("cts_args")) or []
+
+
+def _recipe_sdc_path(cfg: FlowConfig, name: str) -> Path:
+    """pnr.sdc_file, relative to the flow config's directory."""
+    path = Path(name)
+    base = getattr(cfg.design, "config_dir", None)
+    if not path.is_absolute() and base is not None:
+        path = Path(base) / path
+    return path
+
+
 def pack_command(cfg: FlowConfig, out: Path) -> tuple:
     """Write the netlist and SDC a tech pack's P&R command reads into out
     and return (argv, env): the command with its arguments, and the
-    environment it runs in (the process environment plus the pack's wire
-    RC variables)."""
+    environment it runs in (the process environment plus the pack's wire RC
+    variables and the recipe's)."""
     from . import orfs_pnr as pnr_mod
 
     p, top = cfg.design.pnr, cfg.design.top_module
@@ -1190,9 +1305,36 @@ def pack_command(cfg: FlowConfig, out: Path) -> tuple:
         if warn:
             print(f"[circt_flow] {warn}")
     netlist.write_text(text)
-    pnr_mod.write_sdc(sdc, top, str(p["clock_port"]),
-                      float(p.get("clock_period", cfg.design.clock_period_ps)),
-                      float(p.get("clock_latency", 0)))
+    from . import pnr_recipe
+    ropts = pnr_recipe.parse(p, cfg.design.pack_pnr)
+    if "sdc_file" in ropts:
+        sdc.write_bytes(_recipe_sdc_path(cfg, ropts["sdc_file"]).read_bytes())
+    else:
+        pnr_mod.write_sdc(sdc, top, str(p["clock_port"]),
+                          float(p.get("clock_period",
+                                      cfg.design.clock_period_ps)),
+                          float(p.get("clock_latency", 0)))
+    if "input_delay_min" in ropts:
+        sdc.write_text(pnr_recipe.append_input_delay_min(
+            sdc.read_text(), ropts["input_delay_min"]))
+    hold_libs, tt_libs = [], []
+    if ropts.get("hold_corner"):
+        from . import profile as profile_mod
+        prof = profile_mod.load(cfg.design.profile)
+        hold = (ropts["hold_corner"] if isinstance(ropts["hold_corner"], str)
+                else prof.hold_corner)
+        hold_libs = prof.libs_at(hold, rail=cfg.design.rail) if hold else []
+        tt_libs = prof.libs_at(rail=cfg.design.rail)
+    penv = pnr_recipe.env(ropts, hold_libs, tt_libs,
+                          [str(a) for a in pick_cts_args(cfg)])
+    from . import netlist_names
+    try:
+        if netlist_names.needs_rename(Path(netlist).read_text(errors="replace")):
+            print("[circt_flow] WARNING: the P&R netlist has escaped identifiers "
+                  "containing ':' (the SPEF name delimiter): a SPEF reader may "
+                  "skip those nets; rename with circt_flow.netlist_names")
+    except OSError:
+        pass
     cmd = [*cfg.design.pack_pnr["command"], "--netlist", str(netlist),
            "--sdc", str(sdc), "--top", top, "--out", str(out),
            "--pack", str(cfg.design.pack_root)]
@@ -1202,19 +1344,46 @@ def pack_command(cfg: FlowConfig, out: Path) -> tuple:
     env = {**os.environ, **wire_rc_mod.pnr_env(
         getattr(cfg.design, "wire_rc", None),
         getattr(cfg.design, "wire_rc_setup", None), out)}
-    return cmd, env
+    return cmd, {**env, **penv}
 
 
 def pack_finish(cfg: FlowConfig, out: Path, rc: int, cmd: list,
                 log: Optional[Path] = None) -> Path:
     """After a pack command has run (also each rung of the closure ladder):
-    read its pnr_metrics.json, add `status`, rewrite it, and raise when the
-    command failed. Returns the file."""
+    restore the SPEF pin caps, check the SDF exports, read pnr_metrics.json,
+    add `status`, apply placement_check and post_layout, raise when the
+    command failed. Returns the metrics file."""
     import json
 
     from . import orfs_pnr as pnr_mod
+    from . import pnr_recipe
 
-    metrics_path = Path(out) / "pnr_metrics.json"
+    out = Path(out).resolve()
+    p = cfg.design.pnr
+    ropts = pnr_recipe.parse(p, cfg.design.pack_pnr)
+    log = Path(log) if log else out / "pnr.log"
+    metrics_path = out / "pnr_metrics.json"
+    from . import wire_rc as wire_rc_mod
+    env = {**os.environ, **wire_rc_mod.pnr_env(
+        getattr(cfg.design, "wire_rc", None),
+        getattr(cfg.design, "wire_rc_setup", None), out)}
+    if rc == 0 and ropts.get("spef_restore_pincap", True):
+        # Global-route SPEFs the command exported through spef_export.tcl:
+        # put back the pin-node cap OpenROAD's writer drops.
+        from . import spef_pincap
+        spef_pincap.restore_exports(
+            out, Path(env["CIRCT_FLOW_WIRE_RC"])
+            if env.get("CIRCT_FLOW_WIRE_RC") else None)
+    if rc == 0:
+        # An SDF with too few net-delay entries (INTERCONNECT or PORT), or
+        # with nearly all of them zero, gives the nets no wire delay: say so.
+        from . import sdf_tools
+        for sp, r in sdf_tools.check_exports(out):
+            for msg in r["failures"] + r.get("warnings", []):
+                print(f"[circt_flow] WARNING: {sp.name}: {msg} (an SDF carries "
+                      "wire delay only when it is written with the design's "
+                      "parasitics loaded)" if not msg.startswith("could not")
+                      else f"[circt_flow] WARNING: {sp.name}: {msg}")
     metrics = (json.loads(metrics_path.read_text())
                if metrics_path.exists() else {})
     unknown = sorted(k for k in set(metrics) - set(pnr_mod.METRICS) - {"status", "final"}
@@ -1228,7 +1397,117 @@ def pack_finish(cfg: FlowConfig, out: Path, rc: int, cmd: list,
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True) + "\n")
     if metrics["status"] != "ok":
         raise subprocess.CalledProcessError(rc or 1, cmd)
+    if ropts.get("placement_check"):
+        _placement_guard(ropts["placement_check"], out, [log], metrics_path,
+                         pnr_recipe.placement_logs(cfg.design.pack_pnr))
+        metrics = json.loads(metrics_path.read_text())
+    # Opt-in post-layout optimisation (postlayout.py): flavour swaps on the
+    # netlist the command left, timed with its SPEF and propagated clocks.
+    from . import postlayout
+    post = postlayout.parse_post_layout(
+        (cfg.design.pnr or {}).get("post_layout", False), "pnr")
+    if post.enabled and (cfg.design.pnr or {}).get("post_layout"):
+        rec = postlayout.run_flow(cfg, post, out)
+        if rec:
+            metrics["post_layout"] = {
+                "setup_ws": rec["after"]["wns"],
+                "setup_tns": rec["after"]["tns"],
+                "r2r_violators": rec["after"]["r2r_viol"],
+                "instances_changed": rec["instances_changed"],
+                "footprint_changed": len(rec["footprint_changed"])}
+            # The delivered timing, what a closure ladder judges: every number
+            # post-layout measures after its swaps, under the top-level
+            # metric names. postlayout.MEASURE's wns/tns/hold_wns/hold_tns
+            # are OpenSTA's all-endpoint worst/total slack (max, min) in the
+            # same user time units and sign as the command's
+            # `report_worst_slack` numbers (setup_ws, hold_ws), over the
+            # corners post-layout defines: when the profile has a separate
+            # hold corner that is the worst over both, so equal to or more
+            # pessimistic than a command that times one corner. A number it
+            # did not give, or not finite, is null: unverified, never the
+            # command's own pre-post-layout number.
+            def _num(v):
+                return (v if isinstance(v, (int, float))
+                        and not isinstance(v, bool) and math.isfinite(v)
+                        else None)
+            # A `final` the command wrote itself is kept, with these keys
+            # over its own.
+            a = rec["after"]
+            own = metrics.get("final")
+            metrics["final"] = {**(own if isinstance(own, dict) else {}),
+                                "setup_ws": _num(a.get("wns")),
+                                "setup_tns": _num(a.get("tns")),
+                                "hold_ws": _num(a.get("hold_wns")),
+                                "hold_tns": _num(a.get("hold_tns"))}
+            metrics_path.write_text(json.dumps(metrics, indent=2,
+                                               sort_keys=True) + "\n")
     return metrics_path
+
+
+def _without_param(p: dict, param: str) -> dict:
+    """A copy of the `pnr:` mapping with the ladder parameter absent (its
+    default applies)."""
+    import copy
+    q = copy.deepcopy(p)
+    q.pop("ladder", None)
+    if param.startswith("set."):
+        q["set"] = {k: v for k, v in (q.get("set") or {}).items()
+                    if k != param[4:]}
+    else:
+        q.pop(param, None)
+    return q
+
+
+def _ladder_param_env_names(cfg: FlowConfig, param: str, values, d: Path) -> set:
+    """The environment entries the ladder parameter controls (HOLD_MARGIN for
+    hold_margin, CTS_EXTRA_ARGS for cts_args, ...): the variables of the
+    command's environment whose value differs between the parameter taken out
+    and any of the ladder's values (so a rung at the pack's default loses its
+    entry too). The same names for every rung and the placement. The input
+    files the flow writes (netlist, SDC) stay in the plan as the rung's value
+    makes them: the ladder writes the rung's own last."""
+    from .ladder import _with_pnr, apply_param
+    envs = [pack_command(_with_pnr(cfg, _without_param(cfg.design.pnr, param)),
+                         d)[1]]
+    envs += [pack_command(_with_pnr(cfg, apply_param(cfg.design.pnr, param, v)),
+                          d)[1] for v in values]
+    names = set().union(*envs)
+    return {k for k in names if len({e.get(k) for e in envs}) > 1}
+
+
+def _ladder_hash_env_value(cfg: FlowConfig, name: str, value: str):
+    """The recipe's environment values name files (one path, or a
+    blank-separated list such as the liberty files; a relative path is the
+    pack's): their content hashes (_env_file_shas)."""
+    return _env_file_shas(value, Path(cfg.design.pack_root), name)
+
+
+def _env_file_shas(value: str, root: Path, name: str = "?"):
+    """The content hashes of the regular files an environment value names:
+    the whole value as one path, else each blank-separated word that is a
+    path (relative to `root`). Directories (`.`, `/`, ...) and other
+    non-files are not hashed. A string for one file, a mapping for several,
+    None when it names no file. A regular file that cannot be read refuses
+    the ladder, naming the variable `name` and the path."""
+    from .ladder import LadderError, _file_sha
+    if not value:
+        return None
+
+    def sha(p):
+        try:
+            return _file_sha(p)
+        except LadderError as e:
+            raise LadderError(f"closure ladder: {name}={value!r} names {p}, "
+                              f"which cannot be read for the placement's "
+                              f"manifest ({e})")
+    if os.path.isfile(value):
+        return sha(Path(value))
+    got = {}
+    for w in value.split():
+        q = Path(w) if os.path.isabs(w) else root / w
+        if q.is_file():
+            got[w] = sha(q)
+    return got or None
 
 
 def pack_pnr(cfg: FlowConfig) -> Path:

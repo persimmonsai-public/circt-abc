@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 # The pack's flow.fanout_buffer (and a flow config's fanout_buffer:, which
 # overrides it key by key): the buffer cell, its pins and the fanout limit.
-SPEC_KEYS = {"enabled", "cell", "input", "output", "max_fanout"}
+SPEC_KEYS = {"enabled", "cell", "input", "output", "max_fanout", "bundle_pins"}
 
 
 @dataclass(frozen=True)
@@ -36,6 +36,10 @@ class FanoutSpec:
     output: str = "Y"
     max_fanout: int = 16
     enabled: bool = True
+    # Also see the member pins of a liberty bundle (a multibit register's Q0..Qn, D0..Dn): the liberty reader keeps
+    # them apart from `pins`, which names the group. On by default; with `bundle_pins: false` only the cells' own
+    # pins count, so a net driven by a multibit register is not recognised as driven and is not buffered.
+    bundle_pins: bool = True
 
 
 def parse_spec(pack: Optional[dict], design, where: str
@@ -71,10 +75,15 @@ def parse_spec(pack: Optional[dict], design, where: str
     if not isinstance(mf, int) or isinstance(mf, bool) or mf < 2:
         raise KeyError(f"{where}: fanout_buffer.max_fanout must be an "
                        "integer >= 2")
+    bp = merged.get("bundle_pins", True)
+    if not isinstance(bp, bool):
+        raise KeyError(f"{where}: fanout_buffer.bundle_pins must be true or "
+                       "false")
     return FanoutSpec(cell=str(merged["cell"]),
                       input=str(merged.get("input", "A")),
                       output=str(merged.get("output", "Y")),
-                      max_fanout=mf)
+                      max_fanout=mf,
+                      bundle_pins=bp)
 
 
 def rail_specs(prof, design, where: str) -> Dict[str, Optional[FanoutSpec]]:
@@ -122,10 +131,12 @@ def net_limits_from_mlir(paths) -> Dict[str, int]:
 def buffer_fanout(text: str, cells: Dict[str, "object"], buffer: str,
                   buf_in: str, buf_out: str, max_fanout: int = 16,
                   prefix: str = "fob_", driven_ports: Sequence[str] = (),
-                  net_limits: Optional[Dict[str, int]] = None
+                  net_limits: Optional[Dict[str, int]] = None,
+                  bundle_pins: bool = True
                   ) -> Tuple[str, Buffering]:
     """Return (`text` with fanout trees, stats). `cells` maps cell name to an
-    object with `.pins` {pin: direction} (intent.LibCell). Nets of
+    object with `.pins` {pin: direction} (intent.LibCell) and, with
+    `bundle_pins`, `.bundle_pins` {member pin: direction}. Nets of
     `driven_ports` (input ports, bits included) count as driven once: a
     submodule's inputs, driven by a cell in its parent."""
     if max_fanout < 2:
@@ -147,6 +158,8 @@ def buffer_fanout(text: str, cells: Dict[str, "object"], buffer: str,
             if not net or _CONST.match(net) or net.startswith("{"):
                 continue
             d = cell.pins.get(pin)
+            if d is None and bundle_pins:
+                d = getattr(cell, "bundle_pins", {}).get(pin)
             if d == "output":
                 drivers[net] = drivers.get(net, 0) + 1
                 driver_inst[net] = m.group(2).lstrip("\\")
@@ -265,7 +278,8 @@ def run(cfg, spec: FanoutSpec) -> dict:
                          f"and output {spec.output}")
     limits = net_limits_from_mlir(cfg.out_dir.glob("*_mapped.mlir"))
     out, st = buffer_fanout(text, cells, spec.cell, spec.input, spec.output,
-                            spec.max_fanout, net_limits=limits)
+                            spec.max_fanout, net_limits=limits,
+                            bundle_pins=spec.bundle_pins)
     keep = cfg.synth_dir / f"{d.top_module}_prebuf_openroad.v"
     keep.write_text(text)
     nl.write_text(out)
@@ -307,7 +321,8 @@ def buffer_modules(text: str, top: str, rail_of: Dict[str, str],
             q for q in mods[m].ports if mods[m].decls[q].kind == "input"]
         new, st = buffer_fanout(out[a:b], cells_of[rail_of[m]], sp.cell,
                                 sp.input, sp.output, sp.max_fanout,
-                                driven_ports=ins)
+                                driven_ports=ins,
+                                bundle_pins=sp.bundle_pins)
         if st.nets:
             out = out[:a] + new + out[b:]
             per[m] = {"rail": rail_of[m], "cell": sp.cell,

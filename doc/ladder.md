@@ -123,13 +123,13 @@ is an **error**.
 
 ## Which rung wins
 
-The verdicts are read in rung order. The outcome is fixed by the first rung
+The verdicts are read in rung order. The outcome is decided by the first rung
 that is not rejected: if it is accepted, that is the result; if it is
 unverified or an error, the ladder stops there (the later rungs are not
 considered, because the answer to "does a lower rung pass" is unknown); if
 every rung is rejected there is no result. A higher rung that finishes first
 changes nothing; the ladder waits for the lower ones. As soon as the outcome is
-fixed, the rungs above it are cancelled.
+decided, the rungs above it are cancelled.
 
 Exit codes of the flow (and of `python3 -m circt_flow.ladder`): 0 accepted, 5
 every rung rejected, 6 unverified, 7 a rung's P&R run or the placement run
@@ -332,6 +332,31 @@ A timeout applies to the user check only; the P&R jobs and the corner STA have n
 process groups it created (and, with `cancel`, runs the template for the unique
 names it generated), nothing else; it records them in `processes.json`. An
 ORFS container started by the ORFS stage is stopped with it.
+
+## Steps a flow adds
+
+Flow code that runs the ladder (`ladder.run_flow(cfg, hooks=...)`) can give it
+a `ladder.LadderHooks`; without one, the flow stage's own
+(`stages.ladder_hooks()`) is used. Each hook is optional:
+
+* `finish_rung(cfg, rung_dir)` runs after each rung's P&R result is read (both
+  backends; for a pack command after the flow's own finishing step), with the
+  flow config the rung ran with (the base config with the rung's value, also
+  in a run that resumes the ladder), before the rung is judged. It may add numbers
+  to `<rung_dir>/pnr_metrics.json`, and the checks read them. Raising
+  `ladder.RungRejected` rejects the rung with its message (the ladder goes on
+  to the next rung); any other exception makes the rung an error. A rung whose
+  record is reused is not finished again.
+* `check_shared_placement(cfg, place_dir)` runs once on the shared
+  placement, before any rung, with the first rung's config (a reused placement
+  is checked too). `RungRejected` stops the ladder before any rung (exit code
+  7); a number it returns is recorded as `placement_failures` in
+  `RESULT.json`. Without a shared placement (every rung a full run) it is not
+  called.
+* `earlier_stage(param, from_stage)`: with a pack command that restarts, the
+  stage a `pnr:` key acts in when that is before `from_stage`, else None. Such
+  a parameter is refused before anything runs: a restart would reuse a
+  placement made with one value of it.
 
 ## Cost
 

@@ -64,7 +64,9 @@ STUB = textwrap.dedent('''\
         time.sleep(0.1)
     if b.get("rc"):
         sys.exit(b["rc"])
-    m = {k: b[k] for k in ("setup_ws", "hold_ws", "drc_errors") if k in b}
+    m = {k: b[k] for k in ("setup_ws", "hold_ws", "drc_errors", "final") if k in b}
+    if "_seen" in plan:                        # the variables to report
+        m["seen_env"] = {k: os.environ[k] for k in plan["_seen"] if k in os.environ}
     (out / "pnr_metrics.json").write_text(json.dumps(m))
     if b.get("signal"):
         (sd / b["signal"]).write_text("")
@@ -2095,3 +2097,310 @@ def test_a_variable_with_a_changed_value_is_on_the_submit_line(tmp_path, monkeyp
                 {**os.environ, "JOB_ONLY_VAR": "new"}, tmp_path, tmp_path / "j.log")
     assert r.spawn(job).wait(threading.Event()) == 0
     assert out.read_text().split()[0] == "new"
+
+
+def test_a_final_mapping_the_command_writes_is_what_the_checks_read(tmp_path):
+    w = World(tmp_path, {"0": {**GOOD, "final": {"setup_ws": -1.0}},
+                         "1": {**GOOD, "setup_ws": -3.0, "final": {"setup_ws": 2.0}}},
+              stage_restart=None, ladder={"param": "knob", "values": [0, 1]})
+    code, rep = w.run()
+    assert code == 0 and verdicts(rep) == [L.REJECTED, L.ACCEPTED]
+    assert "setup_ws -1 < 0" in rep["rungs"][0]["reasons"][0]
+
+
+# ---------------------------------------------------------------------------
+# Hooks: steps a flow adds around the runs (LadderHooks)
+# ---------------------------------------------------------------------------
+
+
+def test_the_flow_supplies_the_hooks_when_the_caller_gives_none(tmp_path):
+    from circt_flow import stages
+    assert L.LadderHooks() == L.LadderHooks(None, None, None, None, None)
+    w = World(tmp_path, {"0": GOOD})
+    spec = L.parse_ladder(w.pnr["ladder"])
+    mine = L.LadderHooks(finish_rung=lambda cfg, d: None)
+    assert L.CommandBackend(w.cfg, spec, mine).hooks is mine
+    assert L.CommandBackend(w.cfg, spec).hooks == (stages.ladder_hooks()
+                                                   or L.LadderHooks())
+
+
+def test_finish_rung_runs_on_each_rung_with_its_own_config_and_its_numbers_are_judged(
+        tmp_path):
+    seen = []
+
+    def finish(cfg, d):
+        seen.append((Path(d).name, cfg.design.pnr["knob"]))
+        m = json.loads((d / "pnr_metrics.json").read_text())
+        m["extra_count"] = cfg.design.pnr["knob"]
+        (d / "pnr_metrics.json").write_text(json.dumps(m))
+    hooks = L.LadderHooks(finish_rung=finish)
+    w = World(tmp_path, {"0": GOOD, "1": GOOD, "2": GOOD},
+              ladder={"param": "knob", "values": [0, 1, 2], "from_stage": "cts",
+                      "accept": {"metrics": {"extra_count": {"min": 1}}}})
+    code, rep = w.run(hooks=hooks)
+    assert code == 0 and rep["restart"] is True and rep["accepted"] == 1
+    assert verdicts(rep)[:2] == [L.REJECTED, L.ACCEPTED]
+    assert rep["rungs"][1]["metrics"]["extra_count"] == 1
+    assert ("rung_0", 0) in seen and ("rung_1", 1) in seen
+    assert all(n.startswith("rung_") for n, _ in seen)        # not the placement
+    before = [x for x in seen if x[0] in ("rung_0", "rung_1")]
+    code, rep = w.run(hooks=hooks)          # a reused rung record: not again
+    assert rep["rungs"][0]["reused"] is True
+    assert [x for x in seen if x[0] in ("rung_0", "rung_1")] == before
+
+
+def test_finish_rung_rejects_a_rung_with_rung_rejected_and_other_failures_are_errors(
+        tmp_path):
+    def finish(cfg, d):
+        if cfg.design.pnr["knob"] == 0:
+            raise L.RungRejected("the flow's own check refused it")
+        raise ValueError("a broken step")
+    w = World(tmp_path, {"0": GOOD, "1": GOOD}, stage_restart=None,
+              ladder={"param": "knob", "values": [0, 1]})
+    code, rep = w.run(hooks=L.LadderHooks(finish_rung=finish))
+    assert verdicts(rep) == [L.REJECTED, L.ERROR]
+    assert code == L.exit_code(L.ERROR)
+    assert rep["rungs"][0]["reasons"] == ["the flow's own check refused it"]
+    assert rep["rungs"][0]["metrics"]["setup_ws"] == 5.0     # what the run left
+    assert "a broken step" in rep["rungs"][1]["reasons"][0]
+
+
+def test_finish_rung_runs_on_each_orfs_rung_too(fake_orfs, tmp_path):
+    seen = []
+
+    def finish(cfg, d):
+        seen.append((Path(d).name, cfg.design.pnr["hold_margin"]))
+        if cfg.design.pnr["hold_margin"] == 0:
+            raise L.RungRejected("refused")
+    lad = {"param": "hold_margin", "values": [0, 5],
+           "accept": {"metrics": {"hold_ws": {"min": 0}}}}
+    cfg = _orfs_cfg(fake_orfs, tmp_path, lad)
+    L.run_flow(cfg, log=lambda m: None, hooks=L.LadderHooks(finish_rung=finish))
+    rep = _rep(cfg)
+    assert verdicts(rep) == [L.REJECTED, L.ACCEPTED] and rep["accepted"] == 1
+    assert sorted(seen) == [("rung_0", 0), ("rung_1", 5)]
+
+
+def _record_finishing_step(monkeypatch, seen, param):
+    """Wrap the flow's finishing step for a pack command, recording the
+    parameter's value in the config it gets."""
+    from circt_flow import stages
+    real = stages.pack_finish
+
+    def wrapped(cfg, out, rc, cmd, log=None):
+        seen.append(("finishing step", Path(out).name, cfg.design.pnr.get(param)))
+        return real(cfg, out, rc, cmd, log)
+    monkeypatch.setattr(stages, "pack_finish", wrapped)
+
+
+def test_a_backend_that_did_not_start_a_run_finishes_it_with_the_runs_own_value(
+        fake_orfs, tmp_path, monkeypatch):
+    """A new process (a resumed ladder) reads a rung it did not start: the
+    finishing step and finish_rung get the rung's value, not the base
+    config's."""
+    seen = []
+    _record_finishing_step(monkeypatch, seen, "knob")
+    hooks = L.LadderHooks(finish_rung=lambda cfg, d: seen.append(
+        ("finish_rung", Path(d).name, cfg.design.pnr.get("knob"))))
+    w = World(tmp_path, {"7": GOOD}, ladder={"param": "knob", "values": [0, 7],
+                                             "from_stage": "cts"})
+    w.pnr["knob"] = 0
+    spec = L.parse_ladder(w.pnr["ladder"])
+    d = tmp_path / "rung_1"
+    d.mkdir()
+    (d / "pnr_metrics.json").write_text(json.dumps(GOOD))
+    m = L.CommandBackend(w.cfg, spec, hooks).metrics(d, 7)
+    assert m["status"] == "ok"
+    assert seen == [("finishing step", "rung_1", 7), ("finish_rung", "rung_1", 7)]
+    seen.clear()
+    lad = {"param": "hold_margin", "values": [0, 5]}
+    cfg = _orfs_cfg(fake_orfs, tmp_path, lad, {"hold_margin": 0})
+    (d / "pnr_metrics.json").write_text(json.dumps({**GOOD, "status": "ok"}))
+    L.OrfsBackend(cfg, L.parse_ladder(lad), L.LadderHooks(
+        finish_rung=lambda c, x: seen.append(c.design.pnr["hold_margin"]))
+    ).metrics(d, 5)
+    assert seen == [5]
+
+
+@pytest.mark.parametrize("mode", ["sequential", "parallel"])
+def test_a_resumed_ladder_finishes_a_rung_it_runs_again_with_the_rungs_own_value(
+        tmp_path, monkeypatch, mode):
+    """Second run on the same directory (a new Ladder): rung 0 comes from its
+    record and is not finished again; rung 1 (an error the first time) runs
+    again, and its finishing step and finish_rung see its own value."""
+    seen = []
+    _record_finishing_step(monkeypatch, seen, "knob")
+    broken = {"on": True}
+
+    def finish(cfg, d):
+        seen.append(("finish_rung", Path(d).name, cfg.design.pnr.get("knob")))
+        if broken["on"] and cfg.design.pnr.get("knob") == 1:
+            raise ValueError("a step that fails once")
+    plan = {"0": {**GOOD, "setup_ws": -1.0}, "1": GOOD}
+    w = World(tmp_path, plan, ladder={"param": "knob", "values": [0, 1],
+                                      "from_stage": "cts", "mode": mode})
+    w.pnr["knob"] = 9                      # the base value: no rung's own
+    code, rep = w.run(hooks=L.LadderHooks(finish_rung=finish))
+    assert verdicts(rep) == [L.REJECTED, L.ERROR]
+    assert sorted(seen) == [("finish_rung", "rung_0", 0), ("finish_rung", "rung_1", 1),
+                            ("finishing step", "rung_0", 0),
+                            ("finishing step", "rung_1", 1)]
+    seen.clear()
+    broken["on"] = False
+    code, rep = w.run(hooks=L.LadderHooks(finish_rung=finish))
+    assert code == 0 and rep["accepted"] == 1
+    assert rep["rungs"][0]["reused"] is True and rep["rungs"][0]["value"] == 0
+    assert rep["rungs"][1]["reused"] is False
+    assert seen == [("finishing step", "rung_1", 1), ("finish_rung", "rung_1", 1)]
+
+
+def test_a_resumed_orfs_ladder_finishes_a_rung_it_runs_again_with_the_rungs_own_value(
+        fake_orfs, tmp_path):
+    seen = []
+    broken = {"on": True}
+
+    def finish(cfg, d):
+        seen.append((Path(d).name, cfg.design.pnr["hold_margin"]))
+        if cfg.design.pnr["hold_margin"] == 0:
+            raise L.RungRejected("refused")
+        if broken["on"]:
+            raise ValueError("a step that fails once")
+    lad = {"param": "hold_margin", "values": [0, 5],
+           "accept": {"metrics": {"hold_ws": {"min": 0}}}}
+    cfg = _orfs_cfg(fake_orfs, tmp_path, lad, {"hold_margin": 2})
+    with pytest.raises(L.LadderFailed):
+        L.run_flow(cfg, log=lambda m: None, hooks=L.LadderHooks(finish_rung=finish))
+    assert verdicts(_rep(cfg)) == [L.REJECTED, L.ERROR]
+    seen.clear()
+    broken["on"] = False
+    L.run_flow(cfg, log=lambda m: None, hooks=L.LadderHooks(finish_rung=finish))
+    rep = _rep(cfg)
+    assert rep["accepted"] == 1 and rep["rungs"][0]["reused"] is True
+    assert seen == [("rung_1", 5)]
+
+
+def test_check_shared_placement_runs_once_and_its_number_is_reported(
+        tmp_path):
+    seen = []
+
+    def check(cfg, place_dir):
+        seen.append((Path(place_dir).name, cfg.design.pnr["knob"]))
+        return 2
+    hooks = L.LadderHooks(check_shared_placement=check)
+    w = World(tmp_path, {"0": GOOD, "1": GOOD},
+              ladder={"param": "knob", "values": [0, 1], "from_stage": "cts"})
+    code, rep = w.run(hooks=hooks)
+    assert code == 0 and rep["restart"] is True and rep["placement_failures"] == 2
+    assert seen == [("place", 0)]                       # the first rung's config
+    code, rep = w.run(hooks=L.LadderHooks(check_shared_placement=lambda cfg, d: None))
+    assert code == 0 and "placement_failures" not in rep
+    (tmp_path / "full").mkdir()
+    w = World(tmp_path / "full", {"0": GOOD, "1": GOOD}, stage_restart=None,
+              ladder={"param": "knob", "values": [0, 1]})
+    code, rep = w.run(hooks=hooks)                      # no shared placement
+    assert code == 0 and seen == [("place", 0)] and "placement_failures" not in rep
+
+
+def test_rung_rejected_from_check_shared_placement_stops_the_ladder(tmp_path):
+    def check(cfg, place_dir):
+        raise L.RungRejected("the placement is unusable")
+    w = World(tmp_path, {"0": GOOD, "1": GOOD},
+              ladder={"param": "knob", "values": [0, 1], "from_stage": "cts"})
+    code, rep = w.run(hooks=L.LadderHooks(check_shared_placement=check))
+    assert code == L.EXIT_RUNG_FAILED and rep["state"] == "error"
+    assert "shared placement" in rep["message"] and "unusable" in rep["message"]
+    assert [e[0] for e in w.events()] == ["place"]            # no rung ran
+
+
+def test_check_shared_placement_runs_on_an_orfs_shared_placement(fake_orfs, tmp_path):
+    seen = []
+
+    def check(cfg, place_dir):
+        seen.append((Path(place_dir).name, cfg.design.pnr["hold_margin"]))
+        raise L.RungRejected("the placement is unusable")
+    lad = {"param": "hold_margin", "values": [0, 5],
+           "accept": {"metrics": {"hold_ws": {"min": 0}}}}
+    cfg = _orfs_cfg(fake_orfs, tmp_path, lad)
+    with pytest.raises(L.LadderFailed) as e:
+        L.run_flow(cfg, log=lambda m: None,
+                   hooks=L.LadderHooks(check_shared_placement=check))
+    assert e.value.code == L.EXIT_RUNG_FAILED and seen == [("place", 0)]
+    assert not (cfg.pnr_dir / "ladder" / "rung_0").exists()
+
+
+def test_earlier_stage_refuses_a_parameter_that_acts_before_the_restart_stage(tmp_path):
+    asked = []
+
+    def earlier(param, from_stage):
+        asked.append((param, from_stage))
+        return "floorplan" if param == "early_knob" else None
+    hooks = L.LadderHooks(earlier_stage=earlier)
+    w = World(tmp_path, {}, ladder={"param": "early_knob", "values": [0, 1],
+                                    "from_stage": "cts"})
+    with pytest.raises(L.LadderError, match="early_knob acts from the floorplan "
+                                            "stage, before from_stage cts"):
+        L.CommandBackend(w.cfg, L.parse_ladder(w.pnr["ladder"]), hooks)
+    w = World(tmp_path, {}, ladder={"param": "knob", "values": [0, 1],
+                                    "from_stage": "cts"})
+    assert L.CommandBackend(w.cfg, L.parse_ladder(w.pnr["ladder"]), hooks).supports_restart
+    w = World(tmp_path, {}, stage_restart=None,     # every rung a full run: any key
+              ladder={"param": "early_knob", "values": [0, 1]})
+    L.CommandBackend(w.cfg, L.parse_ladder(w.pnr["ladder"]), hooks)
+    assert asked == [("early_knob", "cts"), ("knob", "cts")]
+
+
+def _extra_env(monkeypatch, extra):
+    """stages.pack_command with more environment entries: extra(cfg) -> dict."""
+    from circt_flow import stages
+    orig = stages.pack_command
+
+    def pack_command(cfg, out):
+        cmd, env = orig(cfg, out)
+        return cmd, {**env, **extra(cfg)}
+    monkeypatch.setattr(stages, "pack_command", pack_command)
+
+
+def test_param_env_names_leaves_the_variables_the_parameter_controls_out_of_the_plan(
+        tmp_path, monkeypatch):
+    _extra_env(monkeypatch, lambda cfg: {"KNOB_VAR": str(cfg.design.pnr.get("knob")),
+                                         "OTHER_VAR": "x"})
+    w = World(tmp_path, {"0": GOOD})
+    spec = L.parse_ladder(w.pnr["ladder"])
+    d = tmp_path / "d"
+    d.mkdir()
+    be = L.CommandBackend(w.cfg, spec, L.LadderHooks())
+    assert be.diff(be.plan(d, 0), be.plan(d, 1)) == ["the P&R command's inputs differ"]
+    asked = []
+
+    def names(cfg, param, values, run_dir):
+        asked.append((param, list(values), Path(run_dir).name))
+        return {"KNOB_VAR"}
+    be = L.CommandBackend(w.cfg, spec, L.LadderHooks(param_env_names=names))
+    a, b = be.plan(d, 0), be.plan(d, 1)
+    assert be.diff(a, b) == []
+    assert "KNOB_VAR" not in json.dumps(a) and a["flow_env"]["OTHER_VAR"] == "x"
+    assert asked == [("knob", [0, 1, 2], "d")]                # asked once
+
+
+def test_hash_env_value_decides_what_an_environment_value_hashes_to(tmp_path, monkeypatch):
+    data = tmp_path / "data.txt"
+    data.write_text("a")
+    _extra_env(monkeypatch, lambda cfg: {"DATA_VAR": str(data), "WORD_VAR": "plain"})
+    w = World(tmp_path, {"0": GOOD})
+    spec = L.parse_ladder(w.pnr["ladder"])
+    d = tmp_path / "run"
+    d.mkdir()
+    p = L.CommandBackend(w.cfg, spec, L.LadderHooks()).plan(d, 0)
+    assert "DATA_VAR" in p["flow_env_files"] and "DATA_VAR" not in p["flow_env"]
+    assert p["flow_env"]["WORD_VAR"] == "plain"               # a value, not a path
+    data.write_text("b")
+    assert L.CommandBackend(w.cfg, spec, L.LadderHooks()).plan(d, 0) != p
+    asked = []
+
+    def hash_value(cfg, name, value):
+        asked.append(name)
+        return "h:" + value if name == "WORD_VAR" else None
+    q = L.CommandBackend(w.cfg, spec, L.LadderHooks(hash_env_value=hash_value)).plan(d, 0)
+    assert q["flow_env_files"]["WORD_VAR"] == "h:plain" and "WORD_VAR" not in q["flow_env"]
+    assert "DATA_VAR" not in q["flow_env_files"] and q["flow_env"]["DATA_VAR"] == str(data)
+    assert {"DATA_VAR", "WORD_VAR"} <= set(asked)

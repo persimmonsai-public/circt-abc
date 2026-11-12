@@ -10,7 +10,7 @@
         [--no-vt-swap] [--dont-use PATTERN ...] [--wire-rc <rc.tcl>]
         [--cts-buffer CELL ...] [--cts-cluster-size N]
         [--cts-cluster-diameter UM] [--cts-arg FLAG ...]
-        [--hold-margin T] [--setup-margin T]
+        [--hold-margin T] [--setup-margin T] [--input-delay-min T]
         [--from-dir <placed run dir> --from-stage cts|route]
 
 ORFS takes a pre-synthesised netlist through SYNTH_NETLIST_FILES: its synth
@@ -1139,6 +1139,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="HOLD_SLACK_MARGIN, in the platform's time unit")
     ap.add_argument("--setup-margin", type=float,
                     help="SETUP_SLACK_MARGIN, in the platform's time unit")
+    ap.add_argument("--input-delay-min", type=float, metavar="T",
+                    help="append set_input_delay -min T on every non-clock "
+                    "input to the SDC (the platform's time unit)")
     ap.add_argument("--image", default=os.environ.get("ORFS_IMAGE",
                                                        DEFAULT_IMAGE))
     ap.add_argument("--tie-hi", metavar="CELL:PIN",
@@ -1206,6 +1209,10 @@ def main(argv: list[str] | None = None) -> int:
         sdc.write_bytes(a.sdc.read_bytes())
     else:
         write_sdc(sdc, a.top, a.clock_port, a.clock_period, a.clock_latency)
+    if a.input_delay_min is not None:
+        from .pnr_recipe import append_input_delay_min
+        sdc.write_text(append_input_delay_min(sdc.read_text(),
+                                              a.input_delay_min))
     config = run_dir / "config.mk"
     write_config(config, platform=a.platform, top=a.top, netlist=netlist,
                  sdc=sdc, utilization=a.utilization,

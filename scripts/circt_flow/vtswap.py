@@ -75,7 +75,276 @@ from typing import Optional, Sequence
 ORFS_IMAGE = "openroad/orfs:26Q3-277-gf9ec54a6d"
 STA_BIN = "/OpenROAD-flow-scripts/tools/install/OpenROAD/bin/sta"
 VT_SWAP_KEYS = {"enabled", "false_from", "paths", "max_iter", "recover",
-                "margin_ps", "keep_clock_cells", "false_to"}
+                "margin_ps", "keep_clock_cells", "false_to", "fix",
+                "sens_frac", "recover_order", "ladder_cap",
+                "allow_footprint_change", "ladder_escalate", "close_margin_ps"}
+
+
+@dataclass(frozen=True)
+class LayoutSpec:
+    """How the swap sees a placed netlist: parasitics from `spef`, the
+    clocks propagated, the clock network left alone (`protect_clock`), and
+    a swap allowed only between cells of equal footprint: the LEF size when
+    `sizes` ({cell: (width, height)}) has both cells, else the liberty
+    area. `allow_footprint_change` lifts the footprint rule (the swaps are
+    then listed, not ECO-clean)."""
+    spef: Optional[Path] = None
+    propagated: bool = True
+    protect_clock: bool = True
+    sizes: Optional[dict] = None
+    allow_footprint_change: bool = False
+    # Time setup and hold in two OpenSTA corners (with `hold_libs`), the
+    # parasitics read into both: a propagated clock must not be timed with
+    # setup launching on the setup libraries' tree and capturing on the
+    # hold libraries' faster one, as one corner with -max/-min libraries does.
+    corners: bool = True
+    # Which hold paths the swap protects: "r2r" (register to register: the
+    # ones a faster cell can break that nothing else repairs; input-port
+    # hold is the clock tree's and the constraints' business, and a design
+    # that already fails it would otherwise veto every swap) or "all".
+    hold_scope: str = "r2r"
+    # How far below its start slack (or 0) a hold endpoint may go, in the
+    # libraries' time unit.
+    hold_tol: float = 0.0
+    # Fix by sensitivity ("sens": each candidate cell is tried alone, the
+    # best slack gain per leakage added go up, `sens_frac` of the useful
+    # ones per iteration) rather than "bulk" (every cell of the failing
+    # paths one flavour up, recovery then gives leakage back). `leakage`
+    # is {cell: state-averaged leakage}, needed by "sens".
+    fix: str = "sens"
+    sens_frac: float = 0.25
+    leakage: Optional[dict] = None
+    # Opt-in leakage controls (defaults leave the swap unchanged):
+    # `recover_order` "leak" tries the highest-leakage cells first in each
+    # recovery pass (needs `leakage`), so the slack headroom a path has goes
+    # to the cells that save most; "inst" keeps netlist order.
+    recover_order: str = "inst"
+    # `ladder_cap`: a ladder token (e.g. "L") above which the fix step
+    # may not move a cell; recovery still moves cells down from above it.
+    ladder_cap: str = ""
+    # Closing pass: when the fix, held under `ladder_cap`, leaves the worst
+    # slack below `close_margin`, the cap is lifted to this token and a
+    # sensitivity fix runs once more towards `close_margin` (best slack per
+    # leakage added, on the failing paths only). Recovery then takes the
+    # swaps that were not needed back, highest leakage first. "" is off.
+    ladder_escalate: str = ""
+    close_margin: float = 0.0
+    # Pair recovery: after recovery, try to take the `recover_swap`
+    # highest-leakage cells that could not move down on their own one step
+    # down while moving one cell of the worst path up (cheaper in leakage than
+    # the saving), keeping the pair only if the worst slack stays at the floor.
+    # 0 is off.
+    recover_swap: int = 0
+    # Second wire view (opt-in): with two corners, a third corner `setup2`
+    # (the setup libraries, this SPEF) is timed too, so the worst slack the
+    # fix and recovery see is the worst over both parasitic views.
+    spef2: Optional[Path] = None
+
+    def pre_tcl(self, hold_libs: bool = False) -> str:
+        spef = Path(self.spef).resolve() if self.spef else None
+        if spef and self.corners and hold_libs:
+            rs = (f"read_spef -corner setup {spef}\n"
+                  f"read_spef -corner hold {spef}\n")
+            if self.spef2:
+                rs += f"read_spef -corner setup2 {Path(self.spef2).resolve()}\n"
+        else:
+            rs = f"read_spef {spef}\n" if spef else ""
+        return ("set_propagated_clock [all_clocks]\n" if self.propagated
+                else "") + rs
+
+    def hooks_tcl(self) -> str:
+        sizes = " ".join("{%s} {%g %g}" % (c, w, h)
+                         for c, (w, h) in sorted((self.sizes or {}).items()))
+        return r'''
+if {"%(hold_scope)s" eq "r2r"} {
+  set hold_ft [list -from [all_registers -clock_pins] -to [all_registers -data_pins]]
+  proc whs {} {
+    global hold_ft
+    set pe [lindex [find_timing_paths -path_delay min {*}$hold_ft -group_path_count 1 -sort_by_slack] 0]
+    if {$pe eq ""} { return 1e30 }
+    return [sta::time_sta_ui [$pe slack]]
+  }
+}
+# Per-endpoint hold floor: an endpoint may not end below min(0, its slack
+# at the start) - tol; a violator the start did not have counts from 0. One
+# endpoint already at its floor then stops only the swaps on its own paths,
+# not every swap in the design.
+set hold_tol %(hold_tol)s
+# rounds of undoing the moves on newly failing hold paths before an
+# iteration gives up (each round can only shrink the moved set)
+set hold_rounds 6
+set hold_start [dict create]
+proc hold_begin {} {
+  global hold_start hold_ft
+  foreach pe [find_timing_paths -path_delay min {*}$hold_ft -slack_max 0 \
+                -group_path_count 1000000 -endpoint_path_count 1 \
+                -unique_paths_to_endpoint] {
+    dict set hold_start [get_full_name [$pe pin]] [sta::time_sta_ui [$pe slack]]
+  }
+}
+proc hold_bad_paths {} {
+  global hold_start hold_ft hold_tol
+  set l {}
+  foreach pe [find_timing_paths -path_delay min {*}$hold_ft -slack_max 0 \
+                -group_path_count 1000000 -endpoint_path_count 1 \
+                -unique_paths_to_endpoint] {
+    set s [sta::time_sta_ui [$pe slack]]
+    set n [get_full_name [$pe pin]]
+    set fl [expr {[dict exists $hold_start $n] ? [dict get $hold_start $n] : 0.0}]
+    if {$s < $fl - $hold_tol - 1e-6} { lappend l $pe }
+  }
+  return $l
+}
+proc hold_bad {} { return [expr {[llength [hold_bad_paths]] > 0}] }
+# Sensitivity fix: try each movable cell of the failing paths one flavour
+# up on its own, rank by slack gained (total negative slack plus worst
+# slack) per leakage added, and keep the best `frac` of those that gain.
+set leak_tab [dict create %(leaks)s]
+set recover_leak %(rleak)d
+set ladder_cap_idx [lsearch -exact $flavours {%(cap)s}]
+if {"%(cap)s" eq ""} { set ladder_cap_idx -1 }
+set escalate_idx [lsearch -exact $flavours {%(esc)s}]
+if {"%(esc)s" eq ""} { set escalate_idx -1 }
+set close_margin %(close)s
+set recover_swap %(rswap)d
+proc leak_of {ref} {
+  global leak_tab
+  if {[dict exists $leak_tab $ref]} { return [dict get $leak_tab $ref] }
+  return 0.0
+}
+if {%(sens)d || "%(esc)s" ne ""} {
+  if {%(sens)d} { set bulk_iters 0 }
+  proc sens_fix {max_iter paths margin} {
+    global rec frozen hold_rounds
+    set frac %(frac)s
+    for {set it 0} {$it < $max_iter} {incr it} {
+      set w [wns]
+      if {$w >= $margin} { break }
+      set t0 [tns]
+      set seen [dict create]
+      foreach pe [find_timing_paths -path_delay max -group_path_count $paths \
+                    -endpoint_path_count 1 -slack_max $margin -sort_by_slack] {
+        foreach pin [[$pe path] pins] {
+          set inst [$pin instance]
+          if {$inst eq "" || $inst eq "NULL"} { continue }
+          if {[$inst liberty_cell] eq "NULL"} { continue }
+          if {[is_clock_cell $inst]} { continue }
+          dict set seen [get_full_name $inst] $inst
+        }
+      }
+      set scored {}
+      dict for {name inst} $seen {
+        if {[dict exists $frozen $name]} { continue }
+        set from [get_property $inst ref_name]
+        set to [move $inst 1]
+        if {$to eq ""} { continue }
+        set t1 [tns]
+        set w1 [wns]
+        replace_cell $inst [lib_cell_of $from]
+        set gain [expr {($t1 - $t0) + ($w1 - $w)}]
+        if {$gain <= 1e-6} { continue }
+        set dl [expr {[leak_of $to] - [leak_of $from]}]
+        if {$dl < 1e-9} { set dl 1e-9 }
+        lappend scored [list [expr {$gain / $dl}] $inst $name $from $to]
+      }
+      if {[llength $scored] == 0} {
+        puts $rec "iter $it [format %%.6f $w] moved 0"
+        break
+      }
+      set scored [lsort -real -decreasing -index 0 $scored]
+      set k [expr {int(ceil($frac * [llength $scored]))}]
+      if {$k < 5} { set k 5 }   ;# a few moves per iteration even on a short list
+      set moved {}
+      foreach s [lrange $scored 0 [expr {$k - 1}]] {
+        lassign $s r inst name from to
+        move $inst 1
+        lappend moved [list $inst $name $from $to]
+      }
+      for {set round 0} {$round < $hold_rounds && [llength $moved] > 0 &&
+                         [hold_bad]} {incr round} {
+        set onhold [dict create]
+        foreach pe [hold_bad_paths] {
+          foreach pin [[$pe path] pins] {
+            set inst [$pin instance]
+            if {$inst eq "" || $inst eq "NULL"} { continue }
+            dict set onhold [get_full_name $inst] 1
+          }
+        }
+        set kept {}
+        foreach m $moved {
+          if {[dict exists $onhold [lindex $m 1]]} {
+            replace_cell [lindex $m 0] [lib_cell_of [lindex $m 2]]
+            dict set frozen [lindex $m 1] 1
+            puts $rec "hold $it [lindex $m 1] [lindex $m 2] [lindex $m 3]"
+          } else { lappend kept $m }
+        }
+        set moved $kept
+      }
+      set why ""
+      if {[llength $moved] > 0 && [hold_bad]} { set why hold }
+      if {[llength $moved] > 0 && $why eq "" && [wns] <= $w + 1e-6 &&
+          [tns] <= $t0 + 1e-6} { set why setup }
+      if {$why ne ""} {
+        foreach m $moved { replace_cell [lindex $m 0] [lib_cell_of [lindex $m 2]] }
+        puts $rec "iter $it [format %%.6f $w] moved 0 undone [llength $moved] $why"
+        break
+      }
+      foreach m $moved { puts $rec "up $it [lindex $m 1] [lindex $m 2] [lindex $m 3]" }
+      puts $rec "iter $it [format %%.6f $w] moved [llength $moved]"
+      if {[llength $moved] == 0} { break }
+    }
+  }
+}
+array set clk_cells {}
+if {%(clk)d} {
+  foreach i [get_cells -hierarchical *] {
+    foreach p [get_pins -of_objects $i] {
+      if {[get_property $p direction] eq "output" && [sta::is_clock $p]} {
+        set clk_cells([get_full_name $i]) 1
+        break
+      }
+    }
+  }
+}
+set eco_stat(clock_cells) [array size clk_cells]
+array set fp_size [list %(sizes)s]
+set fp_free %(free)d
+proc eco_count {k} {
+  global eco_stat
+  if {![info exists eco_stat($k)]} { set eco_stat($k) 0 }
+  incr eco_stat($k)
+}
+proc eco_ok {inst from to} {
+  global clk_cells fp_size fp_free
+  if {[info exists clk_cells([get_full_name $inst])]} {
+    eco_count blocked_clock
+    return 0
+  }
+  if {$fp_free} { return 1 }
+  if {[info exists fp_size($from)] && [info exists fp_size($to)]} {
+    if {$fp_size($from) eq $fp_size($to)} { return 1 }
+    eco_count blocked_footprint
+    return 0
+  }
+  if {[array size fp_size] > 0} { eco_count blocked_no_lef; return 0 }
+  set a [get_property [lib_cell_of $from] area]
+  set b [get_property [lib_cell_of $to] area]
+  if {abs($a - $b) < 1e-9} { return 1 }
+  eco_count blocked_footprint
+  return 0
+}
+''' % {"clk": int(self.protect_clock), "sizes": sizes,
+        "free": int(self.allow_footprint_change),
+        "hold_scope": self.hold_scope,
+        "hold_tol": "%g" % self.hold_tol,
+        "sens": int(self.fix == "sens"), "frac": "%g" % self.sens_frac,
+        "rleak": int(self.recover_order == "leak"), "cap": self.ladder_cap,
+        "esc": self.ladder_escalate, "close": "%g" % self.close_margin,
+        "rswap": int(self.recover_swap),
+        "leaks": " ".join("{%s} %.9g" % (c, v) for c, v in
+                          sorted((self.leakage or {}).items()))
+        if (self.fix == "sens" or self.recover_order == "leak"
+            or self.ladder_escalate or self.recover_swap) else ""}
 
 
 class VtSwapError(RuntimeError):
@@ -103,12 +372,63 @@ class VtSwapSpec:
     # otherwise has the fix spend the fastest flavours on them without ever
     # reaching the margin, and recovery then starts from that.
     false_to: tuple = ()
+    # Opt-in: fix by sensitivity (best slack per leakage added), recover the
+    # highest-leakage cells first, and stop the fix at a ladder token. "bulk"
+    # with "inst" order and no cap is the default.
+    fix: str = "bulk"
+    sens_frac: float = 0.25
+    recover_order: str = "inst"
+    ladder_cap: str = ""
+    # A ladder whose steps change a cell's area: without
+    # this the swap vetoes every move to a different area.
+    allow_footprint_change: bool = False
+    # Closing pass (LayoutSpec.ladder_escalate): lift the cap to this token
+    # for what the capped fix left short of `close_margin_ps`.
+    ladder_escalate: str = ""
+    close_margin_ps: float = 0.0
 
 
 def false_to_sdc(false_to) -> str:
     return "".join("set_false_path -to [all_outputs]\n" if p == "outputs"
                    else f"set_false_path -to [get_ports {p}]\n"
                    for p in false_to)
+
+
+def check_leakage_keys(d: dict, where: str) -> None:
+    """The leakage controls shared by `vt_swap:` and `pnr.post_layout:`
+    (`where` names the section), checked when the config is read."""
+    if d.get("fix", "bulk") not in ("sens", "bulk"):
+        raise VtSwapError(f"{where}.fix must be sens or bulk")
+    sf = d.get("sens_frac", 0.25)
+    if isinstance(sf, bool) or not isinstance(sf, (int, float)) \
+            or not 0 < sf <= 1:
+        raise VtSwapError(f"{where}.sens_frac must be a number in (0, 1]")
+    if d.get("recover_order", "inst") not in ("inst", "leak"):
+        raise VtSwapError(f"{where}.recover_order must be inst or leak")
+    for k in ("ladder_cap", "ladder_escalate"):
+        if not isinstance(d.get(k, ""), str):
+            raise VtSwapError(f"{where}.{k} must be a ladder token")
+    cm = d.get("close_margin_ps", 0.0)
+    if isinstance(cm, bool) or not isinstance(cm, (int, float)) or cm < 0 \
+            or cm != cm or cm == float("inf"):
+        raise VtSwapError(f"{where}.close_margin_ps must be a number of ps "
+                          ">= 0")
+    if "close_margin_ps" in d and not d.get("ladder_escalate"):
+        raise VtSwapError(f"{where}.close_margin_ps needs ladder_escalate "
+                          "in the same section (it is the closing pass's "
+                          "target)")
+    if "allow_footprint_change" in d and \
+            not isinstance(d["allow_footprint_change"], bool):
+        raise VtSwapError(f"{where}.allow_footprint_change must be true or "
+                          "false")
+
+
+def check_ladder_tokens(cap: str, esc: str, tokens, where: str) -> None:
+    """`ladder_cap` / `ladder_escalate` name tokens of the pack's ladder."""
+    for k, v in (("ladder_cap", cap), ("ladder_escalate", esc)):
+        if v and v not in tokens:
+            raise VtSwapError(f"{where}.{k} {v!r} is not a token of the "
+                              f"pack's vt_flavours ({', '.join(tokens)})")
 
 
 def parse_vt_swap(d, where) -> VtSwapSpec:
@@ -138,12 +458,19 @@ def parse_vt_swap(d, where) -> VtSwapSpec:
         if k in d and not isinstance(d[k], bool):
             raise VtSwapError(f"{where}: vt_swap.{k} must be true or false")
     mg = d.get("margin_ps", 0.0)
-    if isinstance(mg, bool) or not isinstance(mg, (int, float)) or mg < 0:
+    if isinstance(mg, bool) or not isinstance(mg, (int, float)) or mg < 0 \
+            or mg != mg or mg == float("inf"):
         raise VtSwapError(f"{where}: vt_swap.margin_ps must be a number of "
                           "ps >= 0")
+    check_leakage_keys(d, f"{where}: vt_swap")
     return VtSwapSpec(d.get("enabled", True), tuple(ff), d.get("paths", 200),
                       d.get("max_iter", 30), d.get("recover", True),
-                      float(mg), d.get("keep_clock_cells", False), tuple(ft))
+                      float(mg), d.get("keep_clock_cells", False), tuple(ft),
+                      d.get("fix", "bulk"), float(d.get("sens_frac", 0.25)),
+                      d.get("recover_order", "inst"), d.get("ladder_cap", ""),
+                      bool(d.get("allow_footprint_change", False)),
+                      d.get("ladder_escalate", ""),
+                      float(d.get("close_margin_ps", 0.0)))
 
 
 def parse_flavours(d, where) -> Optional[dict]:
@@ -250,7 +577,8 @@ proc lib_cell_of {name} {
   return [lindex $c 0]
 }
 # A swap's veto: 1 lets `inst` go from cell `from` to cell `to`. The
-# default allows every swap.
+# default allows every swap; the post-layout stage (hooks below) vetoes
+# clock-network cells and footprint changes.
 array set eco_stat {}
 set hold_ft {}
 set hold_rounds 1
@@ -276,6 +604,7 @@ proc hold_bad_paths {} {
 }
 proc eco_ok {inst from to} { return 1 }
 set recover_leak 0
+set recover_swap 0
 set ladder_cap_idx -1
 set escalate_idx -1
 set close_margin 0
@@ -367,7 +696,8 @@ for {set it 0} {$it < $bulk_iters} {incr it} {
   set w2 [wns]
   set why ""
   if {[llength $moved] > 0 && [hold_bad]} { set why hold }
-  # An iteration that does not improve the worst slack is undone.
+  # A post-layout fix also keeps an iteration that lowers the total
+  # negative slack while the worst path stays where it is.
   if {[llength $moved] > 0 && $why eq "" && $w2 <= $w + 1e-6 &&
       !($tns_accept && [tns] > $tn + 1e-6)} {
     set why setup
@@ -452,6 +782,62 @@ if {%(recover)d} {
     }
   }
 }
+# 2b. Pair recovery (opt-in): a cell the plain recovery could not move down
+# goes down together with a cheaper compensating cell on the worst path.
+if {%(recover)d && $recover_swap > 0} {
+  set floor2 [expr {[wns] < $margin ? [wns] : $margin}]
+  set floor2 [expr {$floor2 < $floor ? $floor2 : $floor}]
+  set cand {}
+  foreach inst [get_cells -hierarchical *] {
+    if {[flav_index [get_property $inst ref_name]] > 0 && ![is_clock_cell $inst]} {
+      lappend cand [list [leak_of [get_property $inst ref_name]] $inst]
+    }
+  }
+  set cand [lsort -real -decreasing -index 0 $cand]
+  set ndone 0; set npair 0
+  foreach kv [lrange $cand 0 [expr {$recover_swap - 1}]] {
+    set inst [lindex $kv 1]
+    set ref [get_property $inst ref_name]
+    set to [move $inst -1]
+    if {$to eq ""} { continue }
+    set saved [expr {[leak_of $ref] - [leak_of $to]}]
+    if {[holds $floor2 $tfloor]} {
+      puts $rec "down [get_full_name $inst] $ref $to"; incr ndone; continue
+    }
+    # compensate: best cell on the worst path (one step up, under the cap)
+    set best ""; set bw -1e9
+    foreach pe [find_timing_paths -path_delay max -group_path_count 1 -sort_by_slack] {
+      foreach pin [[$pe path] pins] {
+        set i2 [$pin instance]
+        if {$i2 eq "" || $i2 eq "NULL" || $i2 eq $inst} { continue }
+        if {[$i2 liberty_cell] eq "NULL" || [is_clock_cell $i2]} { continue }
+        set r2 [get_property $i2 ref_name]
+        set t2 [move $i2 1]
+        if {$t2 eq ""} { continue }
+        set cost [expr {[leak_of $t2] - [leak_of $r2]}]
+        # the pair must save leakage: the compensating move may cost at most
+        # nine tenths of what the first move saves
+        if {$cost < $saved * 0.9} {
+          set w2 [wns]
+          if {$w2 > $bw} { set bw $w2; set best [list $i2 $r2 $t2] }
+        }
+        replace_cell $i2 [lib_cell_of $r2]
+      }
+    }
+    if {$best ne ""} {
+      lassign $best i2 r2 t2
+      replace_cell $i2 [lib_cell_of $t2]
+      if {[holds $floor2 $tfloor] && ![hold_bad]} {
+        puts $rec "down [get_full_name $inst] $ref $to"
+        puts $rec "up pair [get_full_name $i2] $r2 $t2"
+        incr npair; continue
+      }
+      replace_cell $i2 [lib_cell_of $r2]
+    }
+    replace_cell $inst [lib_cell_of $ref]
+  }
+  puts $rec "pairrec singles $ndone pairs $npair"
+}
 lap recovered
 puts $rec "end [format %%.6f [wns]] [total_negative_slack -max] [format %%.6f [whs]]"
 foreach {k v} [array get eco_stat] { puts $rec "stat $k $v" }
@@ -484,9 +870,12 @@ def swap(netlist: Path, top: str, out: Path, libs: Sequence[Path],
          hold_both_libs: Sequence[Path] = (),
          rail_flavours: Optional[dict] = None,
          wire_model=None, wire_scales=None,
+         layout: Optional["LayoutSpec"] = None,
          keep_clock_cells: bool = False) -> dict:
     """Swap flavours in `netlist` (see the module docstring); writes `out`
-    and returns the record.
+    and returns the record. With `layout` (a LayoutSpec: SPEF, propagated
+    clocks, clock-network and footprint vetoes) the swap runs on a placed
+    netlist; the record then has `eco_stat`, the swaps the vetoes stopped.
     `margin` is the slack to keep, in the libraries' time unit. With `hold_libs`, `libs` time setup only
     (`read_liberty -max`) and `hold_libs`, the same cells at the hold
     corner, time hold (`-min`). `both_libs` (level shifters) serve both;
@@ -504,15 +893,33 @@ def swap(netlist: Path, top: str, out: Path, libs: Sequence[Path],
     hold_both_libs = [Path(l).resolve() for l in hold_both_libs]
     files = [Path(netlist).resolve(), *(Path(l).resolve() for l in libs),
              *hold_libs, *both_libs, *hold_both_libs]
+    if layout and layout.spef:
+        files.append(Path(layout.spef).resolve())
+    if layout and layout.spef2:
+        files.append(Path(layout.spef2).resolve())
     rc_files = sorted({Path(f).resolve() for f in
                        (getattr(wire_scales, "files", None) or [])})
     flag = "-max " if hold_libs else ""
     both_flag = "-max " if hold_both_libs else ""
     # Setup libraries first: lib_cell_of takes the first library's cell,
     # and OpenSTA times min paths with the -min library's cell of that name.
-    reads = ("".join(f"read_liberty {flag}{Path(l).resolve()}\n"
-                     for l in libs)
-             + "".join(f"read_liberty -min {l}\n" for l in hold_libs))
+    mc = bool(layout and layout.corners and hold_libs)
+    if mc:
+        # Two OpenSTA corners: with propagated clocks, setup must not
+        # capture on the hold corner's faster clock tree.
+        two = bool(layout.spef2)
+        reads = (("define_corners setup hold setup2\n" if two
+                  else "define_corners setup hold\n")
+                 + "".join(f"read_liberty -corner setup {Path(l).resolve()}\n"
+                           for l in libs)
+                 + "".join(f"read_liberty -corner hold {l}\n"
+                           for l in hold_libs)
+                 + ("".join(f"read_liberty -corner setup2 {Path(l).resolve()}\n"
+                            for l in libs) if two else ""))
+    else:
+        reads = ("".join(f"read_liberty {flag}{Path(l).resolve()}\n"
+                         for l in libs)
+                 + "".join(f"read_liberty -min {l}\n" for l in hold_libs))
     reads += ("".join(f"read_liberty {both_flag}{l}\n" for l in both_libs)
               + "".join(f"read_liberty -min {l}\n" for l in hold_both_libs))
     with tempfile.TemporaryDirectory() as td:
@@ -527,10 +934,12 @@ def swap(netlist: Path, top: str, out: Path, libs: Sequence[Path],
             reads
             + f"read_verilog {files[0]}\nlink_design {top}\n"
             + f"read_sdc {sdc}\n"
+            + (layout.pre_tcl(bool(hold_libs)) if layout else "")
             + (wire_mod.tcl(wire_model, str(td / "wire_model.spef"),
                             dict(wire_scales) if wire_scales else None)
-               )
-            + TCL % {"hooks": "", "tns_accept": 0,
+               if (not layout or not layout.spef) else "")
+            + TCL % {"hooks": layout.hooks_tcl() if layout else "",
+                     "tns_accept": int(bool(layout)),
                      "flavours": " ".join(tokens), "fre": flavour_re,
                      "rails": " ".join(
                          "{%s__} {{%s} {%s}}" % (
@@ -806,13 +1215,32 @@ def run(cfg, spec: VtSwapSpec) -> dict:
     keep = cfg.synth_dir / f"{d.top_module}_preswap_openroad.v"
     keep.write_text(nl.read_text())
     out = cfg.synth_dir / f"{d.top_module}_vtswap_openroad.v"
+    check_ladder_tokens(spec.ladder_cap, spec.ladder_escalate,
+                        fl["tokens"], "vt_swap")
+    layout = None
+    if (spec.fix != "bulk" or spec.recover_order != "inst" or spec.ladder_cap
+            or spec.allow_footprint_change or spec.ladder_escalate):
+        # sensitivity fix / leakage-ordered recovery / ladder cap: the
+        # post-layout stage's machinery, on the unplaced netlist (the wire
+        # model stands in for the SPEF).
+        from .postlayout import liberty_table
+        leak = {c: v[1] for c, v in liberty_table(libs).items()}
+        layout = LayoutSpec(spef=None, propagated=False, protect_clock=False,
+                            corners=False, fix=spec.fix,
+                            allow_footprint_change=spec.allow_footprint_change,
+                            sens_frac=spec.sens_frac, leakage=leak,
+                            recover_order=spec.recover_order,
+                            ladder_cap=spec.ladder_cap,
+                            ladder_escalate=spec.ladder_escalate,
+                            close_margin=spec.close_margin_ps
+                            / unit_ps(d.time_unit))
     res = swap(keep, d.top_module, out, libs, fl["tokens"],
                fl["re"], sdc, spec.paths, spec.max_iter,
                spec.recover, margin=spec.margin_ps / unit_ps(d.time_unit),
                hold_libs=hold_libs, wire_model=d.wire_model,
                wire_scales=wire_scales(d, prof.setup_corner,
                                        hold if hold_libs else None),
-               keep_clock_cells=spec.keep_clock_cells)
+               layout=layout, keep_clock_cells=spec.keep_clock_cells)
     out.replace(nl)
     res.update({"mode": tight.name, "libs": [str(l) for l in libs],
                 "setup_corner": prof.setup_corner, "hold_corner": hold,

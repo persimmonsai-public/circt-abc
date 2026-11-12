@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 import pytest
+from pathlib import Path
 
 from circt_flow import vtswap
 from circt_flow.config import ROOT
@@ -409,3 +410,42 @@ def test_vt_swap_false_to_parses_and_makes_sdc():
     assert "set_false_path -to [get_ports q[0]]" in t
     with pytest.raises(v.VtSwapError, match="false_to"):
         v.parse_vt_swap({"false_to": "outputs"}, "f")
+
+
+def test_sensitivity_fix_leaves_clock_cells_alone():
+    """keep_clock_cells: the sensitivity fix (fix: sens, and the closing pass
+    of ladder_escalate) skips clock cells as the bulk fix and both
+    recoveries do."""
+    t = vtswap.LayoutSpec(fix="sens").hooks_tcl()
+    body = t[t.index("proc sens_fix"):]
+    body = body[:body.index("dict for {name inst} $seen")+400]
+    assert "is_clock_cell $inst" in body
+
+
+def test_default_swap_script_has_no_layout_machinery(tmp_path, monkeypatch):
+    """Without a leakage key the generated script has none of the
+    post-layout hooks: the bulk swap's own hold rule, no acceptance by total
+    negative slack, no pair recovery."""
+    class Stop(Exception):
+        pass
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        for w in cmd:
+            if str(w).endswith(".tcl"):
+                seen["tcl"] = Path(w).read_text()
+        raise Stop()
+    monkeypatch.setattr(vtswap.subprocess, "run", fake_run)
+    nl = tmp_path / "n.v"
+    nl.write_text("module top(a); input a; endmodule\n")
+    lib = tmp_path / "l.lib"
+    lib.write_text("library(l){}\n")
+    with pytest.raises(Stop):
+        vtswap.swap(nl, "top", tmp_path / "o.v", [lib], ["R", "L"], r"_([RL])$",
+                    "create_clock -period 1 [get_ports a]\n", 200, 30, True,
+                    keep_clock_cells=True)
+    t = seen["tcl"]
+    assert "set tns_accept 0" in t and "set recover_swap 0" in t
+    assert "proc sens_fix {max_iter paths margin} {}" in t
+    assert "set hold_rounds 6" not in t and "set keep_clk 1" in t
+

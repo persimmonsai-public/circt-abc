@@ -23,12 +23,18 @@ A pack declares the cells in its `flow:` section (techpack_*.yaml):
               data: D{i}               # {i}: bit within the bank
               out: Q{i}
               tie: {SE: 0, SI: last_q} # 0, 1 or last_q (own last output)
+              single:                  # optional: the class's single-bit cell
+                cell: SOMEFF_X1        # for the bits no bank takes (a literal
+                data: D                # name, pins D/Q by default); with it no
+                out: Q                 # bit of the class maps to the liberty's
+                                       # plain flop. Same clock/reset/tie pins.
             none: {...}                # bits with no reset
           b: {...}
 
 Nothing happens unless the flow config opts in with `multibit:` (true, or a
-mapping that overrides `default_family`/`cross_register` and prepends
-`overrides:`; see below). Async-set bits and any class a family leaves out
+mapping that overrides `default_family`/`cross_register`, prepends
+`overrides:`, and turns the classes' `single:` cells on with `single: true`;
+see below). Async-set bits and any class a family leaves out
 stay single-bit cells.
 
 Family choice. `default_family` is the static rule. `overrides:` is a list of
@@ -40,6 +46,10 @@ near-critical paths go to a family with no multibit class, i.e. stay single).
 does it from a file: {file: act.json, hot_family: b, hot_toggle_rate: 0.1}
 where act.json maps register names to data toggles per clock cycle; every
 register at or above the threshold goes to `hot_family`.
+
+Tie override. `tie: {<pin>: 0 | 1 | last_q}` in the flow config sets the tie value of
+that pin in every class that ties it (pin names as in the classes' `tie:`), instead of
+the pack's value; `last_q` is the bank's own last output.
 
 Energy rule. With `activity: {file: act.json, rule: energy}` the family of
 each register is the one that costs least, from the pack's `energy:` model
@@ -71,13 +81,14 @@ from pathlib import Path
 from typing import Optional
 
 CLASS_KEYS = {"cell", "widths", "clock", "reset", "reset_active_high",
-              "data", "out", "tie"}
+              "data", "out", "tie", "single"}
+SINGLE_KEYS = {"cell", "data", "out"}
 SPEC_KEYS = {"default_family", "cross_register", "families", "overrides",
              "energy"}
 ENERGY_KEYS = {"period_ns", "area_weight_nw_per_um2", "families"}
 ENERGY_FAMILY_KEYS = {"clock_aj", "q_aj", "d_aj", "leak_nw", "area_um2"}
 CFG_KEYS = {"default_family", "cross_register", "overrides", "overrides_file",
-            "activity"}
+            "activity", "single", "tie"}
 
 
 def parse_pack(d, where: str) -> dict:
@@ -107,6 +118,13 @@ def parse_pack(d, where: str) -> dict:
                 raise KeyError(f"{where}: {fname}.{cname}.cell needs {{n}}")
             if cname == "clear" and "reset" not in c:
                 raise KeyError(f"{where}: {fname}.clear.reset is required")
+            if "single" in c:
+                sg = c["single"]
+                if (not isinstance(sg, dict) or set(sg) - SINGLE_KEYS
+                        or not isinstance(sg.get("cell"), str)
+                        or "{" in sg["cell"]):
+                    raise KeyError(f"{where}: {fname}.{cname}.single takes "
+                                   "cell (a literal cell name), data, out")
     if d.get("default_family") not in fams:
         raise KeyError(f"{where}: multibit.default_family must name a family")
     if "energy" in d:
@@ -160,6 +178,15 @@ def resolve(pack: Optional[dict], cfg, base: Path, where: str
     for k in ("default_family", "cross_register"):
         if k in cfg:
             spec[k] = cfg[k]
+    if not cfg.get("single"):
+        # the pack's single-bit cells are opt-in (`single: true`): without
+        # it the leftover bits map to the liberty's plain flop
+        for fam in spec["families"].values():
+            for c in (fam or {}).values():      # a family or class may be null in a pack
+                if isinstance(c, dict):
+                    c.pop("single", None)
+    if cfg.get("tie") is not None:
+        apply_tie(spec, cfg["tie"], where)
     ov = list(cfg.get("overrides") or [])
     if cfg.get("overrides_file"):
         f = Path(cfg["overrides_file"])
@@ -177,6 +204,25 @@ def resolve(pack: Optional[dict], cfg, base: Path, where: str
         raise KeyError(f"{where}: multibit.default_family "
                        f"{spec['default_family']!r} is not a family")
     return spec
+
+
+def apply_tie(spec: dict, tie, where: str) -> None:
+    """`tie: {PIN: 0 | 1 | last_q}` in the flow config replaces the tie of PIN in every
+    class of every family that already ties PIN (a pin a class does not tie stays
+    untouched); `last_q` is the bank's own last output."""
+    if not isinstance(tie, dict) or not tie:
+        raise KeyError(f"{where}: multibit.tie must be a mapping PIN: 0|1|last_q")
+    for pin, val in tie.items():
+        if isinstance(val, bool) or val not in (0, 1, "last_q"):
+            raise KeyError(f"{where}: multibit.tie.{pin} must be 0, 1 or last_q")
+    for fam in spec["families"].values():
+        for c in (fam or {}).values():
+            t = c.get("tie")
+            if not isinstance(t, dict):
+                continue
+            for pin, val in tie.items():
+                if pin in t:
+                    t[pin] = val
 
 
 def activity_overrides(act: dict, base: Path, where: str,
@@ -267,6 +313,8 @@ def cell_names(spec: dict) -> list:
     for fam in spec["families"].values():
         for c in fam.values():
             out += [c["cell"].replace("{n}", str(n)) for n in c["widths"]]
+            if "single" in c:
+                out.append(c["single"]["cell"])
     return sorted(set(out))
 
 
