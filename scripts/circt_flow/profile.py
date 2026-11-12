@@ -371,10 +371,16 @@ def _pnr_section(d: dict, base: Path, path: Path) -> dict:
     every word has ${VAR} expanded), not both. A pack may also give defaults
     for the ORFS stage's clock-tree and margin controls (`cts_buffers`,
     `cts_cluster_size`, `cts_cluster_diameter`, `cts_args`, `hold_margin`,
-    `setup_margin`); a flow config's own `pnr:` value wins."""
+    `setup_margin`); a flow config's own `pnr:` value wins. A pack with its
+    own P&R command may declare `stage_restart: [<stage>, ...]`, the stages
+    the command can stop after and restart at (the closure ladder,
+    doc/ladder.md); `stage_inputs: [path, ...]` lists the files and directories
+    (relative to the pack) the command reads, so that the ladder's manifest
+    covers them."""
     p = dict(d.get("pnr") or {})
     ctl = {"cts_buffers", "cts_cluster_size", "cts_cluster_diameter",
-           "cts_args", "hold_margin", "setup_margin"}
+           "cts_args", "hold_margin", "setup_margin", "stage_restart",
+           "stage_inputs"}
     unknown = set(p) - {"orfs_platform_dir", "command"} - ctl
     if unknown:
         raise KeyError(f"{path}: pnr.{sorted(unknown)[0]} is not a pack "
@@ -383,6 +389,19 @@ def _pnr_section(d: dict, base: Path, path: Path) -> dict:
     if len([k for k in p if k not in ctl]) > 1:
         raise ValueError(f"{path}: pnr: give orfs_platform_dir or command, "
                          "not both")
+    sr = p.get("stage_restart")
+    if sr is not None and (not isinstance(sr, list) or len(sr) < 2
+                           or not all(isinstance(x, str) and x for x in sr)
+                           or len(set(sr)) != len(sr)):
+        raise ValueError(f"{path}: pnr.stage_restart must be a list of at "
+                         "least two distinct stage names")
+    si = p.get("stage_inputs")
+    if si is not None:
+        if not isinstance(si, list) or not all(isinstance(x, str) and x
+                                               for x in si):
+            raise ValueError(f"{path}: pnr.stage_inputs must be a list of "
+                             "files or directories (relative to the pack)")
+        p["stage_inputs"] = [str(expand(x, base)) for x in si]
     if "orfs_platform_dir" in p:
         p["orfs_platform_dir"] = expand(p["orfs_platform_dir"], base)
     if "command" in p:

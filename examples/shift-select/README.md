@@ -81,3 +81,69 @@ Clock gating is switched off in this example (`CIRCT_FLOW_NO_CLOCK_GATING=1`): a
 gated clock is outside what a Yosys miter proves, and the example is about the
 select. `CIRCT_FLOW_OUTLINE_AFTER_FLATTEN=1` makes the netlist one flat module, which
 a design whose top has no sub-modules needs for the fanout stage and OpenSTA.
+
+## Closure ladder
+
+`ladder.sh` runs `align_unit` through place and route with the flow's closure
+ladder (`doc/ladder.md`): the placement is made once, then one run of the clock
+tree, routing and the acceptance check per hold margin, all at the same time,
+and the lowest margin whose check passes is the result.
+
+```bash
+examples/shift-select/ladder.sh ~/runs/ladder       # ORFS needed
+```
+
+`designs/align_unit/flow_ladder.yaml` declares it:
+
+```yaml
+pnr:
+  ladder:
+    param: hold_margin
+    values: [0, 10, 20, 30]          # ps
+    accept:
+      metrics:
+        setup_ws: {min: 0}
+        hold_ws: {min: 20}           # illustrative threshold, ps
+        drc_errors: {max: 0}
+      corners:                       # the routed result timed at the fast corner
+        ff: {libs: [...], setup_ws: {min: 0}, hold_ws: {min: 0}}
+```
+
+**This is a demonstration with an illustrative threshold.** ORFS's hold repair
+may already leave a positive hold slack at margin 0, in which case the plain
+checks (slack at least 0) accept the first rung and there is nothing for a
+ladder to do. The acceptance asks for 20 ps of hold slack instead, a threshold
+picked only so that more than one rung is needed. The script runs the ladder
+twice from the same synthesized netlist, sequentially (rung after rung, from
+one placement) and in parallel, then a straight run (no ladder, no restart) at
+the accepted margin, and checks that the three results are the same.
+
+With the thresholds of `flow_ladder.yaml` the rungs end like this:
+
+| hold margin | verdict |
+| ---: | :--- |
+| 0 ps | rejected: hold slack below the 20 ps threshold |
+| 10 ps | rejected: hold slack below the 20 ps threshold |
+| 20 ps | **accepted** |
+| 30 ps | not run (sequential); in parallel either stopped as not needed or finished, and not used |
+
+The fast-corner check starts together with the plain checks and is stopped as
+soon as one of them rejects the rung.
+
+The accepted rung is 20 ps in both modes. The parallel ladder needs the
+wall-clock of the placement plus one rung where the sequential one needs the
+placement plus the rungs up to the accepted one, one after the other (the script
+prints both). In the parallel ladder a rung above the accepted one is stopped
+if it is still running when the outcome is fixed; if it has already finished,
+its result is not used. The accepted results of the sequential ladder,
+the parallel ladder and the straight run are identical: `4_cts.odb`,
+`5_route.odb`, `6_final.odb`, `6_final.v`, `6_final.def`, `6_final.sdc`,
+`6_final.spef` (but for its date line) and `pnr_metrics.json`, byte for byte.
+A restart from the placement is the same as a straight run; the rungs differ
+only in what happens after the placement. The CPU time of the parallel run is
+that of every rung that started, including those above the accepted one, in exchange for the
+shorter wall-clock.
+
+On a cluster, each job can go through a scheduler instead of a local process:
+`CIRCT_FLOW_LADDER_SUBMIT='sbatch --wait -c 16 --job-name={name} -o {log} --wrap {cmdq}'`
+(see "Where jobs run" in `doc/ladder.md`).

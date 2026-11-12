@@ -22,6 +22,7 @@ import sys
 
 from .config import FlowConfig
 from .design.directives import DirectiveError, DirectiveSet
+from .ladder import LadderFailed
 from .pipeline import run
 
 
@@ -248,6 +249,10 @@ def main(argv: list[str] | None = None) -> int:
             run_vt_swap=args.vt_swap,
         )
         run(cfg, pnr=args.pnr)
+    except LadderFailed as e:
+        # No rung accepted: the ladder's own exit code (circt_flow/ladder.py).
+        print(f"ERROR: {e}", file=sys.stderr)
+        return e.code
     except (FileNotFoundError, DirectiveError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1

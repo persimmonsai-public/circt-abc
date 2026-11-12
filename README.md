@@ -46,6 +46,7 @@ under `out/ibex/pnr/`, summarised in `out/ibex/pnr/pnr_metrics.json`.
 | `doc/passes.md` | the pass reference: what each pass does, its options and flow switches |
 | `examples/shift-select/` | a `case` over a shift amount, with `map-shift-select` off and on, on ASAP7 |
 | `doc/techpacks.md` | tech packs: format, lookup, P&R from a pack, the leak audit |
+| `doc/ladder.md` | the closure ladder: one placement, several variants of the later P&R stages in parallel, the lowest one that passes is the result |
 | `patches/` | patches to CIRCT, ABC and mockturtle (see `patches/README`) |
 | `scripts/verify/` | equivalence checks: register-mapper miter, top-level miter |
 | `Dockerfile` | the circt-abc image |
@@ -94,6 +95,42 @@ SUCCESS must be paired with a deliberately broken gate that FAILs.
 
 Early. ibex runs end to end on ASAP7; CVA6 manifests and an ASAP7 baseline
 against ORFS's own synthesis are next.
+
+## Changes in this release
+
+* The closure ladder (`doc/ladder.md`): one placement, several variants of a
+  clock-tree-or-later P&R option run side by side, the lowest that passes its
+  acceptance check is the result.
+* Behaviour change outside the ladder: the ORFS stage drives one-bit constants
+  from the tie cells in more places. It ties a one-bit literal that is an
+  element of a concatenation (`{1'h0, a}`), a positional port argument, a pin
+  connection, the right-hand side of a continuous assignment (also with a bit
+  select, several targets or a delay) or of a net declaration (`wire w = 1'b1;`),
+  in any base or spelling (`1'b0`, `1'sB1`, `1'd0`, `1 'h0_`). OpenROAD read such
+  a literal as a power net and the router refused it. A one-bit literal in an
+  expression (an operand, a ternary branch, a lone parenthesis, an event) is not
+  rewritten; the stage warns about it. Literals in comments, strings, attributes,
+  escaped identifiers, parameter overrides and `parameter` / `localparam` /
+  `defparam` declarations, and in function, task, specify and primitive bodies
+  and compiler directive lines, are not nets and are not rewritten or counted.
+  A literal on an instance pin inside a `generate` body is not rewritten
+  either, but it is counted and reported by the warning (the P&R tool may read
+  it as a supply). An operand of an operator (`a == 1'b0`) is an expression:
+  not rewritten, counted for the warning. For existing users: a netlist that has such literals gets
+  extra tie cells and nets (instance count, area, power and placement change),
+  and the cells are numbered `tie_const_<n>` in text order across the whole
+  netlist, where the earlier code tied all `assign x = 1'h0;` statements first
+  and then the pin literals: the numbers can shift even when no new kind of
+  literal is present. A name the netlist already uses is skipped, each module of
+  a multi-module netlist declares its own tie nets and cells, and a second pass
+  over a tied netlist changes nothing. The same netlist is what a tech pack's own
+  P&R command receives, so it gets the extra tie cells too. The ORFS stage's
+  command line now carries absolute paths for the netlist, run directory,
+  platform directory and wire-RC file.
+* `cts_args` values that start with `-` (`-no_insertion_delay`) now reach the
+  ORFS stage's parser, and so do negative margins (`hold_margin: -1e-05`): every
+  option value is passed as `--option=value`; as a separate word argparse read
+  them as options and the stage failed.
 
 ## License
 

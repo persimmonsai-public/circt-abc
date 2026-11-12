@@ -1,12 +1,11 @@
 """Pipeline stages for the CIRCT-native synthesis flow.
 
-Each function here is a direct Python port of one step of
-scripts/run_circt_native_synth.sh -- same tool, same flags, same
-file paths/naming. See that script's header comment for the full
-pipeline rationale (register-legalize, clock-gate-inference,
-narrow-dead-register-bits, register-mapper, structural-mapper,
-outline-residual-logic, hw-flatten-modules, merge-residual-modules,
-abc-bridge, and the final OpenSTA-compatibility post-processing).
+Each function here runs one step of the flow, in the order the pipeline lists
+them (register-legalize, clock-gate-inference, narrow-dead-register-bits,
+register-mapper, structural-mapper, outline-residual-logic,
+hw-flatten-modules, merge-residual-modules, abc-bridge, and the final
+OpenSTA-compatibility post-processing), with the tool, flags and file
+names that each function names.
 
 Every stage shells out via `subprocess.run(..., check=True)`: a failing
 tool invocation raises `subprocess.CalledProcessError` (command + return
@@ -22,7 +21,7 @@ import os
 import sys
 import subprocess
 from pathlib import Path
-from typing import Sequence
+from typing import Optional, Sequence
 
 from . import shiftselect
 from .config import FlowConfig
@@ -1072,9 +1071,48 @@ def orfs_pnr(cfg: FlowConfig) -> Path:
         raise FileNotFoundError(
             f"{cfg.openroad_netlist} was not produced (the sv2v step needs "
             "its docker image); ORFS reads that netlist, not the raw one")
+    if p.get("ladder"):
+        from . import ladder as ladder_mod
+        return ladder_mod.run_flow(cfg)
     if "command" in cfg.design.pack_pnr:
         return pack_pnr(cfg)
-    argv = [str(cfg.openroad_netlist), str(cfg.pnr_dir),
+    argv = orfs_argv(cfg, p, cfg.pnr_dir)
+    print(f"[circt_flow] ORFS P&R -> {cfg.pnr_dir}")
+    rc = pnr_mod.main(argv)
+    if rc != 0:
+        raise subprocess.CalledProcessError(rc, ["orfs_pnr", *argv])
+    return cfg.pnr_dir / "pnr_metrics.json"
+
+
+_VALUE_OPTIONS = {
+    "--top", "--platform", "--clock-port", "--clock-period", "--clock-latency",
+    "--utilization", "--place-density", "--set", "--tie-hi", "--tie-lo",
+    "--dont-use", "--cts-buffer", "--cts-cluster-size",
+    "--cts-cluster-diameter", "--hold-margin", "--setup-margin", "--sdc",
+    "--platform-dir", "--wire-rc"}
+
+
+def _equals_form(argv: list) -> list:
+    """Every option value as `--option=value`: argparse reads a separate value
+    that starts with `-` (a negative margin, -1e-05, a flag such as
+    -no_insertion_delay) as another option. The two positionals stay first."""
+    out, i = list(argv[:2]), 2
+    while i < len(argv):
+        a = argv[i]
+        if a in _VALUE_OPTIONS and i + 1 < len(argv):
+            out.append(f"{a}={argv[i + 1]}")
+            i += 2
+        else:
+            out.append(a)
+            i += 1
+    return out
+
+
+def orfs_argv(cfg: FlowConfig, p: dict, out: Path) -> list:
+    """The orfs_pnr command line for the flow config's `pnr:` section p
+    (the closure ladder passes a copy with one key changed), run directory
+    out."""
+    argv = [str(Path(cfg.openroad_netlist).resolve()), str(Path(out).resolve()),
             "--top", cfg.design.top_module,
             "--platform", str(p.get("platform", "asap7")),
             "--clock-port", str(p["clock_port"]),
@@ -1113,9 +1151,12 @@ def orfs_pnr(cfg: FlowConfig) -> Path:
         if pick(key) is not None:
             argv += [flag, str(pick(key))]
     for arg in pick("cts_args") or []:
-        argv += ["--cts-arg", str(arg)]
+        # `=` form: argparse reads a separate value that starts with `-` as
+        # an option (the usual value, -no_insertion_delay, does)
+        argv += [f"--cts-arg={arg}"]
     if "orfs_platform_dir" in cfg.design.pack_pnr:
-        argv += ["--platform-dir", str(cfg.design.pack_pnr["orfs_platform_dir"])]
+        argv += ["--platform-dir",
+                 str(Path(cfg.design.pack_pnr["orfs_platform_dir"]).resolve())]
     # The pack's wire RC at the setup corner replaces the platform's
     # setRC.tcl (wire_rc.py); an inline (public pack) entry is written out.
     rc = getattr(cfg.design, "wire_rc", None)
@@ -1124,31 +1165,20 @@ def orfs_pnr(cfg: FlowConfig) -> Path:
         from . import wire_rc as wire_rc_mod
         src = entry.path if entry.path is not None else \
             wire_rc_mod.write_openroad_tcl(
-                entry, cfg.pnr_dir.resolve() / "wire_rc_inline.tcl")
-        argv += ["--wire-rc", str(src)]
-    print(f"[circt_flow] ORFS P&R -> {cfg.pnr_dir}")
-    rc = pnr_mod.main(argv)
-    if rc != 0:
-        raise subprocess.CalledProcessError(rc, ["orfs_pnr", *argv])
-    return cfg.pnr_dir / "pnr_metrics.json"
+                entry, Path(out).resolve() / "wire_rc_inline.tcl")
+        argv += ["--wire-rc", str(Path(src).resolve())]
+    return _equals_form(argv)
 
 
-def pack_pnr(cfg: FlowConfig) -> Path:
-    """A tech pack's own P&R (`pnr.command`, doc/techpacks.md). The command
-    runs from the pack directory with
-
-        --netlist <pnr>/<top>.v --sdc <pnr>/constraint.sdc --top <top>
-        --out <pnr> --pack <pack dir>
-
-    appended. The netlist is the OpenSTA-compatible one with the profile's
-    tie cells on its constants; the SDC is the one the ORFS stage writes.
-    The command must write <out>/pnr_metrics.json with orfs_pnr.METRICS'
-    keys (any subset); the flow adds `status`."""
-    import json
-
+def pack_command(cfg: FlowConfig, out: Path) -> tuple:
+    """Write the netlist and SDC a tech pack's P&R command reads into out
+    and return (argv, env): the command with its arguments, and the
+    environment it runs in (the process environment plus the pack's wire
+    RC variables)."""
     from . import orfs_pnr as pnr_mod
 
-    p, out, top = cfg.design.pnr, cfg.pnr_dir.resolve(), cfg.design.top_module
+    p, top = cfg.design.pnr, cfg.design.top_module
+    out = Path(out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     netlist, sdc = out / f"{top}.v", out / "constraint.sdc"
     text = cfg.openroad_netlist.read_text()
@@ -1156,26 +1186,35 @@ def pack_pnr(cfg: FlowConfig) -> Path:
         hi, lo = (tuple(cfg.design.tie[k].split(":", 1)) for k in ("hi", "lo"))
         text, n = pnr_mod.tie_constants(text, hi, lo)
         print(f"[circt_flow] {n} constant(s) tied with {hi[0]}/{lo[0]}")
+        warn = pnr_mod.untied_constants_warning(text, cfg.design.tie)
+        if warn:
+            print(f"[circt_flow] {warn}")
     netlist.write_text(text)
     pnr_mod.write_sdc(sdc, top, str(p["clock_port"]),
                       float(p.get("clock_period", cfg.design.clock_period_ps)),
                       float(p.get("clock_latency", 0)))
-    metrics_path = out / "pnr_metrics.json"
-    metrics_path.unlink(missing_ok=True)
     cmd = [*cfg.design.pack_pnr["command"], "--netlist", str(netlist),
            "--sdc", str(sdc), "--top", top, "--out", str(out),
            "--pack", str(cfg.design.pack_root)]
-    log = out / "pnr.log"
-    print(f"[circt_flow] tech pack P&R: {cmd[0]} -> {log}")
     # The pack's wire RC: CIRCT_FLOW_WIRE_RC (setup corner) and
     # CIRCT_FLOW_WIRE_RC_<CORNER> (wire_rc.pnr_env).
     from . import wire_rc as wire_rc_mod
     env = {**os.environ, **wire_rc_mod.pnr_env(
         getattr(cfg.design, "wire_rc", None),
         getattr(cfg.design, "wire_rc_setup", None), out)}
-    with open(log, "w") as fh:
-        rc = subprocess.run(cmd, cwd=cfg.design.pack_root, stdout=fh,
-                            stderr=subprocess.STDOUT, env=env).returncode
+    return cmd, env
+
+
+def pack_finish(cfg: FlowConfig, out: Path, rc: int, cmd: list,
+                log: Optional[Path] = None) -> Path:
+    """After a pack command has run (also each rung of the closure ladder):
+    read its pnr_metrics.json, add `status`, rewrite it, and raise when the
+    command failed. Returns the file."""
+    import json
+
+    from . import orfs_pnr as pnr_mod
+
+    metrics_path = Path(out) / "pnr_metrics.json"
     metrics = (json.loads(metrics_path.read_text())
                if metrics_path.exists() else {})
     unknown = sorted(set(metrics) - set(pnr_mod.METRICS) - {"status"})
@@ -1189,3 +1228,25 @@ def pack_pnr(cfg: FlowConfig) -> Path:
     if metrics["status"] != "ok":
         raise subprocess.CalledProcessError(rc or 1, cmd)
     return metrics_path
+
+
+def pack_pnr(cfg: FlowConfig) -> Path:
+    """A tech pack's own P&R (`pnr.command`, doc/techpacks.md). The command
+    runs from the pack directory with
+
+        --netlist <pnr>/<top>.v --sdc <pnr>/constraint.sdc --top <top>
+        --out <pnr> --pack <pack dir>
+
+    appended. The netlist is the OpenSTA-compatible one with the profile's
+    tie cells on its constants; the SDC is the one the ORFS stage writes.
+    The command must write <out>/pnr_metrics.json with orfs_pnr.METRICS'
+    keys (any subset); the flow adds `status`."""
+    out = cfg.pnr_dir.resolve()
+    cmd, env = pack_command(cfg, out)
+    (out / "pnr_metrics.json").unlink(missing_ok=True)
+    log = out / "pnr.log"
+    print(f"[circt_flow] tech pack P&R: {cmd[0]} -> {log}")
+    with open(log, "w") as fh:
+        rc = subprocess.run(cmd, cwd=cfg.design.pack_root, stdout=fh,
+                            stderr=subprocess.STDOUT, env=env).returncode
+    return pack_finish(cfg, out, rc, cmd, log)

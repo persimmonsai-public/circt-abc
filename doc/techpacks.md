@@ -1086,13 +1086,24 @@ What runs depends on the pack's own `pnr:`:
   and every word has `${VAR}` expanded. The template's `pnr/run.py` is a
   stand-in that only counts cells.
 
+  A pack whose command can stop after a stage and restart from one declares
+  `stage_restart: [place, cts, route]` in its `pnr:` (stage names in flow
+  order); the flow's closure ladder (`pnr: {ladder: ...}`,
+  [`doc/ladder.md`](ladder.md)) then places once and runs the variants of a
+  later-stage option from that placement. Without it the ladder runs every
+  variant in full.
+
 The flow config's `pnr:` section also takes four options for the ORFS
 stage (they do not apply to a pack's own `command`):
 
 * `tie_hi` / `tie_lo` (`CELL:PIN`): the tie cells for constants 1 and 0,
-  replacing the pack's `tie`. Every constant the netlist drives with a
-  literal is tied with them before ORFS runs (OpenROAD reads a literal
-  net as a power net, which the router refuses). Use them when the
+  replacing the pack's `tie`. A one-bit literal in the netlist (in any base
+  or spelling) that is an `assign` or net-declaration right-hand side, a pin
+  connection, a positional argument or an element of a concatenation is tied
+  with them before ORFS runs (OpenROAD reads a literal net as a power net,
+  which the router refuses). A one-bit literal in an expression (an operand
+  of an operator, a ternary branch) or on an instance pin inside a `generate`
+  body is not rewritten; the stage reports it in a warning. Use them when the
   platform carries only another flavour's cells (`ASAP7_USE_VT`).
 * `vt_swap: false` passes `--no-vt-swap`: OpenROAD's `repair_timing` may
   not change a cell's threshold-voltage flavour, so the flavours the flow

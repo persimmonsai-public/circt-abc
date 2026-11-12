@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 from circt_flow import orfs_pnr as op, stages
 
+_REAL_MAIN = op.main      # the tests below replace op.main
+
 
 def cfg(tmp_path, pnr):
     net = tmp_path / "top_openroad.v"
@@ -14,6 +16,18 @@ def cfg(tmp_path, pnr):
         openroad_netlist=net, pnr_dir=tmp_path / "pnr",
         design=SimpleNamespace(pnr=pnr, pack_pnr={}, tie=None,
                                top_module="top", clock_period_ps=1500))
+
+
+def opt_values(argv, name):
+    """The values of an option, whichever way it is spelled (`--opt v` or
+    `--opt=v`)."""
+    out = []
+    for i, a in enumerate(argv):
+        if a == name:
+            out.append(argv[i + 1])
+        elif a.startswith(name + "="):
+            out.append(a[len(name) + 1:])
+    return out
 
 
 def argv_of(monkeypatch, c):
@@ -33,8 +47,7 @@ def test_stage_passes_vt_controls(tmp_path, monkeypatch):
         "clock_port": "clk", "vt_swap": False,
         "dont_use": ["*_SL", "*_L"]}))
     assert "--no-vt-swap" in argv
-    assert [argv[i + 1] for i, a in enumerate(argv) if a == "--dont-use"] \
-        == ["*_SL", "*_L"]
+    assert opt_values(argv, "--dont-use") == ["*_SL", "*_L"]
 
 
 def test_no_vt_swap_settings(tmp_path):
@@ -99,6 +112,50 @@ def test_stage_passes_cts_and_margin_controls(tmp_path, monkeypatch):
                        "hold_margin": 20})
     c.design.pack_pnr = {"cts_buffers": ["B1"], "hold_margin": 5}
     argv = argv_of(monkeypatch, c)
-    assert argv[argv.index("--cts-buffer") + 1] == "B1"      # from the pack
-    assert argv[argv.index("--hold-margin") + 1] == "20"     # flow.yaml wins
-    assert argv[argv.index("--cts-arg") + 1] == "-no_insertion_delay"
+    assert opt_values(argv, "--cts-buffer") == ["B1"]        # from the pack
+    assert opt_values(argv, "--hold-margin") == ["20"]       # flow.yaml wins
+    assert "--cts-arg=-no_insertion_delay" in argv
+    # argparse accepts that spelling (a separate "-no_..." value is read as an option)
+    ns = pnr_mod_parse(argv)
+    assert ns.cts_arg == ["-no_insertion_delay"]
+
+
+def pnr_mod_parse(argv):
+    """The ORFS stage's own parser on an argv the flow built."""
+    import argparse
+    seen = {}
+    real = argparse.ArgumentParser.parse_args
+
+    def spy(self, args=None, namespace=None):
+        ns = real(self, args, namespace)
+        seen["ns"] = ns
+        return ns
+    argparse.ArgumentParser.parse_args = spy
+    try:
+        _REAL_MAIN([*argv, "--plan"])
+    finally:
+        argparse.ArgumentParser.parse_args = real
+    return seen["ns"]
+
+
+def test_every_option_value_reaches_the_real_parser_even_when_it_starts_with_a_dash(tmp_path, monkeypatch):
+    """`--hold-margin -1e-05` made argparse fail like `--cts-arg -flag` did:
+    every value travels as --option=value."""
+    c = cfg(tmp_path, {"clock_port": "clk", "hold_margin": -1e-05,
+                       "setup_margin": -2e-05, "clock_latency": -1.5,
+                       "cts_cluster_diameter": -3, "cts_cluster_size": -4,
+                       "cts_args": ["-no_insertion_delay", "-x 5"],
+                       "cts_buffers": ["-B"], "dont_use": ["-D*"],
+                       "utilization": 40, "place_density": 0.5,
+                       "set": {"A": "-1"}, "tie_hi": "H:Z", "tie_lo": "L:Z"})
+    argv = argv_of(monkeypatch, c)
+    ns = pnr_mod_parse(argv)
+    assert ns.hold_margin == -1e-05 and ns.setup_margin == -2e-05
+    assert ns.clock_latency == -1.5 and ns.cts_cluster_diameter == -3
+    assert ns.cts_cluster_size == -4 and ns.cts_arg == ["-no_insertion_delay", "-x 5"]
+    assert ns.cts_buffer == ["-B"] and ns.dont_use == ["-D*"] and ns.set == ["A=-1"]
+    assert ns.tie_hi == "H:Z" and ns.tie_lo == "L:Z" and ns.top == "top"
+    # no separate "--option value" pair is left in the line
+    for a in argv[2:]:
+        assert not (a.startswith("--") and "=" not in a) or a in (
+            "--no-vt-swap",), a

@@ -1,0 +1,41 @@
+# align_unit through the flow and stock ORFS, with a hold-margin closure ladder
+# (doc/ladder.md): one placement, then one run of the clock tree, routing and
+# the checks per margin, the lowest margin that passes is the result.
+#
+# The rung values and the thresholds are illustrative, chosen so that more than
+# one rung is needed on this small design: the acceptance asks for a hold
+# slack of at least 20 ps (a threshold picked only to make the example need more
+# than one rung), on top of the plain setup and hold checks; see ladder.sh and
+# the README.
+design:
+  top_module: align_unit
+  clock_period_ps: 400
+  manifest: manifest.yaml
+pdk:
+  profile: ../../techpack.yaml
+modes:
+  func: func.sdc
+pnr:
+  platform: asap7
+  clock_port: clk_i
+  utilization: 40
+  set: {ASAP7_USE_VT: RVT, CORNER: TC}
+  ladder:
+    param: hold_margin
+    values: [0, 10, 20, 30]          # ps, the platform's time unit
+    mode: parallel
+    accept:
+      metrics:
+        setup_ws: {min: 0}
+        hold_ws: {min: 20}           # illustrative threshold, ps
+        drc_errors: {max: 0}
+      corners:                       # the routed result timed at the fast corner
+        ff:
+          libs:
+            - /OpenROAD-flow-scripts/flow/platforms/asap7/lib/NLDM/asap7sc7p5t_AO_RVT_FF_nldm_211120.lib.gz
+            - /OpenROAD-flow-scripts/flow/platforms/asap7/lib/NLDM/asap7sc7p5t_INVBUF_RVT_FF_nldm_220122.lib.gz
+            - /OpenROAD-flow-scripts/flow/platforms/asap7/lib/NLDM/asap7sc7p5t_OA_RVT_FF_nldm_211120.lib.gz
+            - /OpenROAD-flow-scripts/flow/platforms/asap7/lib/NLDM/asap7sc7p5t_SIMPLE_RVT_FF_nldm_211120.lib.gz
+            - /OpenROAD-flow-scripts/flow/platforms/asap7/lib/NLDM/asap7sc7p5t_SEQ_RVT_FF_nldm_220123.lib
+          setup_ws: {min: 0}
+          hold_ws: {min: 0}

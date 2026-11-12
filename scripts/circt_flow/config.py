@@ -84,6 +84,9 @@ class DesignConfig:
     # command), for the P&R stage.
     pack_root: Optional[Path] = None
     pack_pnr: dict = field(default_factory=dict)
+    # The flow.yaml's directory (relative words of a ladder's accept.command
+    # are relative to it).
+    config_dir: Optional[Path] = None
     # A pack that does not say `public: true`: its outputs are its data.
     pack_private: bool = False
     # pdk.rail: the profile's supply rail this run maps on (a schema-2
@@ -303,6 +306,10 @@ class DesignConfig:
             period = min(c.period_ps for m in modes
                          for c in m.clocks.values() if c.ports)
         abc_target = cfg["design"].get("abc_delay_target_ps")
+        if (cfg.get("pnr") or {}).get("ladder") is not None:
+            from . import ladder as ladder_mod
+            ladder_mod.parse_ladder(cfg["pnr"]["ladder"],
+                                    f"{config_path}: pnr.ladder")
         clock_port = (cfg.get("pnr") or {}).get("clock_port")
         if clock_port is None and manifest is not None and manifest.is_file():
             clock_port = ((yaml.safe_load(manifest.read_text()) or {})
@@ -319,6 +326,7 @@ class DesignConfig:
             flow_defaults=flow_defaults,
             pack_root=pack_root,
             pack_pnr=pack_pnr,
+            config_dir=here,
             pack_private=pack_private,
             rail=rail,
             voltage=voltage,
