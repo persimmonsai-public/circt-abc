@@ -952,7 +952,11 @@ def MapPrefixAdders : Pass<"map-prefix-adders", "mlir::ModuleOp"> {
     Option<"minWidth", "min-width", "unsigned", "16", "minimum add width">,
     Option<"maxWidth", "max-width", "unsigned", "0", "maximum add width (0 = none)">,
     Option<"archOpt", "arch", "std::string", "SKLANSKEY",
-           "SKLANSKEY | KOGGE-STONE | HAN-CARLSON | BRENT-KUNG | attr">
+           "SKLANSKEY | KOGGE-STONE | HAN-CARLSON | BRENT-KUNG | attr">,
+    Option<"boundary", "boundary", "unsigned", "0",
+           "1: NAND2/NOR2 g/t boundary on both operands, ABC maps the rest">,
+    Option<"isolate", "isolate-inputs", "bool", "false",
+           "first level = one NAND2 + one NOR2 per operand bit only">
   ];
   let dependentDialects = ["comb::CombDialect", "hw::HWDialect"];
 }
@@ -1423,6 +1427,23 @@ def ClockGateInference : Pass<"clock-gate-inference", "mlir::ModuleOp"> {
     Option<"minGroupWidth", "min-group-width", "unsigned", "2",
            "Skip groups whose total bit width is below this">,
   ];
+  let dependentDialects = ["hw::HWDialect", "comb::CombDialect", "seq::SeqDialect"];
+}
+
+def DataGateEnables : Pass<"data-gate-enables", "mlir::ModuleOp"> {
+  let summary = "Opt-in: make named register slices hold when loading would "
+                "not change them, so clock-gate-inference gates them by data";
+  let description = [{
+    `--data-gate-enables=slices=[module/]reg@lo-hi[@zero|xor],...` (off when
+    `slices` is empty). For a seq.firreg whose next is a plain hold mux, each
+    named slice loads `(load_s == 0 && q_s == 0) ? q_s : load_s` (mode zero) or
+    `(load_s == q_s) ? q_s : load_s` (mode xor): the identity on the register,
+    but the slice's enable becomes `en && !hold`, so bit-level clock-gate-
+    inference puts it on its own ICG whose enable follows the data. Run it
+    before clock-gate-inference. Combinationally equivalent; the gated result
+    is sequentially equivalent through the ICG (clock-gating equivalence).
+  }];
+  let constructor = "circt_abc::createDataGateEnablesPass()";
   let dependentDialects = ["hw::HWDialect", "comb::CombDialect", "seq::SeqDialect"];
 }
 

@@ -1,6 +1,7 @@
 """Post-layout optimisation (circt_flow/postlayout.py): config parsing, the
 LEF / liberty readers, the ECO script, and a real OpenSTA run on a chain
 whose clock passes two buffers (skipped without docker or $OPENSTA)."""
+import json
 import os
 import re
 import shutil
@@ -494,3 +495,145 @@ def test_cli_on_a_pack_without_a_flavour_ladder(tmp_path, rc_pack, monkeypatch, 
     assert (tmp_path / "o" / "measure.json").exists()
     assert postlayout.main(args) == 2
     assert "has no vt_flavours" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("via", ["set", "options", "section"])
+def test_new_post_layout_options_reach_the_swap_script(tmp_path, rc_pack, monkeypatch, via):
+    """post.recover.block, set by --set (a settings argument), a flow.yaml
+    options: entry or the section key, reaches
+    the post-layout swap's OpenSTA script along the stage's own path
+    (stages: parse_post_layout of cfg.design.pnr.post_layout -> run_flow ->
+    optimise -> vtswap.swap)."""
+    import yaml
+    from test_wire_rc import _flow
+    from circt_flow.config import FlowConfig
+    from circt_flow import profile as profile_mod
+    rc_pack.write_text(rc_pack.read_text() +
+                       "\nvt_flavours: {tokens: [R, L, S], re: '_([RLS])$'}\n")
+    new = {"post.recover.block": "blk_a|blk_b@12"}
+    sec = {"margin_ps": 30}
+    if via == "section":
+        sec.update(recover_block="blk_a|blk_b@12")
+    f = _flow(tmp_path, rc_pack, yaml.safe_dump({"options": new}) if via == "options" else "")
+    f.write_text(f.read_text().replace("pnr: {clock_port: clk}", "pnr:\n  clock_port: clk\n"
+                                       "  post_layout: " + json.dumps(sec)))
+    cfg = FlowConfig.load(f, tmp_path / "o", **({"settings": new} if via == "set" else {}))
+    assert cfg.settings["post.recover.block"] == "blk_a|blk_b@12"
+    post = parse_post_layout((cfg.design.pnr or {}).get("post_layout", False), "pnr")
+    pnr = tmp_path / "pnr"
+    pnr.mkdir()
+    from circt_flow import pnr_recipe
+    names = pnr_recipe.result_files(None)
+    (pnr / names["netlist"]).write_text("module top (a);\n  input a;\nendmodule\n")
+    (pnr / names["spef"]).write_text("*SPEF\n")
+    (pnr / "constraint.sdc").write_text("create_clock -period 1 [get_ports clk]\n")
+    monkeypatch.setattr(postlayout, "spef_for_timing", lambda s, o, r, *a: s)
+    monkeypatch.setattr(postlayout, "measure", lambda *a, **k: {"wns": 0.0})
+    monkeypatch.setattr(postlayout, "liberty_table", lambda libs: {})
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def fake_run(cmd, **kw):
+        seen["tcl"] = Path(cmd[-1]).read_text()
+        raise Stop
+    monkeypatch.setenv("OPENSTA", "/bin/false")
+    monkeypatch.setattr(vtswap.subprocess, "run", fake_run)
+    with pytest.raises(Stop):
+        postlayout.run_flow(cfg, post, pnr)
+    t = seen["tcl"]
+    assert "set opt_blk_re \"blk_a|blk_b\"" in t
+    assert "set opt_blk_floor 0.012" in t
+
+
+def test_new_post_layout_flags_on_the_command_line(tmp_path, rc_pack, monkeypatch):
+    """--recover-block reaches the swap script of the stand-alone tool too."""
+    rc_pack.write_text(rc_pack.read_text() +
+                       "\nvt_flavours: {tokens: [R, L, S], re: '_([RLS])$'}\n")
+    monkeypatch.setattr(postlayout, "spef_for_timing", lambda s, o, r, *a: s)
+    monkeypatch.setattr(postlayout, "measure", lambda *a, **k: {"wns": 0.0})
+    (tmp_path / "n.v").write_text("module top (a);\n  input a;\nendmodule\n")
+    (tmp_path / "c.sdc").write_text("create_clock -period 1 [get_ports clk]\n")
+    args = ["--pack", str(rc_pack), "--netlist", str(tmp_path / "n.v"),
+            "--spef", str(tmp_path / "n.spef"), "--sdc", str(tmp_path / "c.sdc"),
+            "--top", "top", "--out", str(tmp_path / "o")]
+    with pytest.raises(SystemExit):
+        postlayout.main(args + ["--margin-ps", "30", "--recover-block", "a@1", "--no-recover"])
+    with pytest.raises(VtSwapError, match="one block tail recovery"):
+        postlayout.main(args + ["--margin-ps", "30", "--recover-block", "a@1", "--recover-opts", "blk=b@6"])
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def fake_run(cmd, **kw):
+        seen["tcl"] = Path(cmd[-1]).read_text()
+        raise Stop
+    monkeypatch.setenv("OPENSTA", "/bin/false")
+    monkeypatch.setattr(vtswap.subprocess, "run", fake_run)
+    with pytest.raises(Stop):
+        postlayout.main(args + ["--margin-ps", "30", "--recover-block", "blk_a@12"])
+    assert 'set opt_blk_re "blk_a"' in seen["tcl"]
+    with pytest.raises(Stop):
+        postlayout.main(args)
+    assert "opt_blk_re" not in seen["tcl"]
+
+
+# ---------------------------------------------------------------- block tail recovery: Tcl regex, matched cells, floor
+
+def test_block_regex_is_checked_as_tcl(monkeypatch):
+    """check_block: with tclsh the expression is compiled by Tcl (\\y accepted, (?P<..>) and lookbehind refused;
+    \\b, the Tcl backspace, refused on both paths); without tclsh the known-different constructs are
+    refused and the path says so."""
+    if shutil.which("tclsh"):
+        assert postlayout.tcl_regex_check(r"u_a\yb")[0] == "tclsh"
+        assert postlayout.check_block(r"u_a\yb@2", "w") == (r"u_a\yb", 2.0)
+        assert postlayout.check_block(r"u_a\\b@2", "w")[0] == r"u_a\\b"      # an escaped backslash, then b
+        for bad in (r"u_blk\b|u_tail", r"x[\b]"):
+            with pytest.raises(VtSwapError, match="backspace in a Tcl regular expression"):
+                postlayout.check_block(bad + "@2", "w")
+        for bad in ("(?P<n>x)", "(?<=a)b", "(x"):
+            with pytest.raises(VtSwapError, match="not a Tcl regular expression \\(tclsh check\\)"):
+                postlayout.check_block(bad + "@2", "w")
+    monkeypatch.setattr(shutil, "which", lambda *a, **k: None)
+    for bad in (r"a\bb", "(?P<n>x)", "(?<=a)b", "(?<!a)b", "(x"):
+        with pytest.raises(VtSwapError, match="not a Tcl regular expression \\(conservative check\\)"):
+            postlayout.check_block(bad + "@2", "w")
+    assert postlayout.check_block(r"u_(a|b)/.*@2", "w")[0] == "u_(a|b)/.*"
+
+
+def test_block_floor_above_the_margin_is_refused():
+    postlayout.check_block_floor("a@30", 30.0, "w")
+    postlayout.check_block_floor("", 0.0, "w")
+    with pytest.raises(VtSwapError, match="above the global margin_ps"):
+        postlayout.check_block_floor("a@30.5", 30.0, "w")
+    with pytest.raises(VtSwapError, match="above the global margin_ps"):
+        parse_post_layout({"recover_block": "a@5"}, "f")
+    assert parse_post_layout({"recover_block": "a@5", "margin_ps": 5}, "f").recover_block == "a@5"
+
+
+@pytest.mark.parametrize("matched,ok", [(0, False), (3, True)])
+def test_block_recovery_that_matches_nothing_is_refused(tmp_path, monkeypatch, matched, ok):
+    """The block pass records how many cells its expression matched (stat blk_matched); zero is an error."""
+    nl = tmp_path / "n.v"
+    nl.write_text("module m (a);\n  input a;\nendmodule\n")
+    out = tmp_path / "o.v"
+
+    def fake_run(cmd, **kw):
+        out.write_text(nl.read_text())
+        out.with_suffix(".vt_swap.txt").write_text(
+            f"start 0 0\nfixed 0 0\nend 0 0\nstat blk_matched {matched}\nstat blk_floor_clamped 0\n")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    monkeypatch.setenv("OPENSTA", "/bin/false")
+    monkeypatch.setattr(vtswap.subprocess, "run", fake_run)
+    lay = vtswap.LayoutSpec(recover_block_re="blk_a", recover_block_floor=0.012)
+    args = (nl, "m", out, [], ["R", "L"], r"_([RL])$", "create_clock -period 1 [get_ports clk]\n")
+    if ok:
+        r = vtswap.swap(*args, layout=lay)
+        assert r["eco_stat"]["blk_matched"] == 3
+    else:
+        with pytest.raises(VtSwapError, match="no cell instance name matches 'blk_a'"):
+            vtswap.swap(*args, layout=lay)
+    # the pass counts the matches in its Tcl
+    assert "set eco_stat(blk_matched) $blk_n" in lay.blk_tcl(True)

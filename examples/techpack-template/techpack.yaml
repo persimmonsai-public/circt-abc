@@ -47,3 +47,7 @@ flow:
 # a stand-in that only reports the netlist's cell count and area.
 pnr:
   command: ["./pnr/run.py"]
+  # The command's own options (doc/pack-options.md): `options --pack` lists
+  # them, a session sets them (s.set_pack_option) and the flow hands them to
+  # the command as `--settings FILE`.
+  settings_registry: pnr/options.json

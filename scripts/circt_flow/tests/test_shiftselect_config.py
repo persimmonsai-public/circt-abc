@@ -79,3 +79,19 @@ def test_dont_care_is_off_unless_the_design_sets_it():
 def test_direct_decode_dependents_are_checked(bad):
     with pytest.raises(KeyError):
         ss.parse(bad, "x")
+
+
+def test_l2_gate_and_dup_options_config_equals_environment():
+    spec = ss.parse({"wide": 2, "recipes": "3,2@3,2,2", "direct_decode": True,
+                     "l2_range_gate": 3, "select_dup_fanout": 5}, "x")
+    want = DIRECT + " l2-range-gate=3 select-dup-fanout=5"
+    assert ss.pass_options(spec, True, {}) == want
+    env = {"CIRCT_FLOW_SHIFT_SELECT_EARLY": "1", "CIRCT_FLOW_SHIFT_SELECT_WIDE": "2",
+           "CIRCT_FLOW_SHIFT_SELECT_RECIPES": "3,2@3,2,2", "CIRCT_FLOW_SHIFT_SELECT_DIRECT": "1",
+           "CIRCT_FLOW_SHIFT_SELECT_L2GATE": "3", "CIRCT_FLOW_SHIFT_SELECT_DUPFO": "5"}
+    assert ss.pass_options(None, True, env) == want
+
+
+def test_l2_gate_needs_direct_decode():
+    with pytest.raises(KeyError):
+        ss.parse({"l2_range_gate": 3}, "x")

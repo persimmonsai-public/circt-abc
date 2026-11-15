@@ -22,12 +22,22 @@ circt-abc-opt "--map-prefix-adders=enable-prefix-adders=true liberty=cells.lib m
 Options of one pass are separated by spaces inside one quoted argument; list
 values that contain spaces use a comma instead (a liberty list, for example).
 
+In the flow every switch is an option of the registry
+(`scripts/circt_flow/options.py`, reference `doc/options.md`), set with
+`--set NAME=VALUE`, a flow config's `options:` mapping, a tech pack's
+`flow.options:` or the Python session (`doc/scripting.md`). The
+`CIRCT_FLOW_*` / `CIRCT_VT_*` names in the tables below are the legacy
+variables those options replace: accepted with a warning naming the option
+(`python3 -m circt_flow options --legacy` prints the table), refused under
+`--strict` and from release 13 on.
+
 ## Registers
 
 | pass | default | what it does |
 | :--- | :--- | :--- |
 | `register-legalize` | on | Folds synchronous and non-constant resets into the D input, so the mapper sees two shapes: no reset, or asynchronous reset to a constant. |
 | `register-mapper` | on | Bit-blasts every `seq.firreg` to flip-flop cells found in the liberty by function: a plain flop, an asynchronous-clear flop, an asynchronous-preset flop (a library with fewer shapes is mapped through inverted-D and tied-pin fallbacks). With `multibit=` it packs bits into multibit cells first. |
+| `data-gate-enables` | off, **experimental** | Rewrites named slices of a register whose next state is a plain hold mux so that the slice holds when loading would not change it (`zero`: load and slice both zero; `xor`: load equal to the slice), so bit-level `clock-gate-inference` puts the slice on a gate of its own whose enable follows the data. The rewrite is the identity on the register (proven combinationally by a SAT miter in `test_mapper_capabilities.py`); the gated result is a clock-gating equivalence, for which there is no sequential proof here. The compare ends at the gate's enable pin: check its setup slack. Option `slices=[module/]reg@lo-hi[@zero\|xor],...`; flow: `syn.clock_gating.data_gate` (legacy `CIRCT_FLOW_DATA_GATE`) or the scoped command `gate_register` (`doc/scripting.md`, section 7). Runs before `clock-gate-inference`. |
 | `clock-gate-inference` | on | Turns groups of registers that share a hold enable into one gated clock with the hold mux removed, using the cheapest integrated clock-gating cell of the liberty (found by its `clock_gating_integrated_cell` attribute). Its options are listed below. |
 | `narrow-dead-register-bits`, `propagate-register-constants`, `narrow-constant-register-bits`, `remove-dead-registers`, `dedup-registers`, `narrow-array-registers`, `lower-aggregate-registers`, `lower-firmem`, `lower-clock-inverters` | see `Passes.td` | Register clean-ups that run before mapping: dead and constant bits, aggregate and array registers, small memories as registers. `dedup-registers` is off. |
 
@@ -82,9 +92,9 @@ section.
 | `set-adder-arch` | `BRENT-KUNG` in the flow | `CIRCT_FLOW_ADDER_ARCH` | Stamps the adder architecture on `comb.add` / `comb.icmp` so the lowering uses it. |
 | `lower-carry-in-adds` | off | `CIRCT_FLOW_ADD_CARRY_IN=1` | `a + b + zext(c)` (a variable single-bit third operand) is lowered by CombToSynth as two serial adds; `{a,1} + {b,c}` is the same sum in one carry-propagate add, so one architecture choice applies to it. Option `min-width`. |
 | `lower-barrel-shifts` | off | `CIRCT_FLOW_BARREL_SHIFT=1` | A variable shift becomes log2(width) stages of 2:1 muxes sharing their intermediate values. The default lowering builds a mux tree over every shifted copy (about width squared mux bits for the same depth). Options `min-width`, `min-amount-bits`. |
-| `map-adder-chains` | off | `CIRCT_FLOW_ADDER_CELLS=<min-width>` | ABC cannot emit a two-output cell, so a library's full/half-adder cells are invisible to it. This builds a wide add as a ripple chain of those cells (found by function, output-inverted shapes included). Options `min-width`, `max-width` (short chains only), `increments` (also `x + 1` as a half-adder chain). Flow: `CIRCT_FLOW_ADDER_CELLS_MAX`, `CIRCT_FLOW_ADDER_CELLS_INCREMENTS=0`. |
-| `map-prefix-adders` | off | `CIRCT_FLOW_PREFIX_ADDERS=<min-width>` | ABC's area recovery (`scorr`, `dc2`, `&deepsyn`) folds a parallel-prefix adder back into a near-ripple chain. This builds `a + b`, `a + b + 1` and `a + b + zext(c)` as a prefix network of library cells (Sklansky, Kogge-Stone, Han-Carlson or Brent-Kung, or each op's own `synth.test.arch` attribute) before ABC, and cells are boundaries ABC cannot undo. Options `min-width`, `max-width`, `arch`. Flow: `CIRCT_FLOW_PREFIX_ARCH`, `CIRCT_FLOW_PREFIX_MAX_WIDTH`. |
-| `map-compressor-cells` | off | `CIRCT_FLOW_MUL_CELLS=1` | Lowers multiplier compressor trees to full/half-adder cell instances (Dadda), with an optional Brent-Kung final adder built from cells (`prefix-final-adder`, `CIRCT_FLOW_MUL_CELLS_PREFIX=1`). Options `min-width`, `merge-adds` (fold `add(x, zext(add(rows of one compress)))` into one compress when the inner sum provably cannot wrap), `flatten-adds` (flatten nested adds, zero-extensions, shifts and compress row pairs into one compress plus one add; width-safe), `flatten-gated`, `flatten-max-terms`. Flow: `CIRCT_FLOW_MUL_CELLS_MIN_WIDTH`, `_MERGE`, `_FLATTEN`, `_FLATTEN_GATED=0`. |
+| `map-adder-chains` | off | `CIRCT_FLOW_ADDER_CELLS=<min-width>` | ABC cannot emit a two-output cell, so a library's full/half-adder cells are invisible to it. This builds a wide add as a ripple chain of those cells (found by function, output-inverted shapes included). Options `min-width`, `max-width` (short chains only), `increments` (also `x + 1` as a half-adder chain). Flow: `CIRCT_FLOW_ADDER_CELLS_MAX`, `CIRCT_FLOW_ADDER_CELLS_INCREMENTS=0`. A second instance for another width range: `syn.adders.cells2.*` (legacy `CIRCT_FLOW_ADDCH2_MIN`, `_MAX`), or the scoped command `map_adders(form="cells")` on a width window. |
+| `map-prefix-adders` | off | `CIRCT_FLOW_PREFIX_ADDERS=<min-width>` | ABC's area recovery (`scorr`, `dc2`, `&deepsyn`) folds a parallel-prefix adder back into a near-ripple chain. This builds `a + b`, `a + b + 1` and `a + b + zext(c)` as a prefix network of library cells (Sklansky, Kogge-Stone, Han-Carlson or Brent-Kung, or each op's own `synth.test.arch` attribute) before ABC, and cells are boundaries ABC cannot undo. Options `min-width`, `max-width`, `arch`, `boundary=1` (each operand bit gets a NAND2 + NOR2 generate/propagate boundary and ABC maps everything behind it), `isolate-inputs=true` (the first prefix level is one NAND2 and one NOR2 per operand bit only). Flow: `CIRCT_FLOW_PREFIX_ARCH`, `CIRCT_FLOW_PREFIX_MAX_WIDTH`. A second instance for another width range: `syn.adders.prefix2.*` (legacy `CIRCT_FLOW_PREFIX2_ADDERS=<min-width>`, `_MAX_WIDTH`, `_ARCH`, `_ISOLATE=1`, `_BOUNDARY=1`), or the scoped command `map_adders(form="prefix")` on a width window. Each instance prints one report line, also when it built nothing. |
+| `map-compressor-cells` | off | `CIRCT_FLOW_MUL_CELLS=1` | Lowers multiplier compressor trees to full/half-adder cell instances (Dadda), with an optional Brent-Kung final adder built from cells (`prefix-final-adder`, `CIRCT_FLOW_MUL_CELLS_PREFIX=1`). Options `min-width`, `merge-adds` (fold `add(x, zext(add(rows of one compress)))` into one compress when the inner sum provably cannot wrap), `flatten-adds` (flatten nested adds, zero-extensions, shifts and compress row pairs into one compress plus one add; width-safe), `flatten-gated`, `flatten-max-terms`. Flow: `CIRCT_FLOW_MUL_CELLS_MIN_WIDTH`, `_MERGE`, `_FLATTEN`, `_FLATTEN_GATED=0`. Tree shape and cell use (all off by default): `tree=dadda\|wallace\|array` (`_TREE`), `gate-compressors` (every full/half adder as plain logic for ABC; `_GATES=1`), `cell-stages=N` (adder cells in the first N reduction stages only; `_CELL_STAGES`), `nand-pp` (two-input AND partial products enter the tree complemented; the self-dual adder cells carry the complement, undone once at the result rows; `_NANDPP=1`), `map-final-adder` (each tree's final two-row add is tagged so `map-adder-chains` leaves it to ABC; `_MAPFINAL=1`) with `map-final-min-width=N` (only final adds of at least N bits; `_MAPFINAL_MINW`). |
 | `limit-fanout` | off | pack `flow.fanout_buffer`, `CIRCT_FLOW_MAX_FANOUT` | Caps net fanout on the mapped netlist with a balanced buffer tree and touches only nets above the cap. A driver annotated `circt_abc.max_fanout = N` has its limit raised to N when N exceeds the global option; `map-shift-select` sets it on its digit selects when asked. |
 
 ### `map-shift-select`
@@ -123,6 +133,11 @@ included):
 | `recipes` | Mixed-radix recipes, `;`-separated, each `R1,R2,..@c1,c2,..,cK`: the digit radices of the amount (the last digit takes the rest) and the cell width of each level. The recipe of least cell area is built. |
 | `direct-decode` | Build each digit select as a small cell network of the raw bits of the amount (found by evaluating the amount expression over its leaf bits), instead of an OR of per-arm comparators that the logic mapper turns into an adder plus a comparator network; the digit-boundary offset is chosen by area. |
 | `select-max-fanout=N` | With `direct-decode`: annotate the driver of each digit select with `circt_abc.max_fanout = N`, so the fanout stage leaves a net of at most N loads unbuffered. |
+| `select-dup-fanout=N` | With `direct-decode`: a select gate drives at most N loads; a further copy of the gate (same inputs) takes the rest instead of a buffer. |
+| `l2-range-gate=N` | With `direct-decode` and a recipe of two or more digits: a node of the level below the last one is selected by "digit AND coarse range of the last digit", so it is quiet unless its range is the active one. The last digits that consume a node are split into ranges of N consecutive values, one node copy per range (N = 1: one copy per consumer and no last-level select; a large N keeps every node shared and gates only the nodes not used for every digit). |
+| `l2-range-aligned` | With `l2-range-gate`: a node's range is the whole aligned block of N last-digit values that holds a consumer (range selects shared by the nodes of a block). |
+| `l2-range-compose` | With `l2-range-gate`: a gated select is the AND of the digit select and the range select, both shared. |
+| `window-form` | With `direct-decode` and a recipe of two or more digits: the window form (below) instead of the recipe network. Its options: `window-count`, `window-copy-cost`, `window-clip`, `window-per-node`, `window-cuts`, `window-general`, `window-types`, `window-types-max`, `window-direct`. |
 
 **`default-dont-care` is the one option that is not exact.** With
 `direct-decode`, the amounts that match no constant arm (the default arm) are
@@ -162,6 +177,70 @@ older position, after `decode-mux-chains`) and
 win over the config. A library without four-term cells (ASAP7 has the
 three-term AO222/AOI222 but no four-term cell) runs with `wide: 1`.
 `examples/shift-select/` runs the pass on ASAP7 and reports what it changes.
+The flow keys of the options above are `select_dup_fanout`, `l2_range_gate`,
+`l2_range_aligned`, `l2_range_compose`, `form: window` and `window_count`,
+`window_copy_cost`, `window_clip`, `window_per_node`, `window_cuts`,
+`window_general`, `window_types`, `window_types_max`, `window_direct`
+(registry `syn.shifters.*`; a window option without `form: window`, or the
+window form without `direct_decode` and the pass, is refused, not ignored).
+
+**The window form** (`window-form`, exact) is a different generator, not a
+gate on the recipe network. The levels below the one before the last stay
+shared and ungated. Each node of the level before the last is built once per
+window, a contiguous range of shift amounts holding an amount that uses the
+node, and selected by "digit AND window" (built from the raw amount bits), so
+the copy is 0 outside its window. The last level only tells the last digits
+inside a copy's window apart: a pass-through when the window lies inside one
+last digit, otherwise the cheapest of the exact digit select, an active-low
+range select or the digit inside the window. The windows partition the amount
+range, with cuts at multiples of the stride of the gated level, chosen by an
+exhaustive search with the cost "per copy: `window-copy-cost` (percent of one
+always-active load, default 150) + activity x (loads + 1); 0.5 per last-level
+term; 1 per distinct window select". `window-count` fixes the number of
+windows, `window-clip` restricts a copy's select to the amounts of its window
+that use the node, `window-per-node` lets a node take one copy over the whole
+range when its own cost prefers it, and `window-cuts` replaces the search by
+explicit cuts. `window-general` generalises the windows: a window type is a
+range of blocks (the amounts that share every digit from the gated level up)
+with its own digit phase, so types may overlap; every (output, block) need is
+covered by one node copy (greedy cover); `window-types` gives the types
+explicitly (`phase:first-last;...`), otherwise a search combines up to
+`window-types-max` of them, and `window-direct=C` lets an output take a
+lower-level node directly under a block select at cost C per need. Selects
+are built in the polarity of the data they gate, so the levels alternate
+AOI / OAI. Malformed `window-cuts` / `window-types` are refused when the
+options are read; cuts or types outside the shifter's range, or a
+`window-count` no cut set reaches, fail the pass instead of leaving the
+shifter to the logic mapper. Tests: `mapper/test/map-shift-select/shift_window.mlir`
+and the SAT miters `test_shift_select_window_form_*` on generated shifters.
+
+## Leakage-swap keys (`vt_swap:` and `pnr.post_layout:`)
+
+`flop_cap: <ladder token>` (both sections, and `--flop-cap` of
+`python3 -m circt_flow.postlayout`): the swap never moves a flop (a cell whose
+name contains `DFF`, the swap script's test; a library whose flop names lack
+`DFF` gets no cap) above that token of the pack's `vt_flavours` ladder; empty
+is no cap. Options `syn.vt_swap.flop_cap` and `post.flop_cap` (legacy
+`CIRCT_VT_FLOP_CAP`).
+
+`pnr.post_layout.recover_opts` / `--recover-opts` (opt-in): a comma list of
+`seq_first` (flops lead the recovery order), `seq_pair` (flops lead the pair
+candidates), `comp=N` (up to N compensating cells per pair, their leakage
+together below nine tenths of the saving) and `pass=N` (repeat the pair
+recovery N times); validated when the config is read.
+
+Block tail recovery (`pnr.post_layout.recover_block: "<regex>@<ps>"`, option
+`post.recover.block`, `--recover-block`; the `recover_opts` token
+`blk=<regex>@<ps>` is the same setting, both at once are refused): after the
+pair recovery, the cells whose instance name matches the regular expression
+(no comma, no white space) go down with their own slack floor of `<ps>`
+picoseconds; the other cells keep the global margin. Off by default (the swap
+script is then unchanged). The block floor may not exceed the global
+`margin_ps` (refused: the recovery would clamp it); an expression that
+matches no cell instance is an error, and the number of matched cells is
+recorded (`eco_stat.blk_matched`). The expression is checked as a Tcl regular
+expression (`tclsh` when available; otherwise `\b`, `(?P<` and lookbehind
+are refused).
 
 ## Structural mapping, ABC and cleanup
 

@@ -75,6 +75,8 @@ REPO_PROFILES = Path(__file__).resolve().parent.parent.parent / "profiles"
 FLOW_DEFAULTS = {"sv2v_docker_image": str, "abc_script_file": Path,
                  "abc_read_lib_args": str, "enable_classical_resub": bool,
                  "partitions": int, "env": dict,
+                 # Option defaults by dotted name (options.py).
+                 "options": dict,
                  # The mapping target's calibration (modes.parse_target
                  # keys): how optimistic ABC's delay model is on this
                  # library is a property of the library, so a pack (or one
@@ -387,11 +389,16 @@ def _pnr_section(d: dict, base: Path, path: Path) -> dict:
     `stage_restart: [<stage>, ...]`, the stages the command can stop after
     and restart at (the closure ladder, doc/ladder.md); `stage_inputs:
     [path, ...]` lists the files and directories (relative to the pack) the
-    command reads, so that the ladder's manifest covers them."""
+    command reads, so that the ladder's manifest covers them; and
+    `settings_registry: <file>` names the JSON registry of the command's own
+    options (pack_options.py, doc/pack-options.md), and `settings_defaults:
+    {name: value}` gives this profile's values of them (handed to the
+    command as a settings file on every run)."""
     p = dict(d.get("pnr") or {})
     ctl = {"cts_buffers", "cts_cluster_size", "cts_cluster_diameter",
            "cts_args", "hold_margin", "setup_margin", "stage_restart",
-           "stage_inputs", "results", "placement_logs", *_PNR_DEFAULTS}
+           "stage_inputs", "results", "placement_logs", "settings_registry", "settings_defaults",
+           *_PNR_DEFAULTS}
     unknown = set(p) - {"orfs_platform_dir", "command"} - ctl
     if unknown:
         raise KeyError(f"{path}: pnr.{sorted(unknown)[0]} is not a pack "
@@ -403,6 +410,25 @@ def _pnr_section(d: dict, base: Path, path: Path) -> dict:
         pnr_recipe.placement_logs(p)
     except pnr_recipe.RecipeError as e:
         raise ValueError(f"{path}: {e}")
+    if "settings_registry" in p and not isinstance(p["settings_registry"], str):
+        raise ValueError(f"{path}: pnr.settings_registry must be a file name "
+                         "(relative to the pack)")
+    if "settings_defaults" in p:
+        if "settings_registry" not in p or not isinstance(p["settings_defaults"], dict):
+            raise ValueError(f"{path}: pnr.settings_defaults is a mapping of the pack's own "
+                             "options (it needs pnr.settings_registry)")
+        from . import pack_options
+        try:     # every name and value checked against the registry now
+            for k, v in p["settings_defaults"].items():
+                o = pack_options.load(base, p).get(k)
+                if o is None:
+                    raise pack_options.OptionError(f"unknown pack option {k!r}")
+                pack_options.parse_value(o, v, "pnr.settings_defaults")
+        except pack_options.OptionError as e:
+            raise ValueError(f"{path}: pnr.settings_defaults: {e}") from None
+    if "settings_registry" in p and "command" not in p:
+        raise ValueError(f"{path}: pnr.settings_registry declares the options of a pack's "
+                         "own P&R command; it needs pnr.command")
     without = [k for k in ("results", "placement_logs") if k in p]
     if without and "command" not in p:
         raise ValueError(f"{path}: pnr.{without[0]} describes what a pack's own "

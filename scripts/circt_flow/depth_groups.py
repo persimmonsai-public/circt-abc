@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 from collections import defaultdict, deque
+from pathlib import Path
 
 HDR = re.compile(r"^\s*hw\.module\s+(?:private\s+)?@([\w$.]+)\((.*)$")
 NH = re.compile(r'\s*\{[^{}<>]*=[^{}<>]*\}')
@@ -152,10 +153,20 @@ def main():
     ap.add_argument("k", type=int)
     ap.add_argument("out")
     ap.add_argument("--opt", required=True)
-    ap.add_argument("--adder-arch", default=os.environ.get("CIRCT_FLOW_ADDER_ARCH", "BRENT-KUNG"))
+    ap.add_argument("--adder-arch", default=None,
+                    help="option syn.adders.arch (default BRENT-KUNG; the legacy "
+                    "variable CIRCT_FLOW_ADDER_ARCH applies, with a warning, "
+                    "when this is not given)")
     ap.add_argument("--report")
     ap.add_argument("--floor", type=int, default=16)
     a = ap.parse_args()
+    if a.adder_arch is None:
+        try:
+            from circt_flow import options
+        except ImportError:          # run as a plain script from this dir
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+            from circt_flow import options
+        a.adder_arch = options.cli_default("syn.adders.arch")
 
     work = tempfile.mkdtemp(prefix="depth_groups.", dir=os.path.dirname(os.path.abspath(a.out)))
     res = os.path.join(work, "residuals.mlir")

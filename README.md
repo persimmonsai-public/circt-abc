@@ -48,6 +48,10 @@ under `out/ibex/pnr/`, summarised in `out/ibex/pnr/pnr_metrics.json`.
 | `doc/techpacks.md` | tech packs: format, lookup, P&R from a pack, the leak audit |
 | `doc/ladder.md` | the closure ladder: one placement, several variants of the later P&R stages in parallel, the lowest one that passes is the result |
 | `doc/postlayout.md` | post-layout flavour recovery on a placed netlist and its parasitics |
+| `doc/options.md` | every option of the flow: name, type, default, what it binds to, the legacy variable it replaces (generated) |
+| `doc/pack-options.md` | a tech pack's own P&R options: the registry file, `options --pack`, the session's `set_pack_option` |
+| `doc/scripting.md` | the Python session API: recipes as scripts, stages one at a time, object queries, scoped commands, the editable pass pipeline |
+| `examples/scripting/` | Python recipes on the `examples/mvt-mini` design `core_lv` |
 | `patches/` | patches to CIRCT, ABC and mockturtle (see `patches/README`) |
 | `scripts/verify/` | equivalence checks: register-mapper miter, top-level miter |
 | `Dockerfile` | the circt-abc image |
@@ -99,80 +103,80 @@ against ORFS's own synthesis are next.
 
 ## Changes in this release
 
-* Post-layout flavour recovery (`doc/postlayout.md`, `pnr.post_layout`):
-  on a placed netlist and its SPEF (written by a tech pack's own P&R
-  command, or given to `python3 -m circt_flow.postlayout` from any P&R
-  result; the built-in ORFS stage refuses the key), OpenSTA moves
-  cells along the pack's flavour ladder to close setup and back down to give
-  leakage back, with the clock network frozen and only footprint-equal swaps,
-  so the placement stays (`eco.tcl` applies the swaps to the database).
-  Options: sensitivity fix, leakage-ordered recovery, a ladder cap with a
-  closing pass, pair recovery, hold tolerance, false paths to and from
-  ports, a second parasitic view. The result's `final` timing is what a
-  closure ladder judges. The synthesis-time `vt_swap:` takes the same leakage controls.
-* P&R recipe options (`doc/techpacks.md`, `circt_flow/pnr_recipe.py`):
-  minimum input delay and a given SDC (also on the ORFS stage), gated-clock
-  net skipping, clock-gate sizing by measured arrival (optionally with a
-  separate tolerance for gates that clock registers in the fan-in of an
-  output port), root-buffer flattening, a
-  don't-use list for the post-clock-tree repair, dual-corner hold repair,
-  and a placement check that reads the logs for a failed legalization (also
-  on the ORFS stage). The clock-tree and hold-corner options act only
-  through a tech pack's own P&R command, which receives them as environment
-  variables and sources the Tcl procedures in
-  `circt_flow/pnr_tcl/cts_recipe.tcl`; the ORFS stage refuses them.
-* Checks around a pack's P&R command: the pin-node capacitance OpenROAD's
-  global-route SPEF writer leaves out is restored (`circt_flow/spef_pincap.py`,
-  `pnr_tcl/spef_export.tcl`), an SDF with too few net-delay entries, or
-  with nearly all of them zero, is reported (`circt_flow/sdf_tools.py`), and escaped names a SPEF reader may skip are
-  reported (`circt_flow/netlist_names.py`).
-* Closure ladder (`doc/ladder.md`, "Steps a flow adds"): code that runs the
-  ladder can give it hooks: `finish_rung` after each rung's P&R result
-  (raising `ladder.RungRejected` rejects the rung), `check_shared_placement`
-  once on the shared placement before any rung, and `earlier_stage`, which
-  refuses a laddered key that acts before the restart stage. The hooks are
-  for code that runs the ladder from Python; the built-in stages use none of
-  the three.
-* Behaviour change: fan-out buffering now sees the member pins of a liberty
-  `bundle` (a multibit register's `Q0..Qn`, `D0..Dn`) by default, so on a
-  design with multibit banks the nets the banks drive are buffered like
-  those of single-bit flops. `fanout_buffer: {bundle_pins: false}` restores
-  the earlier behaviour; a liberty without bundle groups is unaffected.
-* `multibit: {single: true}` (opt-in): the bits no bank takes become
-  instances of a single-bit cell the pack declares for that class
-  (`single: {cell, data, out}`), with the class's clock, reset and tie
-  pins, instead of the liberty's plain flop.
-* `multibit: {tie: {<pin>: 0|1|last_q}}` (opt-in): for a pin the pack's
-  classes tie, gives the tie value in every class that ties that pin,
-  instead of the pack's value.
-* Behaviour change for packs with their own P&R command: after a
-  successful command the flow rewrites in place a `*.spef` under the P&R
-  directory when the export helper `spef_export_global_route` wrote it (a
-  log there holds the helper's lines for the file's path, with the size and
-  CRC-32 the file still has), its `*CAP` lines sum to
-  less than its `*D_NET` totals (the pin-node capacitance OpenROAD's
-  global-route estimate leaves out), it has `*CAP` entries and no coupling
-  capacitors, and it parses completely; the original is kept as
-  `<file>.spef.orig`. Every other SPEF is left as written and reported in
-  one line. On by default; `pnr: {spef_restore_pincap: false}` turns it
-  off. A file the check cannot read or parse is reported and never fails
-  the stage.
-* A pack command's environment now always carries `CTS_RECIPE_TCL`,
-  `SPEF_EXPORT_TCL` and `SPEF_RESTORE_PINCAP`, and `hold_margin`,
-  `setup_margin` and `cts_args` set `HOLD_MARGIN`, `SETUP_MARGIN` and
-  `CTS_EXTRA_ARGS` for it; these replace variables of the same name in the
-  calling shell.
-* Fan-out buffering with `bundle_pins` (above) also counts the member
-  input pins of bundled cells as loads.
-* Closure-ladder placements and rung records made by the previous release
-  are made again once after the upgrade.
-* New warnings: escaped netlist names that a SPEF reader may skip (before a
-  pack command), and an SDF with too few net-delay entries or with nearly
-  all of them zero (after it).
-* `pnr.hold_margin`, `pnr.setup_margin` and `vt_swap.margin_ps` must be
-  finite numbers: an infinite or NaN value, passed on before, is now
-  refused when the configuration is read (a quoted number is accepted as
-  before). The new time keys are checked the same way.
+* Option registry (`scripts/circt_flow/options.py`, reference
+  `doc/options.md`): every switch of the flow is a named, typed option
+  (`syn.*`, `pnr.*`, `cts.*`, `hold.*`, `post.*`, `run.*`) with its default,
+  range or choices and what it binds to. It is set with `--set NAME=VALUE`,
+  a flow config's `options:` mapping, a tech pack's `flow.options:`, or
+  replayed from an earlier run with `--settings <settings.json>`. Every run
+  writes `settings.json`: the value and source of every option, the tool
+  commits, the hashes of the recipe files and the commands as executed.
+  `python3 -m circt_flow options [PATTERN]` lists the options,
+  `--legacy` the variable-to-option table, `--diff A B` what differs
+  between two runs' records.
+* Deprecation: the `CIRCT_FLOW_*` / `CIRCT_VT_*` environment variables are
+  accepted, with one warning each naming the option that replaces it, in
+  this release and the next; from release 13 on they are refused. `--strict`
+  refuses them now, and refuses any unknown name with those prefixes.
+* Behaviour changes of the legacy variables: a flag variable must be `1` or
+  `0` (any other value is an error; earlier releases read it as off, or as on for a
+  default-on flag); a number has no blank and no leading zero. A tech pack's
+  `flow.env` default now ranks below the flow config and the environment
+  (it was copied into the process environment, above the flow config's
+  `shift_select:` keys, and inherited by child processes).
+* Python session API (`doc/scripting.md`, `examples/scripting/`):
+  `python3 -m circt_flow run RECIPE.py FLOW.yaml OUT` runs a recipe written
+  as a Python script and `python3 -m circt_flow shell FLOW.yaml OUT` opens
+  a Python shell with the session loaded. Options are typed attributes
+  (`s.db.syn.fanout.max = 12`, validated at assignment); the flow is seven
+  stages that run one at a time or together, each returning a result with
+  its outputs, metrics, settings and commands; single passes run with
+  `s.run_pass`; a run directory resumes with `Session.resume`, which refuses
+  inputs that changed since (recipe files, legacy variables, the circt-abc
+  commit) unless told to continue. `s.run()` is
+  the command line's code path and writes the same netlists.
+* Object queries and scoped commands: registers, register bit ranges,
+  adders, multipliers, shifters, clock gates and mapped cells are queried
+  from the flow's own stage files (`s.flops`, `s.adders`, `s.icgs`, ...),
+  and `s.gate_register` / `s.map_adders` apply a command to a selection
+  (option `syn.scoped`). Each target is checked against the design before
+  the structural stage and against the passes' reports after it; a target
+  that does not apply is refused, and `settings.json` records each one.
+* A tech pack's own P&R options (`doc/pack-options.md`): a pack with its
+  own P&R command may declare the command's options in a JSON registry
+  (`pnr.settings_registry` of its techpack.yaml). `python3 -m circt_flow
+  options --pack <pack>` lists them, a session sets them
+  (`s.set_pack_option`, validated against the registry) and the flow hands
+  them to the command as `--settings FILE`, also through the closure
+  ladder; a pack profile can preset them (`pnr.settings_defaults`), and
+  `s.pack_options` / `s.write_pack_settings()` show what is handed over,
+  presets included, with `s.pack_option_sources` saying where each value
+  comes from. Drift rules check the registry against the flow's
+  own options. `examples/techpack-template` has a registry and a command
+  that reads it.
+* Editable pass pipeline and hooks: `s.pipeline` lists the passes each
+  stage will run (obtained without running a tool), edits insert, remove,
+  replace or move a pass, and hooks call Python before or after a stage or
+  a pass (the stage's command is split at that pass). Edits are recorded
+  and replayed; a run with hooks is marked as not reproducible from its
+  record alone. Without edits and hooks the commands are unchanged.
+* New mapper options, all off by default (`doc/passes.md`):
+  `data-gate-enables` (experimental: named register slices hold when
+  loading would not change them, so bit-level clock gating gives them a
+  gate whose enable follows the data); `map-prefix-adders` `boundary` and
+  `isolate-inputs`, and a second instance of `map-prefix-adders` and of
+  `map-adder-chains` for another width range; `map-compressor-cells`
+  `tree=wallace|array`, `gate-compressors`, `cell-stages`, `nand-pp`,
+  `map-final-adder`, `map-final-min-width`; `map-shift-select`
+  `l2-range-gate`, `l2-range-aligned`, `l2-range-compose`,
+  `select-dup-fanout` and the window form (`window-form` and its
+  `window-*` options). The new shifter options are exact.
+* Leakage swap: `flop_cap` (in `vt_swap:` and `pnr.post_layout:`) keeps
+  flops at or below a token of the pack's flavour ladder;
+  `pnr.post_layout.recover_opts` (`seq_first`, `seq_pair`, `comp=N`,
+  `pass=N`) refines the leakage recovery, and `recover_block:
+  "<regex>@<ps>"` adds a recovery pass for the cells of one block with a
+  slack floor of its own (at most `margin_ps`).
 
 ## License
 

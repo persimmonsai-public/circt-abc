@@ -15,7 +15,9 @@ python3 -m circt_flow ../examples/techpack-template/designs/ibex/flow.yaml ~/run
 | `lib/template.lib` | The invented liberty: 21 cells, simple NLDM tables, no foundry data |
 | `lib/make_lib.py` | Writes `template.lib` |
 | `designs/ibex/flow.yaml` | ibex_top (circt-abc's `designs/ibex/manifest.yaml`) on this library |
-| `pnr/run.py` | The P&R command interface, as a stand-in that only counts cells |
+| `pnr/run.py` | The P&R command interface, as a stand-in that only counts cells; reads `--settings` |
+| `pnr/options.json` | The command's option registry (`pnr.settings_registry`, doc/pack-options.md) |
+| `pnr/notes/` | The recipe directory of the registry (`report.note` reads a file from it) |
 
 To make it yours: copy the directory outside circt-abc and into a private
 repository; set `name:`; point `liberties:` at your library (`${VAR}` for

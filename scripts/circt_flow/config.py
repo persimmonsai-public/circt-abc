@@ -84,6 +84,11 @@ class DesignConfig:
     # command), for the P&R stage.
     pack_root: Optional[Path] = None
     pack_pnr: dict = field(default_factory=dict)
+    # Values of the pack's own P&R options (its registry) that a session
+    # hands over (Session.set_pack_option, shared options set through s.db);
+    # stages.pack_command writes them over the profile's
+    # pnr.settings_defaults (pack_options.handover).
+    pack_settings: dict = field(default_factory=dict)
     # The flow.yaml's directory (relative words of a ladder's accept.command
     # are relative to it).
     config_dir: Optional[Path] = None
@@ -144,10 +149,6 @@ class DesignConfig:
     # flow.clock_gating under the flow config's `clock_gating:`; None when
     # off.
     clock_gating: Optional[str] = None
-    # The flow config's `shift_select:` (shiftselect.parse): options of the
-    # map-shift-select pass; None when absent (the environment variables
-    # CIRCT_FLOW_SHIFT_SELECT* still apply).
-    shift_select: Optional[dict] = None
     # The flow config's own fanout_buffer: (raw), applied over each rail's
     # pack-level spec by a power flow (fanout.rail_specs).
     fanout_override: object = None
@@ -187,9 +188,16 @@ class DesignConfig:
         return ",".join(self.synth_lib_tt)
 
     @classmethod
-    def from_yaml(cls, config_path: Path) -> "DesignConfig":
-        with open(config_path) as f:
-            cfg = yaml.safe_load(f)
+    def from_yaml(cls, config_path: Path, raw: Optional[dict] = None
+                  ) -> "DesignConfig":
+        """`raw`: the flow.yaml's content already read (and overlaid with the
+        settings an argument or the environment gave, options.overlay_yaml);
+        None reads config_path."""
+        if raw is None:
+            with open(config_path) as f:
+                cfg = yaml.safe_load(f)
+        else:
+            cfg = raw
         here = Path(config_path).resolve().parent
         rel = lambda p: (here / p).resolve() if p else None
         from . import profile as profile_mod, provenance
@@ -245,12 +253,14 @@ class DesignConfig:
             vt_swap_spec = vtswap_mod.parse_vt_swap(cfg["vt_swap"],
                                                     config_path)
             if prof is not None and vt_swap_spec.enabled and (
-                    vt_swap_spec.ladder_cap or vt_swap_spec.ladder_escalate):
+                    vt_swap_spec.ladder_cap or vt_swap_spec.ladder_escalate
+                    or vt_swap_spec.flop_cap):
                 fl = prof.flavours_at(rail)
                 if fl:
                     vtswap_mod.check_ladder_tokens(
                         vt_swap_spec.ladder_cap, vt_swap_spec.ladder_escalate,
-                        fl["tokens"], f"{config_path}: vt_swap")
+                        fl["tokens"], f"{config_path}: vt_swap",
+                        vt_swap_spec.flop_cap)
         # The flow config's pnr margins are checked here too (a pack's are
         # checked when the pack is read); the P&R stage checks them again.
         if isinstance(cfg.get("pnr"), dict):
@@ -273,7 +283,7 @@ class DesignConfig:
                         "with vt_flavours:")
                 vtswap_mod.check_ladder_tokens(
                     pl.ladder_cap, pl.ladder_escalate, fl["tokens"],
-                    f"{config_path}: pnr.post_layout")
+                    f"{config_path}: pnr.post_layout", pl.flop_cap)
         from . import fanout as fanout_mod
         fanout_spec = fanout_mod.parse_spec(
             flow_defaults.get("fanout_buffer"), cfg.get("fanout_buffer"),
@@ -303,7 +313,6 @@ class DesignConfig:
                     f"{wire_spec.rc_corner!r} is not a wire_rc corner; "
                     "wire_rc corners: " + ", ".join(wire_rc.entries))
         from . import clockgating as clockgating_mod
-        from . import shiftselect as shiftselect_mod
         clock_gating = clockgating_mod.resolve(
             flow_defaults.get("clock_gating"), cfg.get("clock_gating"),
             str(config_path))
@@ -377,8 +386,7 @@ class DesignConfig:
             wire_rc=wire_rc,
             wire_rc_setup=prof.setup_corner if prof is not None else None,
             clock_gating=clock_gating,
-            shift_select=shiftselect_mod.parse(cfg.get("shift_select"),
-                                               str(config_path)),
+
             fanout_override=cfg.get("fanout_buffer"),
             power_options=power_options,
         )
@@ -391,15 +399,16 @@ class DesignConfig:
         return obj
 
 
-def _slow_cell_names(design, pack, env) -> List[str]:
-    """Cells the slow-cell filter (pack flow.slow_cell_filter, or
-    CIRCT_FLOW_SLOW_CELL_RATIO=<ratio>) takes out of ABC's library; []
-    when it is off (the default)."""
+def _slow_cell_names(design, pack, settings) -> List[str]:
+    """Cells the slow-cell filter (pack flow.slow_cell_filter, or the option
+    syn.library.slow_cell_ratio) takes out of ABC's library; [] when it is
+    off (the default)."""
     from . import slowcells
     spec = slowcells.parse_spec(pack.get("slow_cell_filter"), "pack flow")
-    if env.get("CIRCT_FLOW_SLOW_CELL_RATIO"):
+    ratio = settings.get("syn.library.slow_cell_ratio")
+    if ratio is not None:
         spec = dict(spec or {"slew_ps": 30.0, "load_ff": 2.5},
-                    ratio=float(env["CIRCT_FLOW_SLOW_CELL_RATIO"]))
+                    ratio=float(ratio))
     if not spec or design.profile is None:
         return []
     from . import pipeline, profile as profile_mod
@@ -422,6 +431,86 @@ def _read_lib_args(base: Optional[str], dont_use) -> Optional[str]:
                         for i in range(len(have) - 1))]
     out = " ".join([base] + extra).strip()
     return out or None
+
+
+def _default_settings():
+    from . import options
+    return options.resolve(env={})
+
+
+# The flow.yaml's top-level keys (DesignConfig.from_yaml and the stages);
+# any other is an error. TOLERATED_KEYS are read by nothing and only warned
+# about (they occur in existing pack flow configs).
+TOP_KEYS = {"design", "pdk", "pnr", "power", "sta", "vt_swap", "modes",
+            "mapping_target", "multibit", "clock_gating", "fanout_buffer",
+            "wire_model", "shift_select", "options"}
+TOLERATED_KEYS = {"abc"}
+
+
+def check_top_keys(raw: dict, where) -> None:
+    import difflib
+    for k in raw:
+        if k in TOP_KEYS:
+            continue
+        if k in TOLERATED_KEYS:
+            print(f"[circt_flow] WARNING: {where}: top-level key {k!r} is "
+                  "read by nothing in this flow (ignored)")
+            continue
+        near = difflib.get_close_matches(str(k), sorted(TOP_KEYS), 3, 0.6)
+        raise KeyError(f"{where}: unknown top-level key {k!r}"
+                       + (f" (did you mean {', '.join(near)}?)" if near else
+                          f"; allowed: {', '.join(sorted(TOP_KEYS))}"))
+
+
+def resolve_settings(raw: dict, pack: dict, argument=None, env=None,
+                     strict: bool = False, where: str = "flow.yaml",
+                     pack_where: str = "tech pack"):
+    """The options of a run: `argument` ({name: value}), the legacy
+    variables of `env`, the flow.yaml `raw` (its `options:` mapping and its
+    sections), the pack's `flow:` defaults `pack`."""
+    from . import options
+    recipe = options.from_yaml_sections(raw, str(where))
+    mapped = options.from_mapping(raw.get("options"), f"{where}: options")
+    for n in mapped:
+        if not options.registry()[n].settable:
+            raise options.not_settable(options.registry()[n], f"{where}: options")
+    both = sorted(set(recipe) & set(mapped))
+    if both:
+        o = options.registry()[both[0]]
+        keys = [".".join((*b.section, b.key)) for b in o.binds
+                if isinstance(b, options.YamlKey)]
+        raise options.OptionError(
+            f"{where}: {both[0]} is set twice, by options: and by the section "
+            f"key {keys[0] if keys else '?'}; keep one"
+            + (f" (also: {', '.join(both[1:])})" if len(both) > 1 else ""))
+    recipe.update(mapped)
+    techpack = {}
+    for k, v in (pack or {}).items():
+        if k not in ("env", "options"):
+            techpack[f"flow.pack.{k}"] = v
+    for k, v in ((pack or {}).get("slow_cell_filter") or {}).items():
+        techpack[f"syn.library.slow_cell_filter.{k}"] = v
+    pe = (pack or {}).get("env") or {}
+    if pe and strict:
+        raise options.OptionError(
+            f"--strict: {pack_where}: flow.env sets legacy variable(s) "
+            f"{', '.join(sorted(pe))}; use flow.options: with "
+            + ", ".join(sorted({n for v in pe for n in options.legacy_map().get(v, (v,))})))
+    for var in pe:
+        if var not in options.legacy_map():
+            raise options.OptionError(
+                f"{pack_where}: flow.env: {var} is not a legacy option variable"
+                f"{options.suggest_legacy(var)}")
+    techpack.update(options.legacy_to_settings(pe))
+    techpack.update(options.from_mapping((pack or {}).get("options"),
+                                         f"{pack_where}: flow.options"))
+    s = options.resolve(argument=argument, recipe=recipe,
+                        techpack=techpack, env=env, strict=strict,
+                        where={"argument": "argument (--set / settings)",
+                               "recipe": str(where),
+                               "techpack": f"{pack_where}: flow"})
+    s.from_options = dict(mapped)
+    return s
 
 
 @dataclass(frozen=True)
@@ -483,6 +572,11 @@ class FlowConfig:
     run_vt_swap: bool = False
 
     root: Path = field(default_factory=lambda: ROOT)
+    # The resolved options (options.py): every stage reads its options here,
+    # never from the environment. A FlowConfig built without load() gets the
+    # built-in defaults.
+    settings: object = field(default_factory=lambda: _default_settings(),
+                             compare=False, repr=False)
     # The explicit (command-line) arguments load() was given, so the power
     # flow can load each domain's sub-run with the same overrides.
     load_overrides: dict = field(default_factory=dict, compare=False,
@@ -528,6 +622,8 @@ class FlowConfig:
         run_sta: bool = False,
         run_vt_swap: bool = False,
         root: Path = ROOT,
+        settings: Optional[Mapping] = None,
+        strict: bool = False,
     ) -> "FlowConfig":
         """Build a FlowConfig for `config_path`/`out_dir`.
 
@@ -551,14 +647,29 @@ class FlowConfig:
             abc_use_mapped_if_present=abc_use_mapped_if_present,
             abc_keep_buffers=abc_keep_buffers,
             skip_unmappable=skip_unmappable, run_sta=run_sta,
-            run_vt_swap=run_vt_swap).items()
+            run_vt_swap=run_vt_swap, settings=settings, strict=strict).items()
             if v is not None and v is not False}
         env = os.environ if env is None else env
         config_path = Path(config_path)
         out_dir = Path(out_dir)
 
-        design = DesignConfig.from_yaml(config_path)
+        with open(config_path) as f:
+            raw = yaml.safe_load(f) or {}
+        check_top_keys(raw, config_path)
+        design = DesignConfig.from_yaml(config_path, raw)
         pack = design.flow_defaults
+        from . import options as options_mod
+        resolved = resolve_settings(raw, pack, settings, env, strict,
+                                    str(config_path),
+                                    f"tech pack {design.profile}")
+        over = options_mod.overlay_yaml(raw, resolved)
+        if "shift_select" in over:
+            from . import shiftselect as shiftselect_mod
+            shiftselect_mod.parse(over["shift_select"], str(config_path))
+        if over != raw:
+            # an argument or the environment set a key of a flow.yaml
+            # section: the section's own parser reads (and checks) it
+            design = DesignConfig.from_yaml(config_path, over)
 
         resolved_circt_abc_opt = Path(
             circt_abc_opt
@@ -620,7 +731,7 @@ class FlowConfig:
             abc_read_lib_args=_read_lib_args(
                 abc_read_lib_args if abc_read_lib_args is not None
                 else pack.get("abc_read_lib_args"),
-                list(design.dont_use) + _slow_cell_names(design, pack, env)),
+                list(design.dont_use) + _slow_cell_names(design, pack, resolved)),
             abc_save_aig_dir=Path(abc_save_aig_dir) if abc_save_aig_dir else None,
             abc_use_datapath=bool(abc_use_datapath),
             abc_save_mapped_dir=Path(abc_save_mapped_dir) if abc_save_mapped_dir else None,
@@ -631,6 +742,7 @@ class FlowConfig:
             run_sta=bool(run_sta),
             run_vt_swap=bool(run_vt_swap),
             root=root,
+            settings=resolved,
             load_overrides=overrides,
         )
 

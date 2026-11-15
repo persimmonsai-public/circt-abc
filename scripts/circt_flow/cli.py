@@ -197,6 +197,29 @@ def _build_parser() -> argparse.ArgumentParser:
         "defaults; the pack's vt_flavours:). See circt_flow/vtswap.py.",
     )
     p.add_argument(
+        "--set",
+        dest="set_options",
+        action="append",
+        default=None,
+        metavar="NAME=VALUE",
+        help="Set an option (options.py; `python3 -m circt_flow options` "
+        "lists them). Repeatable; wins over the flow.yaml, the tech pack and "
+        "the legacy CIRCT_FLOW_* variables.",
+    )
+    p.add_argument(
+        "--settings",
+        default=None,
+        metavar="SETTINGS_JSON",
+        help="Replay the options of an earlier run's settings.json (every "
+        "option not at its built-in default there; --set wins over it).",
+    )
+    p.add_argument(
+        "--strict",
+        action="store_true",
+        help="Refuse legacy CIRCT_FLOW_* / CIRCT_VT_* variables and any "
+        "unknown such name in the environment.",
+    )
+    p.add_argument(
         "--pnr",
         action="store_true",
         help="After synthesis, place and route the OpenSTA-compatible "
@@ -220,10 +243,24 @@ def _build_directives(args: argparse.Namespace) -> DirectiveSet:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "options":
+        from . import options
+        return options.main(argv[1:])
+    if argv and argv[0] in ("run", "shell"):
+        # the Python entry points (script.py, doc/scripting.md)
+        from . import script
+        return (script.run_main if argv[0] == "run" else script.shell_main)(argv[1:])
     args = _build_parser().parse_args(argv)
 
     try:
         directives = _build_directives(args)
+        from . import options, provenance_settings
+        given = {}
+        if args.settings:
+            given.update(provenance_settings.explicit(
+                provenance_settings.read(args.settings)))
+        given.update(options.parse_assignments(args.set_options or []))
         cfg = FlowConfig.load(
             args.config,
             args.out_dir,
@@ -247,13 +284,15 @@ def main(argv: list[str] | None = None) -> int:
             skip_unmappable=args.skip_unmappable,
             run_sta=args.sta,
             run_vt_swap=args.vt_swap,
+            settings=given or None,
+            strict=args.strict,
         )
         run(cfg, pnr=args.pnr)
     except LadderFailed as e:
         # No rung accepted: the ladder's own exit code (circt_flow/ladder.py).
         print(f"ERROR: {e}", file=sys.stderr)
         return e.code
-    except (FileNotFoundError, DirectiveError) as e:
+    except (FileNotFoundError, DirectiveError, ValueError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
     except Exception as e:  # subprocess.CalledProcessError etc.

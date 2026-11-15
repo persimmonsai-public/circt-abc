@@ -526,6 +526,18 @@ def _sub_run(parent, flow_yaml: Path, out: Path):
     ov = {k: v for k, v in parent.load_overrides.items()
           if k not in ("partition_workdir", "directives", "run_sta",
                        "run_vt_swap")}
+    # The parent flow.yaml's `options:` mapping reaches the sub-run through
+    # its generated flow.yaml (the same source, "recipe"); the parent's
+    # sections (shift_select:, ...) do not, as before.
+    po = getattr(parent.settings, "from_options", None) or {}
+    if po:
+        import yaml
+        doc = yaml.safe_load(Path(flow_yaml).read_text()) or {}
+        doc["options"] = dict(po)
+        head = Path(flow_yaml).read_text().splitlines()[0]
+        Path(flow_yaml).write_text(
+            (head + "\n" if head.startswith("#") else "")
+            + yaml.safe_dump(doc, sort_keys=False))
     sub = FlowConfig.load(flow_yaml, out, root=parent.root, **ov)
     saved = dict(os.environ)
     try:

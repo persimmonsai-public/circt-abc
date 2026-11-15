@@ -7,6 +7,7 @@
 # this library depends on CirctAbcStructuralMapper for that shared code.
 add_mlir_library(CirctAbcRegisterMapper
   ClockGateInferencePass.cpp
+  DataGateEnablesPass.cpp
   DedupRegistersPass.cpp
   NarrowArrayRegistersPass.cpp
   NarrowDeadRegisterBitsPass.cpp

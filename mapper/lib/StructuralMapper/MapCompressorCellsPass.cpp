@@ -533,6 +533,12 @@ struct MapCompressorCellsPass
     libertyPath = other.libertyPath.getValue();
     minWidth = other.minWidth.getValue();
     prefixFinalAdder = other.prefixFinalAdder.getValue();
+    gateCompressors = other.gateCompressors.getValue();
+    cellStages = other.cellStages.getValue();
+    treeShape = other.treeShape.getValue();
+    nandPp = other.nandPp.getValue();
+    mapFinalAdder = other.mapFinalAdder.getValue();
+    mapFinalMinWidth = other.mapFinalMinWidth.getValue();
     mergeAdds = other.mergeAdds.getValue();
     flattenAdds = other.flattenAdds.getValue();
     flattenGated = other.flattenGated.getValue();
@@ -597,6 +603,44 @@ struct MapCompressorCellsPass
   // 128-bit adder, so the product cone ends up deeper than the whole cone
   // without this pass: the area saved costs timing unless the final adder
   // keeps a prefix structure.
+  // Tree-shape and cell-use options (all off by default: the plain Dadda
+  // tree of ADDF/ADDH cells).
+  Option<bool> gateCompressors{
+      *this, "gate-compressors",
+      llvm::cl::desc("Emit every full/half adder of the trees as plain comb "
+                     "logic (xor / majority) for ABC to map, instead of "
+                     "ADDF/ADDH cell instances"),
+      llvm::cl::init(false)};
+  Option<int> cellStages{
+      *this, "cell-stages",
+      llvm::cl::desc("Hard ADDF/ADDH cells only in the first N reduction "
+                     "stages (array tree: first N rows added), plain logic "
+                     "after; -1 = every stage"),
+      llvm::cl::init(-1)};
+  Option<std::string> treeShape{
+      *this, "tree",
+      llvm::cl::desc("Reduction shape: dadda (default), wallace (full adder "
+                     "on every triple of every stage) or array (rows added "
+                     "one at a time into a carry-save pair)"),
+      llvm::cl::init("dadda")};
+  Option<bool> nandPp{
+      *this, "nand-pp",
+      llvm::cl::desc("Leaf bits that are a 2-input AND enter the tree as "
+                     "NAND (complemented); full adder cells are self-dual so "
+                     "the complement flows through the tree and is undone "
+                     "once at the result rows"),
+      llvm::cl::init(false)};
+  Option<bool> mapFinalAdder{
+      *this, "map-final-adder",
+      llvm::cl::desc("Tag each tree's final two-row add so map-adder-chains "
+                     "leaves it to ABC (no ripple of ADDF cells)"),
+      llvm::cl::init(false)};
+  Option<unsigned> mapFinalMinWidth{
+      *this, "map-final-min-width",
+      llvm::cl::desc("With map-final-adder: only tag final adds at least this "
+                     "many bits wide (narrower ones "
+                     "stay ADDF ripple chains); 0 = every width"),
+      llvm::cl::init(0)};
   Option<bool> prefixFinalAdder{
       *this, "prefix-final-adder",
       llvm::cl::desc("Build each tree's final two-row add as a Brent-Kung "
@@ -625,6 +669,8 @@ struct MapCompressorCellsPass
   // the module with no users -- silent dead area in the netlist.
   SmallVector<Operation *> created;
   llvm::DenseMap<Value, Value> invCache; // one inverter per signal, shared
+  llvm::DenseSet<Value> negBits;         // nand-pp: physical value carries the complement
+  unsigned nNandPp = 0;
 
   hw::HWModuleExternOp declFor(ModuleOp top, const CellPattern &cell) {
     if (auto d = cellDecls.lookup(cell.name))
@@ -1046,10 +1092,12 @@ struct MapCompressorCellsPass
                    << " add expression(s) flattened into compress trees\n";
     }
     Type i1 = IntegerType::get(ctx, 1);
-    unsigned nTrees = 0, nFull = 0, nHalf = 0, nBits = 0, nPrefixAdders = 0;
+    unsigned nTrees = 0, nFull = 0, nHalf = 0, nBits = 0, nPrefixAdders = 0, nGateFull = 0, nGateHalf = 0, nTagged = 0;
     cellLib = &*lib;
     cellDecls.clear();
     nPrefixCells = 0;
+    negBits.clear();
+    nNandPp = 0;
     SmallVector<datapath::CompressOp> targets;
     for (auto hwmod : top.getOps<hw::HWModuleOp>())
       hwmod.walk([&](datapath::CompressOp c) { targets.push_back(c); });
@@ -1061,16 +1109,66 @@ struct MapCompressorCellsPass
       unsigned nOut = comp.getNumResults();
       // Columns of live bits, LSB first.
       SmallVector<SmallVector<Value, 8>> col(W);
+      Value oneC;
+      auto one = [&]() {
+        if (!oneC)
+          oneC = hw::ConstantOp::create(b, loc, APInt(1, 1));
+        return oneC;
+      };
+      // flip(v): the physical complement of v; its logical polarity is the
+      // opposite of v's.
+      auto flip = [&](Value v) {
+        Value n = comb::XorOp::create(b, loc, ValueRange{v, one()}, true);
+        if (!negBits.contains(v))
+          negBits.insert(n);
+        return n;
+      };
+      llvm::DenseMap<Value, Value> trueMemo;
+      auto trueOf = [&](Value v) {
+        if (!negBits.contains(v))
+          return v;
+        auto it = trueMemo.find(v);
+        if (it != trueMemo.end())
+          return it->second;
+        Value t = comb::XorOp::create(b, loc, ValueRange{v, one()}, true);
+        return trueMemo[v] = t;
+      };
+      unsigned stageNo = 0;
+      auto cellsNow = [&] {
+        return !gateCompressors.getValue() &&
+               (cellStages.getValue() < 0 ||
+                (int)stageNo < cellStages.getValue());
+      };
+      std::vector<std::vector<std::pair<unsigned, Value>>> rowBits;
       for (Value row : comp.getInputs()) {
+        rowBits.emplace_back();
         for (unsigned j = 0; j < W; ++j) {
           auto [src, sb] = bitSource(row, j);
           if (auto k = src.getDefiningOp<hw::ConstantOp>()) {
             if (!k.getValue()[sb])
               continue; // a zero adds nothing
             col[j].push_back(hw::ConstantOp::create(b, loc, APInt(1, 1)));
+            rowBits.back().push_back({j, col[j].back()});
             continue;
           }
+          if (nandPp.getValue() && cellsNow()) {
+            if (auto an = src.getDefiningOp<comb::AndOp>()) {
+              if (an.getNumOperands() == 2) {
+                Value e1 = comb::ExtractOp::create(b, loc, i1, an.getOperand(0), sb);
+                Value e2 = comb::ExtractOp::create(b, loc, i1, an.getOperand(1), sb);
+                Value a2 = comb::AndOp::create(b, loc, ValueRange{e1, e2}, true);
+                Value nd = comb::XorOp::create(b, loc, ValueRange{a2, one()}, true);
+                negBits.insert(nd);
+                col[j].push_back(nd);
+                rowBits.back().push_back({j, nd});
+                ++nBits;
+                ++nNandPp;
+                continue;
+              }
+            }
+          }
           col[j].push_back(comb::ExtractOp::create(b, loc, i1, src, sb));
+          rowBits.back().push_back({j, col[j].back()});
           ++nBits;
         }
       }
@@ -1080,7 +1178,33 @@ struct MapCompressorCellsPass
           h = std::max(h, c.size());
         return h;
       };
+      auto gateFull = [&](Value x, Value y, Value z) {
+        x = trueOf(x);
+        y = trueOf(y);
+        z = trueOf(z);
+        Value s3 = comb::XorOp::create(b, loc, ValueRange{x, y, z}, true);
+        Value xy = comb::AndOp::create(b, loc, ValueRange{x, y}, true);
+        Value xz = comb::AndOp::create(b, loc, ValueRange{x, z}, true);
+        Value yz = comb::AndOp::create(b, loc, ValueRange{y, z}, true);
+        Value c3 = comb::OrOp::create(b, loc, ValueRange{xy, xz, yz}, true);
+        ++nGateFull;
+        return std::make_pair(Value(s3), Value(c3));
+      };
       auto fullAdder = [&](Value x, Value y, Value z) {
+        if (!cellsNow())
+          return gateFull(x, y, z);
+        // Full adder cells are self-dual: with a majority of complemented
+        // inputs the (complemented) minority is flipped and both outputs are
+        // complemented too.
+        unsigned nNeg = negBits.contains(x) + negBits.contains(y) +
+                        negBits.contains(z);
+        bool P = nNeg >= 2;
+        if (negBits.contains(x) != P)
+          x = flip(x);
+        if (negBits.contains(y) != P)
+          y = flip(y);
+        if (negBits.contains(z) != P)
+          z = flip(z);
         SmallVector<Value, 3> args(3);
         args[faDecl.inIdx[0]] = x;
         args[faDecl.inIdx[1]] = y;
@@ -1090,10 +1214,25 @@ struct MapCompressorCellsPass
             StringAttr::get(ctx, (Twine("cmp_fa_") + Twine(nFull)).str()),
             args);
         ++nFull;
-        return std::make_pair(inst.getResult(faDecl.sumIdx),
-                              inst.getResult(faDecl.carryIdx));
+        Value so = inst.getResult(faDecl.sumIdx),
+              co = inst.getResult(faDecl.carryIdx);
+        if (P) {
+          negBits.insert(so);
+          negBits.insert(co);
+        }
+        return std::make_pair(so, co);
       };
       auto halfAdder = [&](Value x, Value y) {
+        if (!cellsNow()) {
+          x = trueOf(x);
+          y = trueOf(y);
+          Value sx = comb::XorOp::create(b, loc, ValueRange{x, y}, true);
+          Value cx = comb::AndOp::create(b, loc, ValueRange{x, y}, true);
+          ++nGateHalf;
+          return std::make_pair(Value(sx), Value(cx));
+        }
+        x = trueOf(x);
+        y = trueOf(y);
         if (haDecl) {
           SmallVector<Value, 2> args(2);
           args[haDecl->inIdx[0]] = x;
@@ -1109,23 +1248,18 @@ struct MapCompressorCellsPass
         Value zero = hw::ConstantOp::create(b, loc, APInt(1, 0));
         return fullAdder(x, y, zero);
       };
-      // Dadda: reduce stage by stage to the largest Dadda height below the
-      // current maximum, counting the carries a column receives from the
-      // column below IN THIS STAGE toward its height.
-      while (maxHeight() > nOut) {
-        size_t h = maxHeight();
-        size_t target = nOut; // 2, 3, 4, 6, 9, 13, ...
-        while (target * 3 / 2 < h)
-          target = target * 3 / 2;
-        if (target >= h)
-          target = nOut;
+      // One reduction stage. dadda: reduce to `target` (counting the carries
+      // a column receives from the column below in THIS stage). wallace
+      // (greedy=true): a full adder on every triple, a half adder on a
+      // leftover pair only when the column would still be above nOut.
+      auto reduceStage = [&](size_t target, bool greedy) {
         SmallVector<SmallVector<Value, 8>> next(W);
         SmallVector<Value, 8> carriesIn;
         for (unsigned j = 0; j < W; ++j) {
           SmallVector<Value, 8> in = std::move(col[j]);
           SmallVector<Value, 8> carriesOut;
           size_t height = in.size() + carriesIn.size();
-          size_t reduceBy = height > target ? height - target : 0;
+          size_t reduceBy = greedy ? height : (height > target ? height - target : 0);
           size_t pos = 0;
           while (reduceBy >= 2 && pos + 3 <= in.size()) {
             auto [s, c] = fullAdder(in[pos], in[pos + 1], in[pos + 2]);
@@ -1134,7 +1268,11 @@ struct MapCompressorCellsPass
             pos += 3;
             reduceBy -= 2;
           }
-          if (reduceBy >= 1 && pos + 2 <= in.size()) {
+          bool wantHalf = greedy
+                              ? (in.size() - pos == 2 &&
+                                 next[j].size() + 2 + carriesIn.size() > nOut)
+                              : reduceBy >= 1;
+          if (wantHalf && pos + 2 <= in.size()) {
             auto [s, c] = halfAdder(in[pos], in[pos + 1]);
             next[j].push_back(s);
             carriesOut.push_back(c);
@@ -1146,6 +1284,34 @@ struct MapCompressorCellsPass
           carriesIn = std::move(carriesOut); // into column j+1 (dropped past W)
         }
         col = std::move(next);
+        ++stageNo;
+      };
+      if (treeShape.getValue() == "array") {
+        // Carry-save array: the first two rows, then one row per stage added
+        // into the (sum, carry) pair.
+        col.assign(W, {});
+        size_t r = 0;
+        for (auto &rb : rowBits) {
+          for (auto &jb : rb)
+            col[jb.first].push_back(jb.second);
+          if (++r >= 2)
+            while (maxHeight() > nOut)
+              reduceStage(nOut, false);
+        }
+      } else if (treeShape.getValue() == "wallace") {
+        while (maxHeight() > nOut)
+          reduceStage(nOut, true);
+      } else {
+        // Dadda: the largest Dadda height below the current maximum.
+        while (maxHeight() > nOut) {
+          size_t h = maxHeight();
+          size_t target = nOut; // 2, 3, 4, 6, 9, 13, ...
+          while (target * 3 / 2 < h)
+            target = target * 3 / 2;
+          if (target >= h)
+            target = nOut;
+          reduceStage(target, false);
+        }
       }
       // Assemble the result rows: row r takes the r-th bit of every column.
       SmallVector<Value> results;
@@ -1153,7 +1319,7 @@ struct MapCompressorCellsPass
         SmallVector<Value> msbFirst;
         for (int j = W - 1; j >= 0; --j) {
           if (r < col[j].size())
-            msbFirst.push_back(col[j][r]);
+            msbFirst.push_back(trueOf(col[j][r]));
           else
             msbFirst.push_back(hw::ConstantOp::create(b, loc, APInt(1, 0)));
         }
@@ -1165,7 +1331,7 @@ struct MapCompressorCellsPass
       // Only the shape DatapathToComb produces is handled: both rows feed
       // exactly one comb.add of the tree's width and nothing else.
       comb::AddOp finalAdd;
-      if (prefixFinalAdder && nOut == 2 && comp.getResult(0).hasOneUse() &&
+      if ((prefixFinalAdder || mapFinalAdder) && nOut == 2 && comp.getResult(0).hasOneUse() &&
           comp.getResult(1).hasOneUse()) {
         Operation *u0 = *comp.getResult(0).getUsers().begin();
         Operation *u1 = *comp.getResult(1).getUsers().begin();
@@ -1173,6 +1339,13 @@ struct MapCompressorCellsPass
         if (add && u0 == u1 && add.getNumOperands() == 2 &&
             add.getType().getIntOrFloatBitWidth() == W)
           finalAdd = add;
+      }
+      if (finalAdd && !prefixFinalAdder) {
+        if (W >= mapFinalMinWidth.getValue()) {
+          finalAdd->setAttr("circt_abc.no_adder_cells", UnitAttr::get(ctx));
+          ++nTagged;
+        }
+        finalAdd = comb::AddOp();
       }
       if (finalAdd) {
         auto asSig = [&](Value v) {
@@ -1202,6 +1375,10 @@ struct MapCompressorCellsPass
                  << nBits << " input bit(s) -> " << nFull << " " << fa->name
                  << " + " << nHalf << " " << (ha ? ha->name : std::string("(no HA)"))
                  << "\n";
+    llvm::errs() << "[map-compressor-cells] tree=" << treeShape.getValue()
+                 << " gate FA/HA " << nGateFull << "/" << nGateHalf
+                 << " nand-pp bits " << nNandPp << " final adds tagged "
+                 << nTagged << "\n";
     if (prefixFinalAdder)
       llvm::errs() << "[map-compressor-cells] " << nPrefixAdders
                    << " final adder(s) built as Brent-Kung prefix networks, "

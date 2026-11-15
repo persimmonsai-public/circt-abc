@@ -23,9 +23,9 @@
 # OpenSTA runs in place with $OPENSTA, else in the ORFS image; Yosys is
 # $YOSYS, else `yosys`.
 #
-# Clock gating is switched off (CIRCT_FLOW_NO_CLOCK_GATING=1): a gated clock
+# Clock gating is switched off (option syn.clock_gating.enable: false in the flow configs): a gated clock
 # is outside what a Yosys miter proves, and the example is about the select.
-# The outline-after-flatten stage order (CIRCT_FLOW_OUTLINE_AFTER_FLATTEN=1)
+# The outline-after-flatten stage order (option syn.outline_after_flatten: true)
 # leaves one flat module, which the fanout stage and OpenSTA need for a design
 # whose top has no sub-modules.
 set -euo pipefail
@@ -48,7 +48,7 @@ python3 -I "$root/examples/asap7-mvt/lib/make_libs.py" "$here/lib" >/dev/null
 cd "$root/scripts"
 python3 -m circt_flow.techpack check "$here/techpack.yaml" >/dev/null \
   || { python3 -m circt_flow.techpack check "$here/techpack.yaml"; exit 1; }
-export CIRCT_FLOW_NO_CLOCK_GATING=1 CIRCT_FLOW_OUTLINE_AFTER_FLATTEN=1
+# clock gating off and outline-after-flatten: the flow configs' options:
 
 flow() {  # flow <arm> <out dir>
   python3 -m circt_flow "$here/designs/align_unit/flow_$1.yaml" "$2" --sta \

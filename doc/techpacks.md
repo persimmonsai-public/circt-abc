@@ -60,8 +60,8 @@ deny_exceptions: []                  # names the audit lets through
 flow:                            # defaults; see Precedence
   abc_script_file: abc/recipe.abc
   sv2v_docker_image: circt-abc
-  env:
-    CIRCT_FLOW_ADDER_ARCH: RIPPLE-CARRY
+  options:
+    syn.adders.arch: RIPPLE-CARRY
 
 pnr:                             # optional; one of
   orfs_platform_dir: orfs-platform
@@ -1054,11 +1054,14 @@ The keys a `flow:` section may set are `profile.FLOW_DEFAULTS`:
 `sv2v_docker_image`, `abc_script_file` (a path in the pack),
 `abc_read_lib_args`, `enable_classical_resub`, `partitions`,
 `mapping_target` (see "Modes and the mapping target"), `fanout_buffer`
-(see "Fanout buffering"; a rail's own overrides it key by key), and `env`.
-`env` sets defaults for the flow's `CIRCT_FLOW_*` pass knobs (the ones
-`stages.py` documents); only `CIRCT_FLOW_` names are accepted, a YAML
-boolean means `1`/`0`, and a knob the environment already sets keeps its
-value. The flow prints each default it applies.
+(see "Fanout buffering"; a rail's own overrides it key by key), `options`
+and `env`. `options` sets defaults for the flow's options by their dotted
+names (`doc/options.md`); they rank below the flow config (its `options:`
+mapping and its sections), an argument (`--set`) and, during the
+transition, a legacy environment variable. `env` is the legacy form: the
+`CIRCT_FLOW_*` names of those options, accepted with a deprecation warning
+at the same rank (refused under `--strict` and from release 13 on); a YAML
+boolean means `1`/`0`.
 
 `CIRCT_FLOW_OUTLINE_AFTER_FLATTEN=1` moves the outlining of unmapped logic
 after the hierarchy is flattened, so ABC receives one residual module
@@ -1118,6 +1121,14 @@ What runs depends on the pack's own `pnr:`:
   read in that order; `placement_check` then reads only those (not the
   command's console log). Under `placement_check: fail`,
   patterns that match nothing are an error.
+
+  The pack may declare its command's own options in a JSON registry,
+  `pnr: {settings_registry: <file>}` (relative to the pack): `options --pack`
+  lists them, a session sets them with `s.set_pack_option`, and the flow
+  hands them to the command as `--settings FILE` in front of the arguments
+  above ([`pack-options.md`](pack-options.md); the template has one).
+  `pnr: {settings_defaults: {name: value}}` gives the profile's own values of
+  those options, handed over on every run.
 
   Besides the arguments, the flow **sets** these variables in the command's
   environment, each only when its key is set (nothing in this repository

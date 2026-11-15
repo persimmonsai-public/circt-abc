@@ -67,6 +67,8 @@ STUB = textwrap.dedent('''\
     m = {k: b[k] for k in ("setup_ws", "hold_ws", "drc_errors", "final") if k in b}
     if "_seen" in plan:                        # the variables to report
         m["seen_env"] = {k: os.environ[k] for k in plan["_seen"] if k in os.environ}
+    if "--settings" in a:                      # the pack settings file it was given
+        m["settings"] = json.load(open(a["--settings"]))
     (out / "pnr_metrics.json").write_text(json.dumps(m))
     if b.get("signal"):
         (sd / b["signal"]).write_text("")
@@ -83,6 +85,9 @@ CHECK = textwrap.dedent('''\
     time.sleep(b.get("check_sleep", 0))
     with open(os.environ["STUB_LOG"], "a") as f:
         f.write(f"check {os.environ['CIRCT_FLOW_LADDER_VALUE']}\\n")
+        ps = os.environ.get("CIRCT_FLOW_PACK_SETTINGS")
+        seen = json.dumps(json.load(open(ps)), sort_keys=True).replace(" ", "") if ps else "unset"
+        f.write(f"checksettings {os.environ['CIRCT_FLOW_LADDER_VALUE']} {seen}\\n")
     sys.exit(b.get("check_rc", 0))
 ''')
 
@@ -378,6 +383,90 @@ def test_jobs_bounds_the_concurrency(tmp_path):
     ev = [(e[0], e[1]) for e in w.events() if e[0] in ("begin", "end")]
     for a, b in zip(ev[::2], ev[1::2]):               # begin/end pairs never interleave
         assert a[0] == "begin" and b == ("end", a[1])
+
+
+def _with_pack_settings(w, defaults=None, given=None):
+    """The world's pack with an option registry, the profile's
+    settings_defaults and a session's values (cfg.design.pack_settings)."""
+    reg = {"format": 1, "legacy_env_removed_in": 0, "namespaces": ["xyz"],
+           "options": [{"name": "xyz.mode", "type": "choice", "choices": ["a", "b", "c"],
+                        "default": "a"},
+                       {"name": "xyz.effort", "type": "int", "default": 1, "range": [0, 9]}]}
+    from circt_flow import options
+    reg["legacy_env_removed_in"] = options.LEGACY_ENV_REMOVED_IN
+    (w.tmp / "pack" / "opts.json").write_text(json.dumps(reg))
+    w.cfg.design.pack_pnr["settings_registry"] = "opts.json"
+    if defaults is not None:
+        w.cfg.design.pack_pnr["settings_defaults"] = defaults
+    w.cfg.design.pack_settings = dict(given or {})
+
+
+def _rung_settings(w):
+    return sorted(json.dumps(json.loads(f.read_text()).get("settings"), sort_keys=True)
+                  for f in (w.cfg.pnr_dir / "ladder").rglob("pnr_metrics.json"))
+
+
+@pytest.mark.parametrize("defaults,given", [
+    (None, None), ({"xyz.mode": "b"}, None), ({"xyz.mode": "b"}, {"xyz.effort": 3}),
+    (None, {"xyz.effort": 3})])
+def test_restart_ladder_with_pack_settings(tmp_path, defaults, given):
+    """Pack settings (the profile's settings_defaults, a session's values)
+    reach the placement and every rung of a restarting ladder: each job gets
+    its own <dir>/pack_settings.json, which does not make the plans differ;
+    a second run reuses the placement and the rungs; a change of the
+    settings' content is a change of the inputs (refused)."""
+    w = World(tmp_path, {"0": {**GOOD, "hold_ws": -1}, "1": {**GOOD, "hold_ws": -1}, "2": GOOD})
+    _with_pack_settings(w, defaults, given)
+    code, rep = w.run(mode="sequential")
+    assert code == 0 and rep["restart"] is True and rep["accepted"] == 2
+    kinds = [e[0] for e in w.events()]
+    assert kinds.count("place") == 1 and kinds.count("restart") == 3 and "full" not in kinds
+    want = {**(defaults or {}), **(given or {})}
+    got = _rung_settings(w)
+    assert len(got) == 3
+    assert set(got) == {json.dumps({"options": want} if want else None, sort_keys=True)}
+    n = len(w.events())
+    code, rep = w.run(mode="sequential")                         # the same inputs: all reused
+    assert code == 0 and len(w.events()) == n
+    assert any("placement reused" in l for l in w.logs)
+    if want:
+        if given:
+            w.cfg.design.pack_settings = {**given, "xyz.effort": 4}
+        else:
+            w.cfg.design.pack_pnr["settings_defaults"] = {"xyz.mode": "c"}
+        with pytest.raises(L.LadderError, match="different inputs or options"):
+            L.run_flow(w.cfg, log=lambda m: None)
+
+
+@pytest.mark.parametrize("restart", [True, False])
+@pytest.mark.parametrize("defaults,given", [
+    (None, None), ({"xyz.mode": "b"}, None), ({"xyz.mode": "b"}, {"xyz.effort": 3})])
+def test_acceptance_command_gets_the_pack_settings(tmp_path, restart, defaults, given):
+    """accept.command gets CIRCT_FLOW_PACK_SETTINGS (the rung's own file)
+    when pack options are handed over, and not at all otherwise (also when
+    the environment has it); its verdict is reused only with the same
+    settings content."""
+    _MP.setenv("CIRCT_FLOW_PACK_SETTINGS", "/stale/from/the/environment.json")
+    w = World(tmp_path, {"0": GOOD, "1": GOOD},
+              stage_restart=("place", "cts", "route") if restart else None,
+              ladder={"param": "knob", "values": [0, 1], "from_stage": "cts",
+                      "accept": {"command": ["./check.py"]}})
+    _with_pack_settings(w, defaults, given)
+    code, rep = w.run(mode="sequential")
+    assert code == 0 and rep["accepted"] == 0
+    want = {**(defaults or {}), **(given or {})}
+
+    def form(opts):
+        return json.dumps({"options": opts}, sort_keys=True).replace(" ", "")
+    seen = [e[2] for e in w.events() if e[0] == "checksettings"]
+    assert seen == [form(want) if want else "unset"]
+    n = len(w.events())
+    assert w.run(mode="sequential")[0] == 0 and len(w.events()) == n    # reused
+    if want and not restart:          # (with a restart a change is refused: other tests)
+        w.cfg.design.pack_settings = {"xyz.effort": 5}
+        assert w.run(mode="sequential")[0] == 0
+        seen = [e[2] for e in w.events()[n:] if e[0] == "checksettings"]
+        assert seen == [form({**(defaults or {}), "xyz.effort": 5})]
 
 
 def test_stage_contract_with_restart(tmp_path):

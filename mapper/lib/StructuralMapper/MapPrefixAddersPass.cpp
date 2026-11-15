@@ -91,6 +91,8 @@ struct MapPrefixAddersPass
     minWidth = o.minWidth.getValue();
     maxWidth = o.maxWidth.getValue();
     archOpt = o.archOpt.getValue();
+    isolate = o.isolate.getValue();
+    boundary = o.boundary.getValue();
   }
 
   StringRef getArgument() const final { return "map-prefix-adders"; }
@@ -118,6 +120,18 @@ struct MapPrefixAddersPass
       llvm::cl::desc("SKLANSKEY | KOGGE-STONE | HAN-CARLSON | BRENT-KUNG; "
                      "'attr' takes each op's synth.test.arch (default "
                      "SKLANSKEY when it has none)")};
+
+  Option<unsigned> boundary{
+      *this, "boundary", llvm::cl::init(0),
+      llvm::cl::desc("0 off; 1 = operands feed only NAND2+NOR2 cells (g,t "
+                     "boundary), the prefix network is left as comb logic for "
+                     "ABC; any other value is refused")};
+  Option<bool> isolate{
+      *this, "isolate-inputs", llvm::cl::init(false),
+      llvm::cl::desc("first level reads each operand bit with one NAND2 and "
+                     "one NOR2 only (2 pins per bit); the propagate is "
+                     "derived from those two (p = (a|b) & !(a&b)), so a "
+                     "register driving the adder sees 2 loads per bit")};
 
   struct Sig {
     Value v;
@@ -332,7 +346,21 @@ struct MapPrefixAddersPass
       auto gi = gate(b, loc, top, AND2, {x[i], y[i]});
       if (!gi)
         return std::nullopt;
-      auto pi = gateWant(b, loc, top, XOR2, {x[i], y[i]}, gi->k < 0 && gi->neg);
+      std::optional<Sig> pi;
+      bool iso = isolate.getValue() && x[i].k < 0 && y[i].k < 0 &&
+                 gi->k < 0;
+      if (iso) {
+        // NOR2 straight off the operands; (a|b) is its complement.
+        auto no = gateOnce(b, loc, top, /*NOR2*/ 0x1, {x[i], y[i]});
+        if (no && no->k < 0) {
+          Sig orS{no->v, !no->neg, -1};
+          // p = (a|b) & !g over the two first-level outputs only.
+          pi = gateWant(b, loc, top, /*a & !b*/ 0x2, {orS, *gi},
+                        gi->neg);
+        }
+      }
+      if (!pi)
+        pi = gateWant(b, loc, top, XOR2, {x[i], y[i]}, gi->k < 0 && gi->neg);
       if (!pi)
         return std::nullopt;
       G[i] = *gi;
@@ -415,6 +443,87 @@ struct MapPrefixAddersPass
     return sum;
   }
 
+
+  // g/t boundary: NAND2/NOR2 cells on the operand bits; everything else is
+  // comb logic over g and t, mapped by ABC as usual.
+  std::optional<SmallVector<Value>>
+  buildBoundaryAdder(OpBuilder &b, Location loc, ModuleOp top,
+                     ArrayRef<Sig> x, ArrayRef<Sig> y, Arch arch,
+                     unsigned firstSum) {
+    created.clear();
+    invCache.clear();
+    unsigned N = x.size();
+    Value one = hw::ConstantOp::create(b, loc, APInt(1, 1));
+    auto trueOf = [&](Sig s) -> Value {
+      if (s.k >= 0)
+        return hw::ConstantOp::create(b, loc, APInt(1, s.k));
+      return s.neg ? comb::XorOp::create(b, loc, s.v, one).getResult() : s.v;
+    };
+    SmallVector<Value> g(N), t(N), P(N), G(N);
+    SmallVector<unsigned> lo(N);
+    for (unsigned i = 0; i < N; ++i) {
+      bool cellable = x[i].k < 0 && y[i].k < 0;
+      if (cellable) {
+        auto gs = gateOnce(b, loc, top, 0x8, {x[i], y[i]});
+        auto ts = gateOnce(b, loc, top, 0xE, {x[i], y[i]});
+        if (!gs || !ts || gs->k >= 0 || ts->k >= 0)
+          return std::nullopt;
+        g[i] = trueOf(*gs);
+        t[i] = trueOf(*ts);
+      } else {
+        g[i] = comb::AndOp::create(b, loc, trueOf(x[i]), trueOf(y[i]));
+        t[i] = comb::OrOp::create(b, loc, trueOf(x[i]), trueOf(y[i]));
+      }
+      Value ng = comb::XorOp::create(b, loc, g[i], one);
+      P[i] = comb::AndOp::create(b, loc, t[i], ng); // = a ^ b
+      G[i] = g[i];
+      lo[i] = i;
+    }
+    SmallVector<Value> p0 = P;
+    auto combine = [&](unsigned hi, unsigned lw) {
+      Value pg = comb::AndOp::create(b, loc, P[hi], G[lw]);
+      G[hi] = comb::OrOp::create(b, loc, G[hi], pg);
+      if (lo[lw] > 0)
+        P[hi] = comb::AndOp::create(b, loc, P[hi], P[lw]);
+      lo[hi] = lo[lw];
+    };
+    switch (arch) {
+    case Arch::Sklansky:
+      for (unsigned d = 1; d < N; d *= 2)
+        for (unsigned i = 0; i < N; ++i)
+          if (i & d)
+            combine(i, (i & ~(d - 1)) - 1);
+      break;
+    case Arch::KoggeStone:
+      for (unsigned d = 1; d < N; d *= 2)
+        for (unsigned i = N; i-- > d;)
+          combine(i, i - d);
+      break;
+    default: { // Brent-Kung (also used for Han-Carlson here)
+      unsigned top2 = 1;
+      while (top2 * 2 <= N)
+        top2 *= 2;
+      for (unsigned d = 1; d < N; d *= 2)
+        for (unsigned i = 2 * d - 1; i < N; i += 2 * d)
+          combine(i, i - d);
+      for (unsigned d = top2 / 2; d >= 1; d /= 2)
+        for (unsigned i = 3 * d - 1; i < N; i += 2 * d)
+          combine(i, i - d);
+      break;
+    }
+    }
+    SmallVector<Value> sum;
+    for (unsigned i = firstSum; i < N; ++i) {
+      if (i > 0 && lo[i - 1] != 0)
+        return std::nullopt;
+      sum.push_back(i == 0 ? p0[0]
+                           : comb::XorOp::create(b, loc, p0[i], G[i - 1])
+                                 .getResult());
+    }
+    created.clear();
+    return sum;
+  }
+
   Sig bitOf(OpBuilder &b, Location loc, Value v, unsigned bit) {
     auto [src, sbit] = bitSource(v, bit);
     if (auto k = src.getDefiningOp<hw::ConstantOp>())
@@ -431,6 +540,11 @@ struct MapPrefixAddersPass
     ModuleOp top = getOperation();
     if (libertyPath.getValue().empty()) {
       top.emitError("map-prefix-adders: liberty= is required");
+      return signalPassFailure();
+    }
+    if (boundary.getValue() > 1) {
+      top.emitError("map-prefix-adders: boundary=")
+          << boundary.getValue() << " is not supported (0 off, 1 on)";
       return signalPassFailure();
     }
     auto lib = LibertyLibrary::loadFromFile(libertyPath.getValue());
@@ -515,7 +629,9 @@ struct MapPrefixAddersPass
       else if (auto at = add->getAttrOfType<StringAttr>("synth.test.arch"))
         if (auto pa = parseArch(at.getValue()))
           arch = *pa;
-      auto sum = buildPrefixAdder(b, loc, top, xs, ys, arch, off);
+      auto sum = boundary.getValue()
+                     ? buildBoundaryAdder(b, loc, top, xs, ys, arch, off)
+                     : buildPrefixAdder(b, loc, top, xs, ys, arch, off);
       if (!sum || sum->size() != W) {
         ++nDeclined;
         continue;
@@ -527,8 +643,10 @@ struct MapPrefixAddersPass
       add.erase();
       ++nAdd;
     }
-    if (nAdd || nDeclined)
-      llvm::errs() << "[map-prefix-adders] " << nAdd << " add(s) built as "
+    // One report line per enabled run, also when it built nothing: the flow
+    // attributes the lines to the pass instances of its command in order
+    // (scoping.py: a scoped window that built nothing is refused).
+    llvm::errs() << "[map-prefix-adders] " << nAdd << " add(s) built as "
                    << archOpt.getValue() << " prefix networks, "
                    << (nPrefixCells - cellsBefore) << " cell(s); " << nDeclined
                    << " left to CombToSynth\n";

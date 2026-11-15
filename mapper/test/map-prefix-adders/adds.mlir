@@ -9,6 +9,8 @@
 // whose third operand is not a carry-in are left alone. Equivalence of every
 // module is SAT-proven in scripts/circt_flow/tests/test_arith_lowering.py.
 
+// RUN: circt-abc-opt "--map-prefix-adders=enable-prefix-adders=true liberty=%S/prefix.lib min-width=60 arch=SKLANSKEY" %s 2>&1 | FileCheck %s --check-prefix=NONE
+// NONE: [map-prefix-adders] 0 add(s) built as SKLANSKEY prefix networks, 0 cell(s); 0 left to CombToSynth
 // CHECK: [map-prefix-adders] 4 add(s) built as {{.*}} prefix networks, {{[0-9]+}} cell(s); 1 left to CombToSynth
 // OFF-NOT: map-prefix-adders
 // CHECK-LABEL: hw.module @add16
@@ -28,12 +30,12 @@ hw.module @add32_cin(in %a : i32, in %b : i32, in %c : i1, out y : i32) {
   hw.output %0 : i32
 }
 
-// CHECK-LABEL: hw.module @add48_one
+// CHECK-LABEL: hw.module @add40_one
 // CHECK-NOT: comb.add
-hw.module @add48_one(in %a : i48, in %b : i48, out y : i48) {
-  %one = hw.constant 1 : i48
-  %0 = comb.add %a, %b, %one : i48
-  hw.output %0 : i48
+hw.module @add40_one(in %a : i40, in %b : i40, out y : i40) {
+  %one = hw.constant 1 : i40
+  %0 = comb.add %a, %b, %one : i40
+  hw.output %0 : i40
 }
 
 // CHECK-LABEL: hw.module @add8_const

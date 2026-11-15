@@ -107,6 +107,20 @@ struct MapShiftSelectPass
     directDecode = o.directDecode.getValue();
     defaultDontCare = o.defaultDontCare.getValue();
     selectMaxFanout = o.selectMaxFanout.getValue();
+    l2RangeGate = o.l2RangeGate.getValue();
+    selectDupFanout = o.selectDupFanout.getValue();
+    l2RangeAligned = o.l2RangeAligned.getValue();
+    l2RangeCompose = o.l2RangeCompose.getValue();
+    windowForm = o.windowForm.getValue();
+    windowCount = o.windowCount.getValue();
+    windowCopyCost = o.windowCopyCost.getValue();
+    windowClip = o.windowClip.getValue();
+    windowPerNode = o.windowPerNode.getValue();
+    windowCuts = o.windowCuts.getValue();
+    windowTypes = o.windowTypes.getValue();
+    windowGeneral = o.windowGeneral.getValue();
+    windowTypesMax = o.windowTypesMax.getValue();
+    windowDirect = o.windowDirect.getValue();
   }
 
   StringRef getArgument() const final { return "map-shift-select"; }
@@ -167,6 +181,109 @@ struct MapShiftSelectPass
                      "digit select with circt_abc.max_fanout = N so the "
                      "flow's fanout stage leaves a net of at most N loads "
                      "unbuffered (0 = no annotation)")};
+  Option<unsigned> l2RangeGate{
+      *this, "l2-range-gate", llvm::cl::init(0),
+      llvm::cl::desc("with direct-decode and a recipe of two or more digits: "
+                     "gate each node of the level below the last one with "
+                     "the coarse range of the last digit that consumes it, "
+                     "so the node is quiet unless its range is the active "
+                     "one (select = digit AND range). N = width of a range in "
+                     "last-digit values: the consumers of a node are split "
+                     "into ranges of N consecutive digit values, one node "
+                     "copy per range (N=1: one copy per consumer, joint "
+                     "decode; a large N keeps every node shared and only "
+                     "gates the nodes that are not used for every digit). "
+                     "A node consumed by one digit needs no last-level "
+                     "select. 0 = off")};
+  Option<bool> l2RangeCompose{
+      *this, "l2-range-compose", llvm::cl::init(false),
+      llvm::cl::desc("with l2-range-gate: build each gated select as an AND "
+                     "of the digit select and the range select (shared with "
+                     "the other selects of that digit set / range) instead "
+                     "of one network per gated select")};
+  Option<bool> l2RangeAligned{
+      *this, "l2-range-aligned", llvm::cl::init(false),
+      llvm::cl::desc("with l2-range-gate=N: a node's range is the whole "
+                     "aligned block of N last-digit values that holds a "
+                     "consumer (digit / N), not only the consumers inside "
+                     "it: fewer distinct range selects (shared by all nodes "
+                     "of a block), nodes at the "
+                     "ends of the word are active for a few digits they do "
+                     "not use")};
+  Option<unsigned> selectDupFanout{
+      *this, "select-dup-fanout", llvm::cl::init(0),
+      llvm::cl::desc("with direct-decode: a digit-select gate drives at most "
+                     "N loads; further loads get a copy of the gate (same "
+                     "inputs) instead of a buffer. The copies are annotated "
+                     "circt_abc.max_fanout = max(N, select-max-fanout). "
+                     "0 = one gate per select")};
+  Option<bool> windowForm{
+      *this, "window-form", llvm::cl::init(false),
+      llvm::cl::desc("with direct-decode and a recipe of two or more digits: "
+                     "build the window form. The levels below the one before "
+                     "the last stay shared and ungated; every node of the "
+                     "level before the last exists once per WINDOW (a "
+                     "contiguous range of shift amounts) that holds an amount "
+                     "using it, selected by 'digit AND window' and quiet "
+                     "outside it; the last level selects a node copy with a "
+                     "select that only has to tell the last digits inside "
+                     "the copy's window apart (a pass-through when the window "
+                     "lies inside one last digit). The windows are chosen by "
+                     "a small search over the partitions of the amount range "
+                     "(cost: copies against the activity of their outputs)")};
+  Option<unsigned> windowCount{
+      *this, "window-count", llvm::cl::init(0),
+      llvm::cl::desc("with window-form: the number of windows (0 = chosen by "
+                     "the cost)")};
+  Option<unsigned> windowCopyCost{
+      *this, "window-copy-cost", llvm::cl::init(150),
+      llvm::cl::desc("with window-form: cost of one node copy (the two loads "
+                     "it puts on the shared nodes below and its cell), in "
+                     "percent of one always-active load")};
+  Option<bool> windowClip{
+      *this, "window-clip", llvm::cl::init(false),
+      llvm::cl::desc("with window-form: a copy's select covers only the "
+                     "amounts of its window that use the node (more distinct "
+                     "selects, lower activity) instead of the whole window "
+                     "(shared by every copy of the window)")};
+  Option<bool> windowPerNode{
+      *this, "window-per-node", llvm::cl::init(false),
+      llvm::cl::desc("with window-form: each node takes the chosen windows or "
+                     "a single copy over the whole amount range (selected by "
+                     "its digit alone), whichever its own cost prefers")};
+  Option<std::string> windowCuts{
+      *this, "window-cuts", llvm::cl::init(""),
+      llvm::cl::desc("with window-form: explicit cuts of the amount range "
+                     "(comma-separated shifts counted from the smallest one "
+                     "plus the digit offset, as the window report prints "
+                     "them) instead of the search; the digit offset is then "
+                     "the one the recipe search picks")};
+  Option<bool> windowGeneral{
+      *this, "window-general", llvm::cl::init(false),
+      llvm::cl::desc("with window-form: overlapping windows, each a range of "
+                     "blocks (values of the gated level's digit and above) "
+                     "with its own digit phase; every output picks, per "
+                     "block, a node copy whose window holds the block "
+                     "(greedy cover minimising copies); window types from "
+                     "window-types or a search over sets of up to "
+                     "window-types-max types")};
+  Option<std::string> windowTypes{
+      *this, "window-types", llvm::cl::init(""),
+      llvm::cl::desc("with window-general: explicit window types "
+                     "'phase:first-last;...' in blocks (block = shift from "
+                     "the smallest plus the digit offset, divided by the "
+                     "stride of the gated level)")};
+  Option<unsigned> windowTypesMax{
+      *this, "window-types-max", llvm::cl::init(2),
+      llvm::cl::desc("with window-general: most window types the search "
+                     "combines (1 to 3)")};
+  Option<unsigned> windowDirect{
+      *this, "window-direct", llvm::cl::init(0),
+      llvm::cl::desc("with window-general: an output may take a lower-level "
+                     "node directly under a block select (no copy cell) at "
+                     "this cost per requirement, percent of one always-active "
+                     "load; the cover then picks copies by cost per covered "
+                     "requirement. 0 = off")};
   Option<unsigned> radix{
       *this, "radix", llvm::cl::init(4),
       llvm::cl::desc("shift-amount radix of the first AND-OR level")};
@@ -296,6 +413,31 @@ struct MapShiftSelectPass
                           TruthTable f, SmallVector<Sig, 4> in) {
     if (auto r = gateOnce(b, loc, top, f, in))
       return r;
+    if (l2RangeGate.getValue() || selectDupFanout.getValue()) {
+      // Mixed operand polarities: make them uniform by inverting the minority
+      // (the cell is then an OAI with complemented operands or an AOI with true
+      // ones), not always the complemented ones.
+      unsigned nn = 0, np = 0;
+      for (auto &x : in)
+        if (x.k < 0)
+          (x.neg ? nn : np)++;
+      if (np && nn && np < nn) {
+        auto in2 = in;
+        bool okInv = true;
+        for (auto &x : in2)
+          if (x.k < 0 && !x.neg) {
+            auto v = invOf(b, loc, top, x.v);
+            if (!v) {
+              okInv = false;
+              break;
+            }
+            x = Sig{*v, true, -1};
+          }
+        if (okInv)
+          if (auto r = gateOnce(b, loc, top, f, in2))
+            return r;
+      }
+    }
     bool any = false;
     for (auto &x : in)
       if (x.k < 0 && x.neg) {
@@ -540,8 +682,28 @@ struct MapShiftSelectPass
       }
       if (!p && n == 1)
         p = gate(b, loc, top, and2(), {merged[i].first, merged[i].second});
-      if (!p)
-        return std::nullopt;
+      if (!p) {
+        // a term with a constant-1 select (a range-exact node) is just its
+        // datum: OR it with the AND-OR of the other terms of the chunk
+        SmallVector<std::pair<Sig, Sig>> rest;
+        SmallVector<Sig> plain;
+        for (size_t t = i; t < i + n; ++t)
+          if (merged[t].first.k == 1)
+            plain.push_back(merged[t].second);
+          else
+            rest.push_back(merged[t]);
+        if (plain.empty() || n == 1)
+          return std::nullopt;
+        if (!rest.empty()) {
+          auto q = andOrMerged(b, loc, top, rest, cap);
+          if (!q)
+            return std::nullopt;
+          plain.push_back(*q);
+        }
+        p = orReduce(b, loc, top, plain);
+        if (!p)
+          return std::nullopt;
+      }
       parts.push_back(*p);
       i += n;
     }
@@ -1167,6 +1329,914 @@ struct MapShiftSelectPass
     const DecodeIn *dec = nullptr;
   };
 
+  //--- window form ------------------------------------------------------------
+  //
+  // The level before the last (KL = K-1) is where a shared node toggles for
+  // shift amounts whose output never uses it: a node V_KL(m) serves up to R_K
+  // outputs (one per last digit) and its select is a digit of level KL alone,
+  // so it is live for every amount. The window form keeps the levels below KL
+  // shared and ungated, and builds each node of level KL once per WINDOW (a
+  // contiguous range of amounts, from a partition of the amount range) that
+  // holds an amount using it:
+  //     V_KL,w(m) = OR_d (S_KL,d & Win_w) & V_KL-1(m - d*stride_KL)
+  // so the copy is 0 outside its window. An output then takes, for each last
+  // digit d and each window w that holds amounts of d, the copy V_KL,w of its
+  // node under a select T that is 1 on the amounts of w with last digit d and
+  // 0 on the other amounts of w (anything elsewhere: the copy is 0 there). T
+  // is 1 (a pass-through) when w holds no other last digit; otherwise the
+  // cheapest of: the exact digit select (shared by every window), "not one of
+  // the other digits of the window" (an active-low range select), or the
+  // digit inside the window. Every amount without an arm gets 0 from the
+  // gated selects (the copies), as in the recipe network.
+  //
+  // The partition is chosen by a small search over the cuts at multiples of
+  // stride_KL (fewer if there are many): cost = per copy (window-copy-cost +
+  // activity * (its loads + 1)), activity = share of the amounts in its
+  // select, plus 0.5 per last-level term and 1 per distinct window select.
+  // Polarity: each level's selects are built in the polarity of the data
+  // they gate (as in the recipe network), so levels alternate AOI / OAI.
+  template <typename VFn, typename UseSelFn>
+  std::optional<SmallVector<Value>> buildWindowForm(
+      OpBuilder &b, Location loc, ModuleOp top, const RecipeIn &in, unsigned K,
+      const std::vector<long> &stride, ArrayRef<unsigned> caps,
+      const std::vector<std::vector<long>> &dg, const std::vector<long> &uOf,
+      std::vector<std::map<long, SmallVector<Sig>>> &selArms, unsigned nA,
+      unsigned nL, unsigned W, unsigned off, VFn &V, UseSelFn &useSel) {
+    const unsigned KL = K - 1;
+    const long SK = stride[K];
+    std::map<long, unsigned> wt;
+    unsigned nLegal = 0;
+    for (unsigned A = 0; A < nA; ++A)
+      if (uOf[A] >= 0) {
+        ++wt[uOf[A]];
+        ++nLegal;
+      }
+    if (wt.empty())
+      return std::nullopt;
+    long umin = wt.begin()->first, umax = wt.rbegin()->first;
+    // nodes of level KL and the last digits that consume them
+    std::map<long, std::set<long>> cons;
+    for (unsigned j = 0; j < W; ++j) {
+      long jj = (long)j - in.smin + (long)off;
+      for (auto &[d, _] : selArms[K])
+        if (jj - d * SK >= 0)
+          cons[jj - d * SK].insert(d);
+    }
+    // the ungated groups of a node: datum -> level-KL digits
+    struct Grp {
+      Sig datum;
+      std::set<long> D;
+    };
+    std::map<long, std::vector<Grp>> grpOf;
+    std::map<long, bool> plain; // node is one datum for every digit (complete)
+    for (auto &[m, _] : cons) {
+      std::map<SigId, Grp> g;
+      std::vector<SigId> order;
+      for (auto &[d, __] : selArms[KL]) {
+        long m2 = m - d * stride[KL];
+        if (m2 < 0)
+          continue;
+        Sig c = V(KL - 1, m2, {});
+        if (c.k >= 0)
+          continue;
+        auto id = idOf(c);
+        if (!g.count(id))
+          order.push_back(id);
+        g[id].datum = c;
+        g[id].D.insert(d);
+      }
+      std::vector<Grp> v;
+      for (auto &id : order)
+        v.push_back(g[id]);
+      plain[m] = in.complete && v.size() == 1 &&
+                 v[0].D.size() == selArms[KL].size();
+      grpOf[m] = std::move(v);
+    }
+    // candidate cuts
+    long G = stride[KL];
+    std::vector<long> cuts;
+    for (;;) {
+      cuts.clear();
+      for (long c = (umin / G + 1) * G; c <= umax; c += G)
+        cuts.push_back(c);
+      if (cuts.size() <= 12)
+        break;
+      G *= 2;
+    }
+    auto windowsOf = [&](unsigned mask) {
+      std::vector<std::pair<long, long>> ws;
+      long lo = umin;
+      for (unsigned i = 0; i < cuts.size(); ++i)
+        if (mask >> i & 1) {
+          ws.push_back({lo, cuts[i]});
+          lo = cuts[i];
+        }
+      ws.push_back({lo, umax + 1});
+      return ws;
+    };
+    // active amounts of node m in window w (sorted); empty = no copy
+    auto activeOf = [&](long m, std::pair<long, long> w, bool clip) {
+      std::vector<long> act;
+      bool used = false;
+      const auto &C = cons[m];
+      for (auto it = wt.lower_bound(w.first); it != wt.end() && it->first < w.second;
+           ++it) {
+        bool u = C.count(it->first / SK);
+        used |= u;
+        if (u || !clip)
+          act.push_back(it->first);
+      }
+      if (!used)
+        act.clear();
+      return act;
+    };
+    double A0 = windowCopyCost.getValue() / 100.0;
+    bool clip = windowClip.getValue();
+    // cost of node m under windows ws: copies, last-level terms, select sets
+    auto nodeCost = [&](long m, const std::vector<std::pair<long, long>> &ws,
+                        double &cost, unsigned &terms,
+                        std::vector<std::vector<long>> &distinct) {
+      const auto &C = cons[m];
+      for (auto &w : ws) {
+        auto act = activeOf(m, w, clip);
+        if (act.empty())
+          continue;
+        unsigned fo = 0, aw = 0;
+        for (long d : C) {
+          bool has = false;
+          for (long u : act)
+            has |= u / SK == d;
+          fo += has;
+        }
+        for (long u : act)
+          aw += wt[u];
+        cost += A0 + (double)aw / nLegal * (fo + 1);
+        terms += fo;
+        distinct.push_back(act);
+      }
+    };
+    double bestCost = 1e30;
+    unsigned bestMask = 0;
+    if (!windowCuts.getValue().empty()) {
+      // explicit cuts: all must lie inside the amount range (validated for
+      // syntax at pass start)
+      std::vector<long> ex;
+      std::string e;
+      if (!parseCuts(windowCuts.getValue(), ex, e)) {
+        windowNote = "window-cuts: " + e;
+        return std::nullopt;
+      }
+      for (long v : ex)
+        if (!(v > umin && v <= umax)) {
+          windowNote = "window-cuts: cut " + std::to_string(v) +
+                       " is outside the shift range (" + std::to_string(umin) +
+                       "," + std::to_string(umax) + "]";
+          return std::nullopt;
+        }
+      cuts = ex;
+    }
+    if (cuts.size() >= 31) {
+      windowNote = "window form: too many cuts";
+      return std::nullopt;
+    }
+    for (unsigned mask = 0; mask < (1u << cuts.size()); ++mask) {
+      if (!windowCuts.getValue().empty() && mask + 1 != (1u << cuts.size()))
+        continue; // explicit cuts: all of them
+      auto ws = windowsOf(mask);
+      if (windowCount.getValue() && ws.size() != windowCount.getValue())
+        continue;
+      double cost = 0;
+      unsigned terms = 0;
+      std::set<std::vector<long>> distinct;
+      for (auto &[m, C] : cons) {
+        if (plain[m] || grpOf[m].empty())
+          continue;
+        double c1 = 0;
+        unsigned t1 = 0;
+        std::vector<std::vector<long>> d1;
+        nodeCost(m, ws, c1, t1, d1);
+        if (windowPerNode.getValue() && ws.size() > 1) {
+          double c2 = 0;
+          unsigned t2 = 0;
+          std::vector<std::vector<long>> d2;
+          nodeCost(m, {{umin, umax + 1}}, c2, t2, d2);
+          if (c2 < c1) {
+            c1 = c2, t1 = t2, d1 = d2;
+          }
+        }
+        cost += c1;
+        terms += t1;
+        distinct.insert(d1.begin(), d1.end());
+      }
+      cost += 0.5 * terms + 1.0 * distinct.size();
+      if (cost < bestCost - 1e-9) {
+        bestCost = cost;
+        bestMask = mask;
+      }
+    }
+    if (bestCost > 1e29) {
+      if (windowCount.getValue())
+        windowNote = "window-count " + std::to_string(windowCount.getValue()) +
+                     " is not reachable";
+      return std::nullopt;
+    }
+    auto ws = windowsOf(bestMask);
+    // the windows of each node: the chosen partition, or (window-per-node)
+    // the whole range when that is cheaper for the node
+    std::map<long, std::vector<unsigned>> nodeWins;
+    unsigned nSingle = 0;
+    {
+      unsigned whole = ws.size();
+      bool addWhole = false;
+      for (auto &[m, C] : cons) {
+        std::vector<unsigned> all;
+        for (unsigned wi = 0; wi < ws.size(); ++wi)
+          all.push_back(wi);
+        if (windowPerNode.getValue() && ws.size() > 1 && !plain[m] &&
+            !grpOf[m].empty()) {
+          double c1 = 0, c2 = 0;
+          unsigned t1 = 0, t2 = 0;
+          std::vector<std::vector<long>> d1, d2;
+          nodeCost(m, ws, c1, t1, d1);
+          nodeCost(m, {{umin, umax + 1}}, c2, t2, d2);
+          if (c2 < c1) {
+            all = {whole};
+            addWhole = true;
+            ++nSingle;
+          }
+        }
+        nodeWins[m] = all;
+      }
+      if (addWhole)
+        ws.push_back({umin, umax + 1});
+    }
+    // selects ------------------------------------------------------------------
+    auto selCostOf = [&](const std::vector<uint8_t> &on) {
+      TT f;
+      for (unsigned i = 0; i < nL; ++i)
+        f.vars.push_back(i);
+      f.bits = on;
+      f = normalizeTT(f);
+      int cv;
+      if (f.isConst(cv))
+        return 0.0;
+      return std::min(planOf(f).cost, planOf(notTT(f)).cost);
+    };
+    std::map<std::pair<std::vector<uint8_t>, bool>, Sig> wsCache;
+    bool fail = false;
+    unsigned nSel = 0;
+    auto selOf = [&](unsigned lvl, const std::vector<uint8_t> &on,
+                     bool wantNeg) -> Sig {
+      auto ck = std::make_pair(on, wantNeg);
+      std::vector<long> kv(on.begin(), on.end());
+      auto key = std::make_tuple(1000 + lvl, kv, wantNeg, std::vector<long>());
+      auto it = wsCache.find(ck);
+      if (it != wsCache.end())
+        return useSel(key, it->second);
+      auto r = buildSelect(b, loc, top, on, nL, wantNeg);
+      if (!r) {
+        fail = true;
+        return Sig{Value(), false, 0};
+      }
+      ++nSel;
+      Sig sel = *r;
+      if (sel.k < 0 && sel.neg != wantNeg) {
+        // the select in the polarity of its data: one shared inverter on the
+        // select, never one per datum
+        auto v = invOf(b, loc, top, sel.v);
+        if (!v) {
+          fail = true;
+          return Sig{Value(), false, 0};
+        }
+        annotateFanout(sel);
+        sel = Sig{*v, wantNeg, -1};
+      }
+      annotateFanout(sel);
+      wsCache[ck] = sel;
+      return useSel(key, sel);
+    };
+    // node copies ----------------------------------------------------------------
+    std::map<std::pair<long, unsigned>, Sig> copyMemo;
+    unsigned nCopies = 0;
+    auto copyOf = [&](long m, unsigned wi) -> Sig {
+      auto mk = std::make_pair(m, wi);
+      auto it = copyMemo.find(mk);
+      if (it != copyMemo.end())
+        return it->second;
+      auto act = activeOf(m, ws[wi], clip);
+      std::set<long> actS(act.begin(), act.end());
+      SmallVector<std::pair<Sig, Sig>> terms;
+      for (auto &g : grpOf[m]) {
+        std::vector<uint8_t> on(nA, 0);
+        for (unsigned A = 0; A < nA; ++A)
+          on[A] = uOf[A] >= 0 && actS.count(uOf[A]) && g.D.count(dg[KL][A]);
+        Sig s = selOf(KL, on, g.datum.neg);
+        if (fail)
+          return Sig{Value(), false, 0};
+        if (s.k == 0)
+          continue;
+        terms.push_back({s, g.datum});
+      }
+      Sig r{Value(), false, 0};
+      if (!terms.empty()) {
+        auto o = andOrMerged(b, loc, top, terms, caps[KL - 1]);
+        if (!o) {
+          fail = true;
+          return r;
+        }
+        r = *o;
+        ++nCopies;
+      }
+      return copyMemo[mk] = r;
+    };
+    // last level -------------------------------------------------------------------
+    unsigned nPass = 0, nTerms = 0;
+    SmallVector<Value> bits;
+    for (unsigned j = 0; j < W; ++j) {
+      long jj = (long)j - in.smin + (long)off;
+      struct T3 {
+        Sig datum;
+        int wi; // -1: an ungated (plain) node
+        long m;
+        std::set<long> D;
+      };
+      std::map<std::pair<SigId, int>, T3> groups;
+      std::vector<std::pair<SigId, int>> order;
+      for (auto &[d, _] : selArms[K]) {
+        long m = jj - d * SK;
+        if (m < 0 || grpOf[m].empty())
+          continue;
+        auto add = [&](Sig c, int wi) {
+          if (c.k >= 0)
+            return;
+          auto key = std::make_pair(idOf(c), wi);
+          if (!groups.count(key)) {
+            order.push_back(key);
+            groups[key] = T3{c, wi, m, {}};
+          }
+          groups[key].D.insert(d);
+        };
+        if (plain[m]) {
+          add(grpOf[m][0].datum, -1);
+          continue;
+        }
+        for (unsigned wi : nodeWins[m]) {
+          bool has = false;
+          for (auto it = wt.lower_bound(ws[wi].first);
+               it != wt.end() && it->first < ws[wi].second; ++it)
+            has |= it->first / SK == d;
+          if (!has)
+            continue;
+          Sig c = copyOf(m, wi);
+          if (fail)
+            return std::nullopt;
+          add(c, wi);
+        }
+      }
+      SmallVector<std::pair<Sig, Sig>> terms;
+      for (auto &key : order) {
+        T3 &g = groups[key];
+        std::set<long> actS;
+        if (g.wi >= 0) {
+          auto act = activeOf(g.m, ws[g.wi], clip);
+          actS.insert(act.begin(), act.end());
+        }
+        std::vector<uint8_t> must0(nA, 0);
+        bool any0 = false;
+        for (unsigned A = 0; A < nA; ++A) {
+          bool inD = uOf[A] >= 0 && g.D.count(dg[K][A]);
+          must0[A] = g.wi >= 0 ? (uOf[A] >= 0 && actS.count(uOf[A]) && !inD)
+                               : !inD;
+          any0 |= must0[A];
+        }
+        Sig s{Value(), false, 1};
+        if (any0) {
+          std::vector<uint8_t> ca(nA), cb(nA), cc(nA);
+          for (unsigned A = 0; A < nA; ++A) {
+            bool inD = uOf[A] >= 0 && g.D.count(dg[K][A]);
+            ca[A] = inD;
+            cb[A] = !must0[A];
+            cc[A] = inD && (g.wi < 0 || actS.count(uOf[A]));
+          }
+          const std::vector<uint8_t> *pick = &ca;
+          double best = 1e30;
+          for (auto *c : {&ca, &cb, &cc}) {
+            double cst = wsCache.count({*c, g.datum.neg}) ? 0.0 : selCostOf(*c);
+            if (cst < best - 1e-9) {
+              best = cst;
+              pick = c;
+            }
+          }
+          s = selOf(K, *pick, g.datum.neg);
+          if (fail)
+            return std::nullopt;
+        } else
+          ++nPass;
+        if (s.k == 0)
+          continue;
+        terms.push_back({s, g.datum});
+      }
+      nTerms += terms.size();
+      Sig o{Value(), false, 0};
+      if (terms.size() == 1 && terms[0].first.k == 1)
+        o = terms[0].second;
+      else if (!terms.empty()) {
+        auto r = andOrMerged(b, loc, top, terms, caps[K - 1]);
+        if (!r)
+          return std::nullopt;
+        o = *r;
+      }
+      auto v = materialize(b, loc, top, o);
+      if (!v)
+        return std::nullopt;
+      bits.push_back(*v);
+    }
+    if (verboseSel) {
+      llvm::errs() << "[map-shift-select] window form: windows";
+      for (auto &w : ws)
+        llvm::errs() << " [" << w.first << "," << w.second << ")";
+      unsigned nodes = 0;
+      for (auto &[m, _] : cons)
+        nodes += !plain[m] && !grpOf[m].empty();
+      llvm::errs() << " cost=" << bestCost << " nodes=" << nodes
+                   << " copies=" << nCopies << " single-copy nodes=" << nSingle
+                   << " selects=" << nSel
+                   << " last-level terms=" << nTerms << " pass-through=" << nPass
+                   << "\n";
+    }
+    return bits;
+  }
+
+  //--- general window form -----------------------------------------------------
+  //
+  // A block is a value of floor(u / s), s = stride of the gated level KL: the
+  // lower levels (shared, ungated) resolve u mod s. An output j needs, for an
+  // amount in block b, the lower-level node V_{KL-1}(j' - b*s). A window type
+  // t = (phase p, blocks [b0, b1]) gives node copies (m, t):
+  //     N_{m,t} = OR_{b in [b0,b1]} (S_{t,r(b)}) & V_{KL-1}(m - r(b)*s),
+  //     r(b) = (b - p) mod R_KL,  S_{t,r} = amount in a block of t with residue r
+  // which is live on the blocks of t only, and serves output j for block b
+  // when V_{KL-1}(m - r(b)*s) is the node that j needs for b. Types may
+  // overlap and have different phases. Every
+  // (output, block) requirement is covered by one copy (greedy cover: the copy
+  // covering most open requirements first); an output then ORs its copies,
+  // each under a select that is 1 on the blocks it takes from that copy and 0
+  // on the copy's other live blocks where the copy carries another node.
+  template <typename VFn, typename UseSelFn>
+  std::optional<SmallVector<Value>> buildWindowGeneral(
+      OpBuilder &b, Location loc, ModuleOp top, const RecipeIn &in, unsigned K,
+      const std::vector<long> &stride, ArrayRef<unsigned> Rs,
+      ArrayRef<unsigned> caps, const std::vector<long> &uOf, unsigned nA,
+      unsigned nL, unsigned W, unsigned off, VFn &V, UseSelFn &useSel) {
+    const unsigned KL = K - 1;
+    const long S = stride[KL];
+    const long R = Rs[KL - 1];
+    std::map<long, unsigned> bw; // block -> legal assignments
+    unsigned nLegal = 0;
+    for (unsigned A = 0; A < nA; ++A)
+      if (uOf[A] >= 0) {
+        ++bw[uOf[A] / S];
+        ++nLegal;
+      }
+    if (bw.empty())
+      return std::nullopt;
+    long bmin = bw.begin()->first, bmax = bw.rbegin()->first;
+    auto lower = [&](long x) -> Sig {
+      if (x < 0)
+        return Sig{Value(), false, 0};
+      return V(KL - 1, x, {});
+    };
+    auto rmod = [&](long b, long p) { return ((b - p) % R + R) % R; };
+    struct Ty {
+      long p, b0, b1;
+    };
+    // requirements: (output j, block b) -> lower-level node id
+    struct Req {
+      unsigned j;
+      long jj, b;
+      Sig need;
+    };
+    std::vector<Req> reqs;
+    std::map<unsigned, Sig> plainOut; // complete: every block needs one datum
+    for (unsigned j = 0; j < W; ++j) {
+      long jj = (long)j - in.smin + (long)off;
+      std::vector<Req> rj;
+      for (auto &[bb, _] : bw) {
+        Sig c = lower(jj - bb * S);
+        if (c.k >= 0)
+          continue;
+        rj.push_back({j, jj, bb, c});
+      }
+      bool same = in.complete && rj.size() == bw.size();
+      for (auto &r : rj)
+        same &= idOf(r.need) == idOf(rj[0].need);
+      if (same && !rj.empty()) {
+        plainOut[j] = rj[0].need;
+        continue;
+      }
+      reqs.insert(reqs.end(), rj.begin(), rj.end());
+    }
+    double A0 = windowCopyCost.getValue() / 100.0;
+    // greedy cover for a type set; returns cost and the assignment
+    auto cover = [&](const std::vector<Ty> &T, std::vector<int> *asg,
+                     std::vector<std::pair<long, int>> *nodes) -> double {
+      // candidate node of requirement i under type ti: m = jj - (b - r)*S
+      std::map<std::pair<long, int>, std::vector<unsigned>> cand;
+      for (unsigned i = 0; i < reqs.size(); ++i)
+        for (unsigned ti = 0; ti < T.size(); ++ti) {
+          const Ty &t = T[ti];
+          if (reqs[i].b < t.b0 || reqs[i].b > t.b1)
+            continue;
+          long m = reqs[i].jj - (reqs[i].b - rmod(reqs[i].b, t.p)) * S;
+          cand[{m, (int)ti}].push_back(i);
+        }
+      std::vector<int> who(reqs.size(), -1);
+      std::vector<std::pair<long, int>> picked;
+      unsigned open = reqs.size();
+      std::vector<uint8_t> done(reqs.size(), 0);
+      for (auto &x : who)
+        (void)x;
+      for (unsigned i = 0; i < reqs.size(); ++i) {
+        bool any = false;
+        for (unsigned ti = 0; ti < T.size() && !any; ++ti)
+          any = reqs[i].b >= T[ti].b0 && reqs[i].b <= T[ti].b1;
+        if (!any && windowDirect.getValue() == 0)
+          return 1e30;
+      }
+      double cost = 0;
+      unsigned terms = 0;
+      double Ad = windowDirect.getValue() / 100.0;
+      while (open) {
+        const std::pair<long, int> *best = nullptr;
+        unsigned bestN = 0;
+        double bestLive = 0, bestRatio = 1e30;
+        for (auto &[k, v] : cand) {
+          unsigned n = 0;
+          std::set<unsigned> o;
+          for (unsigned i : v)
+            if (!done[i])
+              ++n, o.insert(reqs[i].j);
+          if (!n)
+            continue;
+          const Ty &t = T[k.second];
+          double live = 0;
+          for (auto &[bb, w] : bw)
+            if (bb >= t.b0 && bb <= t.b1)
+              live += w;
+          if (Ad > 0) {
+            double ratio = (A0 + live / nLegal * (o.size() + 1)) / n;
+            if (ratio < bestRatio - 1e-12) {
+              best = &k;
+              bestN = n;
+              bestLive = live;
+              bestRatio = ratio;
+            }
+          } else if (n > bestN || (n == bestN && live < bestLive)) {
+            best = &k;
+            bestN = n;
+            bestLive = live;
+          }
+        }
+        if (Ad > 0 && (!best || bestRatio > Ad)) {
+          // the rest directly from the lower nodes (one shared node per x)
+          std::map<long, int> dn;
+          for (unsigned i = 0; i < reqs.size(); ++i)
+            if (!done[i]) {
+              long x = reqs[i].jj - reqs[i].b * S;
+              if (!dn.count(x)) {
+                dn[x] = picked.size();
+                picked.push_back({x, -1});
+              }
+              done[i] = 1;
+              who[i] = dn[x];
+              --open;
+              cost += Ad;
+              ++terms;
+            }
+          break;
+        }
+        if (!best || !bestN)
+          return 1e30;
+        std::set<unsigned> outs;
+        for (unsigned i : cand[*best])
+          if (!done[i]) {
+            done[i] = 1;
+            who[i] = picked.size();
+            outs.insert(reqs[i].j);
+            --open;
+          }
+        cost += A0 + bestLive / nLegal * (outs.size() + 1);
+        terms += outs.size();
+        picked.push_back(*best);
+      }
+      cost += 0.5 * terms + 1.0 * T.size() * R;
+      if (asg)
+        *asg = who;
+      if (nodes)
+        *nodes = picked;
+      return cost;
+    };
+    // window types: explicit, or a search
+    std::vector<Ty> T;
+    double bestCost = 1e30;
+    if (!windowTypes.getValue().empty()) {
+      std::vector<WTy> pt;
+      std::string e;
+      if (!parseTypes(windowTypes.getValue(), pt, e)) {
+        windowNote = "window-types: " + e;
+        return std::nullopt;
+      }
+      for (auto &t : pt) {
+        if (t.p >= R || t.b0 < bmin || t.b1 > bmax) {
+          windowNote = "window-types: '" + std::to_string(t.p) + ":" +
+                       std::to_string(t.b0) + "-" + std::to_string(t.b1) +
+                       "' is outside phase 0.." + std::to_string(R - 1) +
+                       ", blocks " + std::to_string(bmin) + ".." +
+                       std::to_string(bmax);
+          return std::nullopt;
+        }
+        T.push_back({t.p, t.b0, t.b1});
+      }
+      bestCost = cover(T, nullptr, nullptr);
+    } else {
+      std::vector<Ty> all;
+      for (long p = 0; p < R; ++p)
+        for (long l = bmin; l <= bmax; ++l)
+          for (long h = l; h <= bmax; ++h)
+            all.push_back({p, l, h});
+      unsigned mx = std::min(3u, std::max(1u, windowTypesMax.getValue()));
+      std::vector<unsigned> idx;
+      std::function<void(unsigned)> rec = [&](unsigned from) {
+        if (!idx.empty()) {
+          std::vector<Ty> cand;
+          for (unsigned i : idx)
+            cand.push_back(all[i]);
+          double c = cover(cand, nullptr, nullptr);
+          if (c < bestCost - 1e-9) {
+            bestCost = c;
+            T = cand;
+          }
+        }
+        if (idx.size() == mx)
+          return;
+        for (unsigned i = from; i < all.size(); ++i) {
+          idx.push_back(i);
+          rec(i + 1);
+          idx.pop_back();
+        }
+      };
+      rec(0);
+    }
+    if (bestCost > 1e29) {
+      if (!windowTypes.getValue().empty())
+        windowNote = "window-types: the types do not cover every block need";
+      return std::nullopt;
+    }
+    std::vector<int> asg;
+    std::vector<std::pair<long, int>> nodes;
+    cover(T, &asg, &nodes);
+    // selects
+    std::map<std::pair<std::vector<uint8_t>, bool>, Sig> wsCache;
+    bool fail = false;
+    unsigned nSel = 0;
+    auto selOf = [&](unsigned lvl, const std::vector<uint8_t> &on,
+                     bool wantNeg) -> Sig {
+      auto ck = std::make_pair(on, wantNeg);
+      std::vector<long> kv(on.begin(), on.end());
+      auto key = std::make_tuple(3000 + lvl, kv, wantNeg, std::vector<long>());
+      auto it = wsCache.find(ck);
+      if (it != wsCache.end())
+        return useSel(key, it->second);
+      auto r = buildSelect(b, loc, top, on, nL, wantNeg);
+      if (!r) {
+        fail = true;
+        return Sig{Value(), false, 0};
+      }
+      ++nSel;
+      Sig sel = *r;
+      if (sel.k < 0 && sel.neg != wantNeg) {
+        auto v = invOf(b, loc, top, sel.v);
+        if (!v) {
+          fail = true;
+          return Sig{Value(), false, 0};
+        }
+        annotateFanout(sel);
+        sel = Sig{*v, wantNeg, -1};
+      }
+      annotateFanout(sel);
+      wsCache[ck] = sel;
+      return useSel(key, sel);
+    };
+    auto selCostOf = [&](const std::vector<uint8_t> &on) {
+      TT f;
+      for (unsigned i = 0; i < nL; ++i)
+        f.vars.push_back(i);
+      f.bits = on;
+      f = normalizeTT(f);
+      int cv;
+      if (f.isConst(cv))
+        return 0.0;
+      return std::min(planOf(f).cost, planOf(notTT(f)).cost);
+    };
+    // the datum a copy carries for block bb
+    auto copyDatum = [&](const std::pair<long, int> &n, long bb) -> Sig {
+      if (n.second < 0)
+        return bw.count(bb) ? lower(n.first) : Sig{Value(), false, 0};
+      const Ty &t = T[n.second];
+      if (bb < t.b0 || bb > t.b1 || !bw.count(bb))
+        return Sig{Value(), false, 0};
+      return lower(n.first - rmod(bb, t.p) * S);
+    };
+    std::map<unsigned, Sig> copySig;
+    std::set<unsigned> plainCopies;
+    auto copyOf = [&](unsigned ni) -> Sig {
+      auto it = copySig.find(ni);
+      if (it != copySig.end())
+        return it->second;
+      const auto &n = nodes[ni];
+      if (n.second < 0) { // a lower node used directly: live everywhere
+        plainCopies.insert(ni);
+        return copySig[ni] = lower(n.first);
+      }
+      std::map<SigId, std::pair<Sig, std::set<long>>> g;
+      std::vector<SigId> order;
+      for (auto &[bb, _] : bw) {
+        Sig c = copyDatum(n, bb);
+        if (c.k >= 0)
+          continue;
+        auto id = idOf(c);
+        if (!g.count(id))
+          order.push_back(id);
+        g[id].first = c;
+        g[id].second.insert(bb);
+      }
+      const Ty &ty = T[n.second];
+      if (in.complete && order.size() == 1 && ty.b0 <= bmin && ty.b1 >= bmax &&
+          g[order[0]].second.size() == bw.size())
+      {
+        plainCopies.insert(ni);
+        return copySig[ni] = g[order[0]].first; // live everywhere, no cell
+      }
+      SmallVector<std::pair<Sig, Sig>> terms;
+      for (auto &id : order) {
+        auto &[d, B] = g[id];
+        std::vector<uint8_t> on(nA, 0);
+        for (unsigned A = 0; A < nA; ++A)
+          on[A] = uOf[A] >= 0 && B.count(uOf[A] / S);
+        Sig sl = selOf(KL, on, d.neg);
+        if (fail)
+          return Sig{Value(), false, 0};
+        if (sl.k == 0)
+          continue;
+        terms.push_back({sl, d});
+      }
+      Sig r{Value(), false, 0};
+      if (!terms.empty()) {
+        auto o = andOrMerged(b, loc, top, terms, caps[KL - 1]);
+        if (!o) {
+          fail = true;
+          return r;
+        }
+        r = *o;
+      }
+      return copySig[ni] = r;
+    };
+    // outputs
+    std::vector<std::vector<unsigned>> reqOf(W);
+    for (unsigned i = 0; i < reqs.size(); ++i)
+      reqOf[reqs[i].j].push_back(i);
+    unsigned nTerms = 0, nPass = 0;
+    std::set<unsigned> usedCopies;
+    SmallVector<Value> bits;
+    for (unsigned j = 0; j < W; ++j) {
+      if (plainOut.count(j)) {
+        auto v = materialize(b, loc, top, plainOut[j]);
+        if (!v)
+          return std::nullopt;
+        bits.push_back(*v);
+        continue;
+      }
+      std::map<int, std::set<long>> take; // copy -> blocks taken
+      for (unsigned i : reqOf[j])
+        take[asg[i]].insert(reqs[i].b);
+      SmallVector<std::pair<Sig, Sig>> terms;
+      // copies that are the same signal (plain copies) form one term
+      std::map<SigId, std::tuple<Sig, std::set<long>, std::vector<unsigned>>> grp;
+      std::vector<SigId> gorder;
+      for (auto &[ni, B] : take) {
+        Sig c = copyOf(ni);
+        if (fail)
+          return std::nullopt;
+        if (c.k >= 0)
+          continue;
+        usedCopies.insert(ni);
+        auto id = idOf(c);
+        if (!grp.count(id))
+          gorder.push_back(id);
+        auto &gg = grp[id];
+        std::get<0>(gg) = c;
+        std::get<1>(gg).insert(B.begin(), B.end());
+        std::get<2>(gg).push_back(ni);
+      }
+      for (auto &gid : gorder) {
+        auto &[c, B, members] = grp[gid];
+        unsigned ni = members[0];
+        // blocks where a member is live with another node than j needs
+        std::set<long> bad;
+        for (auto &[bb, _] : bw) {
+          if (B.count(bb))
+            continue;
+          long jj = (long)j - in.smin + (long)off;
+          Sig need = lower(jj - bb * S);
+          for (unsigned mi : members) {
+            Sig cd = plainCopies.count(mi) ? c : copyDatum(nodes[mi], bb);
+            if (cd.k >= 0)
+              continue;
+            if (need.k < 0 && idOf(need) == idOf(cd))
+              continue; // carries what j needs there too
+            bad.insert(bb);
+          }
+        }
+        Sig sl{Value(), false, 1};
+        if (!bad.empty()) {
+          std::vector<uint8_t> ca(nA), cb(nA), cc(nA);
+          const Ty t = nodes[ni].second >= 0 ? T[nodes[ni].second] : Ty{0, LONG_MIN, LONG_MAX};
+          for (unsigned A = 0; A < nA; ++A) {
+            long bb = uOf[A] >= 0 ? uOf[A] / S : LONG_MIN;
+            bool inB = uOf[A] >= 0 && B.count(bb);
+            ca[A] = inB;
+            cb[A] = !(uOf[A] >= 0 && bad.count(bb));
+            cc[A] = inB && (plainCopies.count(ni) || (bb >= t.b0 && bb <= t.b1));
+          }
+          const std::vector<uint8_t> *pick = &ca;
+          double best = 1e30;
+          for (auto *cnd : {&ca, &cb, &cc}) {
+            double cst = wsCache.count({*cnd, c.neg}) ? 0.0 : selCostOf(*cnd);
+            if (cst < best - 1e-9) {
+              best = cst;
+              pick = cnd;
+            }
+          }
+          sl = selOf(K, *pick, c.neg);
+          if (fail)
+            return std::nullopt;
+        } else
+          ++nPass;
+        if (sl.k == 0)
+          continue;
+        terms.push_back({sl, c});
+      }
+      // equal copies (shared Sigs) merge their selects through andOrMerged's
+      // datum grouping only when the selects agree; keep them as terms
+      nTerms += terms.size();
+      Sig o{Value(), false, 0};
+      SmallVector<std::pair<Sig, Sig>> tp, tn;
+      for (auto &t : terms)
+        (t.second.neg ? tn : tp).push_back(t);
+      if (terms.size() == 1 && terms[0].first.k == 1)
+        o = terms[0].second;
+      else if (!tp.empty() && !tn.empty()) {
+        // data of both polarities (copies and direct lower nodes): one
+        // AND-OR per polarity, then their OR
+        auto rp = andOrMerged(b, loc, top, tp, caps[K - 1]);
+        auto rn = andOrMerged(b, loc, top, tn, caps[K - 1]);
+        if (!rp || !rn)
+          return std::nullopt;
+        auto r = orReduce(b, loc, top, {*rp, *rn});
+        if (!r)
+          return std::nullopt;
+        o = *r;
+      } else if (!terms.empty()) {
+        auto r = andOrMerged(b, loc, top, terms, caps[K - 1]);
+        if (!r)
+          return std::nullopt;
+        o = *r;
+      }
+      auto v = materialize(b, loc, top, o);
+      if (!v)
+        return std::nullopt;
+      bits.push_back(*v);
+    }
+    if (verboseSel) {
+      std::set<long> pos;
+      std::set<SigId> cells;
+      for (unsigned ni : usedCopies)
+        if (!plainCopies.count(ni)) {
+          pos.insert(nodes[ni].first);
+          cells.insert(idOf(copySig[ni]));
+        }
+      llvm::errs() << "[map-shift-select] window form (general): types";
+      for (auto &t : T)
+        llvm::errs() << " " << t.p << ":" << t.b0 << "-" << t.b1;
+      llvm::errs() << " cost=" << bestCost << " copies=" << usedCopies.size()
+                   << " copy-cells=" << cells.size() << " positions=" << pos.size() << " requirements="
+                   << reqs.size() << " selects=" << nSel
+                   << " last-level terms=" << nTerms << " pass-through=" << nPass
+                   << "\n";
+    }
+    return bits;
+  }
+
   // Builds the output bits (LSB first); nullopt when a needed cell is missing.
   std::optional<SmallVector<Value>>
   attemptRecipe(OpBuilder &b, Location loc, ModuleOp top, const RecipeIn &in,
@@ -1182,12 +2252,14 @@ struct MapShiftSelectPass
     std::vector<std::map<long, SmallVector<Sig>>> selArms(K + 1);
     // direct decode: digit of every assignment, per level
     std::vector<std::vector<long>> dg;
+    std::vector<long> uOf; // window form: the shift (from the smallest) of an assignment
     unsigned nA = 0, nL = 0;
     if (in.dec) {
       const DecodeIn &d = *in.dec;
       nL = d.leaves.size();
       nA = 1u << nL;
       dg.assign(K + 1, std::vector<long>(nA, -1));
+      uOf.assign(nA, -1);
       for (unsigned A = 0; A < nA; ++A) {
         long sh = d.shiftOf[A];
         if (d.isDefault[A] && defaultDontCare.getValue() && d.affine)
@@ -1197,6 +2269,7 @@ struct MapShiftSelectPass
         long u = sh - in.smin + off;
         if (u < 0)
           return std::nullopt;
+        uOf[A] = u;
         for (unsigned k = 1; k <= K; ++k) {
           dg[k][A] = digit(k, u);
           selArms[k][dg[k][A]]; // present
@@ -1224,18 +2297,72 @@ struct MapShiftSelectPass
         return (*negBits)[bit];
       return Sig{extractBit(b, loc, in.root, bit), false, -1};
     };
-    std::map<std::tuple<unsigned, std::vector<long>, bool>, Sig> selCache;
+    using SelKey =
+        std::tuple<unsigned, std::vector<long>, bool, std::vector<long>>;
+    std::map<SelKey, Sig> selCache;
+    // select-dup-fanout: the copy of a select gate in use and its loads
+    std::map<SelKey, std::pair<Sig, unsigned>> selCur;
     bool selFail = false;
-    auto selFor = [&](unsigned k, const std::set<long> &D, bool wantNeg) {
+    auto useSel = [&](const SelKey &key, Sig base) -> Sig {
+      unsigned cap = selectDupFanout.getValue();
+      if (!in.dec || !cap || base.k >= 0 || !base.v ||
+          !isa_and_nonnull<hw::InstanceOp>(base.v.getDefiningOp()))
+        return base;
+      auto &u = selCur[key];
+      if (!u.first.v && u.first.k < 0) {
+        u.first = base;
+        u.second = 0;
+      }
+      if (u.second >= cap) {
+        Operation *c = b.clone(*base.v.getDefiningOp());
+        c->removeAttr(kIdAttr);
+        c->setAttr("instanceName",
+                   StringAttr::get(top.getContext(),
+                                   (Twine("shs_") + Twine(nCells++)).str()));
+        created.push_back(c);
+        u.first = Sig{c->getResult(0), base.neg, -1};
+        u.second = 0;
+      }
+      ++u.second;
+      return u.first;
+    };
+    std::function<Sig(unsigned, const std::set<long> &, bool,
+                      const std::vector<long> &)>
+        selFor = [&](unsigned k, const std::set<long> &D, bool wantNeg,
+                     const std::vector<long> &R) -> Sig {
       auto key = std::make_tuple(k, std::vector<long>(D.begin(), D.end()),
-                                 wantNeg);
+                                 wantNeg, R);
       auto it = selCache.find(key);
       if (it != selCache.end())
-        return it->second;
+        return useSel(key, it->second);
+      if (in.dec && !R.empty() && l2RangeCompose.getValue()) {
+        // select = digit select AND range select, each shared with the other
+        // selects of the same digit set / range (one AND cell per pair)
+        std::set<long> Rs(R.begin(), R.end());
+        std::optional<Sig> best;
+        for (int pol = 0; pol < 2 && !(best && best->neg == wantNeg); ++pol) {
+          Sig x = selFor(k, D, pol, {});
+          Sig y = selFor(K, Rs, pol, {});
+          if (selFail)
+            return selCache[key] = Sig{Value(), false, 0};
+          if (auto g = gate(b, loc, top, and2(), {x, y}))
+            if (!best || g->neg == wantNeg)
+              best = *g;
+        }
+        if (best) {
+          annotateFanout(*best);
+          selCache[key] = *best;
+          return useSel(key, *best);
+        }
+      }
       if (in.dec) {
         std::vector<uint8_t> on(nA, 0);
-        for (unsigned A = 0; A < nA; ++A)
+        for (unsigned A = 0; A < nA; ++A) {
           on[A] = dg[k][A] >= 0 && D.count(dg[k][A]);
+          if (on[A] && !R.empty())
+            on[A] = dg[K][A] >= 0 &&
+                    std::binary_search(R.begin(), R.end(), dg[K][A]);
+        }
         unsigned before = nCells;
         auto r = buildSelect(b, loc, top, on, nL, wantNeg);
         if (verboseSel && r) {
@@ -1250,7 +2377,8 @@ struct MapShiftSelectPass
           return selCache[key] = Sig{Value(), false, 0};
         }
         annotateFanout(*r);
-        return selCache[key] = *r;
+        selCache[key] = *r;
+        return useSel(key, *r);
       }
       SmallVector<Value> ops;
       for (long d : D)
@@ -1270,22 +2398,53 @@ struct MapShiftSelectPass
       return selCache[key] = Sig{v, wantNeg, -1};
     };
     bool ok = true;
-    std::map<std::pair<unsigned, long>, Sig> memo;
-    std::function<Sig(unsigned, long)> V = [&](unsigned k, long m) -> Sig {
+    std::map<std::tuple<unsigned, long, std::vector<long>>, Sig> memo;
+    // l2-range-gate: the level below the last one is gated by the range of
+    // last-digit values that consume the node.
+    unsigned gateW = in.dec && K >= 2 ? l2RangeGate.getValue() : 0;
+    auto consumers = [&](long m2) {
+      std::vector<long> r;
+      for (auto &[d, _] : selArms[K]) {
+        long j = m2 + d * stride[K] + in.smin - (long)off;
+        if (j >= 0 && j < (long)W)
+          r.push_back(d);
+      }
+      return r;
+    };
+    auto rangeOf = [&](long m2, long d) -> std::vector<long> {
+      std::vector<long> r;
+      if (l2RangeAligned.getValue()) {
+        for (auto &[x, _] : selArms[K])
+          if (x / (long)gateW == d / (long)gateW)
+            r.push_back(x);
+      } else
+        for (long x : consumers(m2))
+          if (x / (long)gateW == d / (long)gateW)
+            r.push_back(x);
+      if (r.size() >= selArms[K].size())
+        r.clear(); // every digit consumes it: nothing to gate
+      return r;
+    };
+    std::function<Sig(unsigned, long, const std::vector<long> &)> V =
+        [&](unsigned k, long m, const std::vector<long> &R) -> Sig {
       if (!ok)
         return Sig{Value(), false, 0};
       if (k == 0)
         return data0(m);
-      auto mk = std::make_pair(k, m);
+      auto mk = std::make_tuple(k, m, R);
       auto it = memo.find(mk);
       if (it != memo.end())
         return it->second;
       std::map<SigId, std::pair<Sig, std::set<long>>> groups;
+      std::map<SigId, bool> single; // last-level term whose node is range-exact
       for (auto &[d, _] : selArms[k]) {
         long m2 = m - d * stride[k];
         if (m2 < 0)
           continue;
-        Sig c = V(k - 1, m2);
+        std::vector<long> R2;
+        if (gateW && k == K)
+          R2 = rangeOf(m2, d);
+        Sig c = V(k - 1, m2, R2);
         if (!ok)
           return Sig{Value(), false, 0};
         if (c.k >= 0)
@@ -1293,15 +2452,25 @@ struct MapShiftSelectPass
         auto &g = groups[idOf(c)];
         g.first = c;
         g.second.insert(d);
+        if (gateW && k == K)
+          single[idOf(c)] = R2.size() == 1;
       }
       Sig r{Value(), false, 0};
-      if (groups.size() == 1 && in.complete &&
+      if (groups.size() == 1 && in.complete && R.empty() &&
           groups.begin()->second.second.size() == selArms[k].size()) {
         r = groups.begin()->second.first; // every digit selects the same datum
       } else if (!groups.empty()) {
         SmallVector<std::pair<Sig, Sig>> terms;
-        for (auto &[id, g] : groups)
-          terms.push_back({selFor(k, g.second, g.first.neg), g.first});
+        for (auto &[id, g] : groups) {
+          if (gateW && k == K && g.second.size() == 1 && single[id]) {
+            terms.push_back({Sig{Value(), false, 1}, g.first});
+            continue;
+          }
+          terms.push_back(
+              {selFor(k, g.second, g.first.neg,
+                      gateW && k + 1 == K ? R : std::vector<long>()),
+               g.first});
+        }
         if (selFail) {
           ok = false;
           return Sig{Value(), false, 0};
@@ -1315,9 +2484,24 @@ struct MapShiftSelectPass
       }
       return memo[mk] = r;
     };
+    if (in.dec && K >= 2 && windowForm.getValue() &&
+        windowGeneral.getValue()) {
+      auto r = buildWindowGeneral(b, loc, top, in, K, stride, Rs, caps, uOf,
+                                  nA, nL, W, off, V, useSel);
+      if (!ok)
+        return std::nullopt;
+      return r;
+    }
+    if (in.dec && K >= 2 && windowForm.getValue()) {
+      auto r = buildWindowForm(b, loc, top, in, K, stride, caps, dg, uOf,
+                               selArms, nA, nL, W, off, V, useSel);
+      if (!ok)
+        return std::nullopt;
+      return r;
+    }
     SmallVector<Value> bits;
     for (unsigned j = 0; j < W && ok; ++j) {
-      Sig o = V(K, (long)j - in.smin + (long)off);
+      Sig o = V(K, (long)j - in.smin + (long)off, {});
       if (!ok)
         break;
       auto v = materialize(b, loc, top, o);
@@ -1331,6 +2515,75 @@ struct MapShiftSelectPass
       return std::nullopt;
     return bits;
   }
+
+  // Window-form option parsers (also checked in the Python option check).
+  static constexpr size_t kMaxWindowCuts = 12;
+  static bool asciiDigits(StringRef t) {
+    if (t.empty() || t.size() > 9)
+      return false;
+    return llvm::all_of(t, [](char c) { return c >= '0' && c <= '9'; });
+  }
+  // "c1,c2,..." distinct ASCII integers (sorted on return), at most kMaxWindowCuts.
+  static bool parseCuts(StringRef s, std::vector<long> &out, std::string &err) {
+    SmallVector<StringRef> parts;
+    s.split(parts, ',', -1, false);
+    if (parts.empty()) {
+      err = "no cut";
+      return false;
+    }
+    if (parts.size() > kMaxWindowCuts) {
+      err = "more than " + std::to_string(kMaxWindowCuts) + " cuts";
+      return false;
+    }
+    for (StringRef p : parts) {
+      p = p.trim();
+      if (!asciiDigits(p)) {
+        err = "'" + p.str() + "' is not an ASCII integer";
+        return false;
+      }
+      long v = std::stol(p.str());
+      if (llvm::is_contained(out, v)) {
+        err = "duplicate cut " + p.str();
+        return false;
+      }
+      out.push_back(v);
+    }
+    std::sort(out.begin(), out.end());
+    return true;
+  }
+  struct WTy {
+    long p, b0, b1;
+  };
+  // "phase:first-last;..." ASCII integers, first <= last.
+  static bool parseTypes(StringRef s, std::vector<WTy> &out, std::string &err) {
+    SmallVector<StringRef> parts;
+    s.split(parts, ';', -1, false);
+    if (parts.empty()) {
+      err = "no window type";
+      return false;
+    }
+    for (StringRef pt : parts) {
+      auto [ph, rg] = pt.trim().split(':');
+      auto [lo, hi] = rg.split('-');
+      ph = ph.trim();
+      lo = lo.trim();
+      hi = hi.trim();
+      if (!asciiDigits(ph) || !asciiDigits(lo) || !asciiDigits(hi)) {
+        err = "'" + pt.str() + "' is not phase:first-last (ASCII integers)";
+        return false;
+      }
+      WTy t{std::stol(ph.str()), std::stol(lo.str()), std::stol(hi.str())};
+      if (t.b0 > t.b1) {
+        err = "'" + pt.str() + "': first > last";
+        return false;
+      }
+      out.push_back(t);
+    }
+    return true;
+  }
+  // Set when a requested window form could not be applied for its
+  // parameters; the pass then fails (applied or refused).
+  std::string windowErr, windowNote;
 
   static SmallVector<unsigned> parseList(StringRef s) {
     SmallVector<unsigned> r;
@@ -1454,6 +2707,7 @@ struct MapShiftSelectPass
     double best = 0;
     int bestIdx = -1;
     unsigned cells0 = nCells;
+    windowNote.clear();
     for (auto [i, c] : llvm::enumerate(cands)) {
       clearCaches();
       areaAcc = 0;
@@ -1468,8 +2722,11 @@ struct MapShiftSelectPass
         bestIdx = i;
       }
     }
-    if (bestIdx < 0)
+    if (bestIdx < 0) {
+      if (windowForm.getValue() && !windowNote.empty() && windowErr.empty())
+        windowErr = windowNote;
       return std::nullopt;
+    }
     clearCaches();
     areaAcc = 0;
     created.clear();
@@ -1782,6 +3039,21 @@ struct MapShiftSelectPass
       return signalPassFailure();
     }
     cellLib = &*lib;
+    if (windowForm.getValue()) {
+      std::string e;
+      std::vector<long> cv;
+      std::vector<WTy> tv;
+      if (!windowCuts.getValue().empty() &&
+          !parseCuts(windowCuts.getValue(), cv, e)) {
+        top.emitError("map-shift-select: window-cuts: ") << e;
+        return signalPassFailure();
+      }
+      if (!windowTypes.getValue().empty() &&
+          !parseTypes(windowTypes.getValue(), tv, e)) {
+        top.emitError("map-shift-select: window-types: ") << e;
+        return signalPassFailure();
+      }
+    }
     SmallVector<comb::OrOp> work;
     top.walk([&](comb::OrOp o) {
       if (o.getType().getIntOrFloatBitWidth() >= minWidth.getValue() &&
@@ -1807,6 +3079,12 @@ struct MapShiftSelectPass
     for (comb::OrOp o : work)
       if (rewrite(o, top, nDeclined))
         ++nDone;
+    if (!windowErr.empty()) {
+      top.emitError("map-shift-select: window form requested but not "
+                    "applied: ")
+          << windowErr;
+      return signalPassFailure();
+    }
     if (nDone || nDeclined)
       llvm::errs() << "[map-shift-select] " << nDone
                    << " one-hot select(s) built as radix-" << radix.getValue()

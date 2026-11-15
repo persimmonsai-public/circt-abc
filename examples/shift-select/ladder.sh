@@ -16,7 +16,7 @@
 #
 # <out_dir> may not be inside this repository. ORFS runs in place under
 # $ORFS_HOME, else in the ORFS image with docker (as for `--pnr`); the rungs
-# are local processes. A cluster can run them instead: CIRCT_FLOW_LADDER_SUBMIT
+# are local processes. A cluster can run them instead: pnr.ladder.submit
 # (doc/ladder.md, "Where jobs run"). The values of flow_ladder.yaml are
 # illustrative (hold slack of at least 20 ps): ASAP7 closes hold at margin 0
 # on this design, so the ladder has nothing to do without them.
@@ -31,7 +31,7 @@ cfg="$here/designs/align_unit/flow_ladder.yaml"
 
 python3 -I "$root/examples/asap7-mvt/lib/make_libs.py" "$here/lib" >/dev/null
 cd "$root/scripts"
-export CIRCT_FLOW_NO_CLOCK_GATING=1 CIRCT_FLOW_OUTLINE_AFTER_FLATTEN=1
+# clock gating off and outline-after-flatten: the flow configs' options:
 
 if [ ! -f "$out/syn/1_synth/align_unit_openroad.v" ]; then
   echo "[ladder] synthesis -> $out/syn"

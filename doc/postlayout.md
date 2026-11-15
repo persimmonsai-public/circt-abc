@@ -139,6 +139,9 @@ stage's own additions, and the SPEF; clocks are propagated.
 | `ladder_escalate` | (none) | token the closing pass may use |
 | `close_margin_ps` | 0 | slack the closing pass works to |
 | `recover_swap` | 0 | pair recovery over this many cells (0 = off) |
+| `recover_opts` | (none) | `seq_first`, `seq_pair`, `comp=N`, `pass=N`, `blk=<regex>@<ps>` (doc/passes.md, "Leakage-swap keys") |
+| `recover_block` | (none) | `<regex>@<ps>`: block tail recovery after the pair recovery, its own slack floor in ps (required with it; at most `margin_ps`) |
+| `flop_cap` | (none) | ladder token above which no flop is moved |
 | `hold_scope` | `r2r` | `r2r` or `all` |
 | `hold_tol_ps` | 0 | hold slack a move may lose below the endpoint's floor |
 | `false_from` | [] | input ports not optimised |
@@ -148,7 +151,8 @@ stage's own additions, and the SPEF; clocks are propagated.
 
 Times are in ps and converted to the libraries' time unit. The command line
 takes the same options (`--margin-ps`, `--recover-order`, `--ladder-cap`,
-`--ladder-escalate`, `--close-margin-ps`, `--recover-swap`, `--hold-tol-ps`,
+`--ladder-escalate`, `--close-margin-ps`, `--recover-swap`, `--recover-opts`,
+`--recover-block`, `--flop-cap`, `--hold-tol-ps`,
 `--false-from`, `--false-to`, `--also-spef`, `--no-spef-restore-pincap`, ...; see `--help`).
 
 The same leakage controls exist for the synthesis-time swap: the flow

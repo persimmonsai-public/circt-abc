@@ -76,6 +76,10 @@ createRemoveDeadRegistersPass();
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createClockGateInferencePass();
 
+/// See Passes.td's DataGateEnables description.
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
+createDataGateEnablesPass();
+
 /// See Passes.td's NarrowDeadRegisterBits description.
 std::unique_ptr<mlir::OperationPass<circt::hw::HWModuleOp>>
 createNarrowDeadRegisterBitsPass();

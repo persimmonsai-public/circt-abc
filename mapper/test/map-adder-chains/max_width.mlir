@@ -3,6 +3,8 @@
 // max-width bounds the ripple lowering to short chains: the 12- and 16-bit
 // adds become cell chains, the 40-bit add stays a comb.add.
 //
+// RUN: circt-abc-opt "--map-adder-chains=enable-adder-chains=true liberty=%S/adders.lib min-width=50" %s 2>&1 | FileCheck %s --check-prefix=NONE
+// NONE: [map-adder-chains] lowered 0 comb.add op(s) (no add in the width window)
 // CHECK: lowered 2 comb.add op(s)
 // CHECK: comb.add {{.*}} : i40
 

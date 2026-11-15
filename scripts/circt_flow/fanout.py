@@ -258,7 +258,8 @@ def run(cfg, spec: FanoutSpec) -> dict:
     """The flow stage: buffer the run's OpenSTA netlist in place, keeping
     the unbuffered one as <top>_prebuf_openroad.v; writes <out>/fanout.json.
     """
-    from . import intent, profile as profile_mod
+    from . import intent, profile as profile_mod, stages as _st
+    _st.record_step("fanout", "fanout.run", repr(spec))
     d = cfg.design
     nl = cfg.openroad_netlist
     if not nl.exists():

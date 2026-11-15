@@ -186,10 +186,18 @@ struct MapAdderChainsPass
     }
     const FullAdderCellPattern *fa = lib->lookupFullAdder();
     const HalfAdderCellPattern *ha = lib->lookupHalfAdder();
+    // One report line per enabled run, also when it lowers nothing: the
+    // flow attributes the lines to the pass instances of its command in
+    // order (scoping.py: a scoped window that lowered nothing is refused).
+    auto reportNone = [&](StringRef why) {
+      llvm::errs() << "[map-adder-chains] lowered 0 comb.add op(s) (" << why
+                   << ")\n";
+    };
     if (!fa) {
       // Without a full adder there is no chain to build; a half adder alone
-      // only covers bit 0. Silently do nothing, like every other
-      // liberty-driven pass here.
+      // only covers bit 0. Do nothing, like every other liberty-driven pass
+      // here.
+      reportNone("no full adder cell in the liberty");
       return;
     }
 
@@ -202,6 +210,8 @@ struct MapAdderChainsPass
       hwmod.walk([&](comb::AddOp add) {
         if (add.getNumOperands() != 2)
           return; // variadic adds are lowered to pairs upstream
+        if (add->hasAttr("circt_abc.no_adder_cells"))
+          return; // map-compressor-cells map-final-adder: left to ABC
         auto ty = dyn_cast<IntegerType>(add.getType());
         if (!ty || ty.getWidth() < minWidth.getValue() ||
             (maxWidth.getValue() && ty.getWidth() > maxWidth.getValue()))
@@ -225,8 +235,10 @@ struct MapAdderChainsPass
           return;
         targets.push_back(add);
       });
-    if (targets.empty())
+    if (targets.empty()) {
+      reportNone("no add in the width window");
       return;
+    }
 
     CellDecl faDecl = getOrCreateDecl(
         top, fa->name,
@@ -235,6 +247,7 @@ struct MapAdderChainsPass
     if (!faDecl.valid) {
       top.emitWarning("map-adder-chains: existing declaration of ")
           << fa->name << " does not match the liberty pin names; skipping";
+      reportNone("cell declaration mismatch");
       return;
     }
     std::optional<CellDecl> haDecl;

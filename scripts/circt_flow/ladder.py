@@ -1132,6 +1132,13 @@ class Ladder:
                "CIRCT_FLOW_LADDER_VALUE": json.dumps(spec.values[i]),
                "CIRCT_FLOW_OUT": str(self.out),
                "CIRCT_FLOW_PNR_METRICS": str(d / "pnr_metrics.json")}
+        # the pack settings the rung's command was handed (stages.pack_command
+        # writes them into the rung's directory); unset when there are none.
+        # Their content is part of the rung's plan, so a cached verdict is
+        # one made with the same settings.
+        env.pop("CIRCT_FLOW_PACK_SETTINGS", None)
+        if (d / "pack_settings.json").is_file():
+            env["CIRCT_FLOW_PACK_SETTINGS"] = str(d / "pack_settings.json")
         job = Job(f"check rung {i}", list(spec.accept.command), env, d,
                   d / "check.log")
         try:
@@ -1836,18 +1843,22 @@ class CommandBackend(_FlowBackend):
             q = Path(w)
             return q if q.is_absolute() else root / q
         # What is covered: the whole command line, the content of every word
-        # of it that is a file (the script), the netlist and SDC it is given,
-        # every `pnr:` option, and the files and directories the pack lists in
-        # `stage_inputs` (its data). Nothing else the command reads is known.
+        # of it that is a file (the script, and the pack settings file the
+        # flow writes into the job's own directory: its content counts, its
+        # directory does not, `<dir>` in the words), the netlist and SDC it
+        # is given, every `pnr:` option, and the files and directories the
+        # pack lists in `stage_inputs` (its data). Nothing else the command
+        # reads is known.
         extra = {str(x): _path_sha(Path(x)) for x in
                  (self.cfg.design.pack_pnr.get("stage_inputs") or [])}
+        shown = [w.replace(here, "<dir>") for w in words]
         return {"version": FORMAT,
                 "flow_env": {k: v for k, v in flow_env.items()
                              if k not in flow_env_files},
                 "flow_env_files": flow_env_files,
-                "tool": {"command": words,
-                         "command_files": {w: _file_sha(as_path(w))
-                                           for w in words
+                "tool": {"command": shown,
+                         "command_files": {k: _file_sha(as_path(w))
+                                           for k, w in zip(shown, words)
                                            if as_path(w).is_file()},
                          "stage_inputs": extra},
                 "inputs": {"netlist": _file_sha(d / f"{top}.v"),
@@ -1994,12 +2005,18 @@ def run_flow(cfg, mode: Optional[str] = None, jobs: Optional[int] = None,
         over["jobs"] = jobs
     if fresh:
         over["fresh"] = True
-    submit = os.environ.get("CIRCT_FLOW_LADDER_SUBMIT")
+    from . import options
+    S = options.of(cfg)
+    # run.ladder.submit / .cancel: pnr.ladder's own keys are in `spec`; an
+    # argument or the legacy variable replaces them
+    submit = (S["run.ladder.submit"]
+              if S.source("run.ladder.submit") in ("argument", "env") else None)
     if submit:
         check_template(submit, SUBMIT_KEYS, "CIRCT_FLOW_LADDER_SUBMIT",
                        (("cmd", "cmdq"),))
         over["submit"] = submit
-    cancel = os.environ.get("CIRCT_FLOW_LADDER_CANCEL")
+    cancel = (S["run.ladder.cancel"]
+              if S.source("run.ladder.cancel") in ("argument", "env") else None)
     if cancel:
         check_template(cancel, CANCEL_KEYS, "CIRCT_FLOW_LADDER_CANCEL", ("name",))
         over["cancel"] = cancel

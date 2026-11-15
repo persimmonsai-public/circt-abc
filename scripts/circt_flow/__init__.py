@@ -14,5 +14,6 @@ console entry point installed by this package's own __main__.py.
 """
 
 from .config import FlowConfig
+from .session import Session, SessionError, ScopedSetting
 
-__all__ = ["FlowConfig"]
+__all__ = ["FlowConfig", "Session", "SessionError", "ScopedSetting"]

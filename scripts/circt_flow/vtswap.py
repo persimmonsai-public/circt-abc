@@ -67,6 +67,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,7 +78,49 @@ STA_BIN = "/OpenROAD-flow-scripts/tools/install/OpenROAD/bin/sta"
 VT_SWAP_KEYS = {"enabled", "false_from", "paths", "max_iter", "recover",
                 "margin_ps", "keep_clock_cells", "false_to", "fix",
                 "sens_frac", "recover_order", "ladder_cap",
-                "allow_footprint_change", "ladder_escalate", "close_margin_ps"}
+                "allow_footprint_change", "ladder_escalate", "close_margin_ps",
+                "flop_cap"}
+
+
+
+def tcl_word(s: str) -> str:
+    """`s` as one Tcl word, every character literal (a double-quoted word
+    with backslash, brackets, dollar, quote and braces escaped)."""
+    return '"' + "".join("\\" + c if c in '\\[]$"{}' else c for c in s) + '"'
+
+
+# Tcl of LayoutSpec.recover_block_re (template value `blk_pass`, after the pair recovery; "" by default, so the default
+# script is unchanged). %s: the regular expression as a Tcl word, the floor in the libraries' time unit.
+BLK_PASS = r"""# 2c. Block tail recovery (opt-in, post.recover.block): cells whose instance name matches the regular expression
+# go down with their own slack floor (below the global margin); other cells are not touched.
+set opt_blk_re %s
+set opt_blk_floor %s
+set floor3 [expr {[wns] < $opt_blk_floor ? [wns] : $opt_blk_floor}]
+set floor3 [expr {$floor3 < $floor ? $floor3 : $floor}]
+# Recorded (stat lines): the cells the expression matched, and 1 when the global floor is below the block floor
+# (the block floor is then not reached: the block recovers no deeper than the global state allows).
+set blk_n 0
+foreach inst [get_cells -hierarchical *] {
+  if {[regexp -- $opt_blk_re [get_full_name $inst]]} { incr blk_n }
+}
+set eco_stat(blk_matched) $blk_n
+set eco_stat(blk_floor_clamped) [expr {$floor < $opt_blk_floor - 1e-9 ? 1 : 0}]
+set changed 1
+while {$changed} {
+  set keyed {}
+  foreach inst [get_cells -hierarchical *] {
+    if {[flav_index [get_property $inst ref_name]] > 0 && ![is_clock_cell $inst] && [regexp -- $opt_blk_re [get_full_name $inst]]} {
+      lappend keyed [list [leak_of [get_property $inst ref_name]] $inst]
+    }
+  }
+  set cand {}
+  foreach kv [lsort -real -decreasing -index 0 $keyed] { lappend cand [lindex $kv 1] }
+  set changed 0
+  for {set i 0} {$i < [llength $cand]} {incr i 256} {
+    incr changed [try_down [lrange $cand $i [expr {$i + 255}]] $floor3 $tfloor]
+  }
+}
+"""
 
 
 @dataclass(frozen=True)
@@ -135,10 +178,27 @@ class LayoutSpec:
     # the saving), keeping the pair only if the worst slack stays at the floor.
     # 0 is off.
     recover_swap: int = 0
+    # Comma list of recovery refinements (leakage recovery): "seq_first" puts
+    # sequential cells first in every recovery pass, "comp=N" lets a pair
+    # take up to N compensating cells, "seq_pair" puts sequential cells first
+    # among the pair candidates.
+    recover_opts: str = ""
     # Second wire view (opt-in): with two corners, a third corner `setup2`
     # (the setup libraries, this SPEF) is timed too, so the worst slack the
     # fix and recovery see is the worst over both parasitic views.
     spef2: Optional[Path] = None
+    # Block tail recovery (opt-in, post.recover.block): after the pair recovery, the cells whose instance name matches
+    # `recover_block_re` (a Tcl regular expression) go down with their own slack floor `recover_block_floor` (libraries'
+    # time unit); other cells are not touched. "" is off (the script is unchanged).
+    recover_block_re: str = ""
+    recover_block_floor: float = 0.0
+
+    def blk_tcl(self, recover: bool) -> str:
+        """The block tail recovery pass (text of the template value
+        `blk_pass`, after the pair recovery); "" when it is off."""
+        if not (recover and self.recover_block_re):
+            return ""
+        return BLK_PASS % (tcl_word(self.recover_block_re), "%g" % self.recover_block_floor)
 
     def pre_tcl(self, hold_libs: bool = False) -> str:
         spef = Path(self.spef).resolve() if self.spef else None
@@ -207,6 +267,13 @@ set escalate_idx [lsearch -exact $flavours {%(esc)s}]
 if {"%(esc)s" eq ""} { set escalate_idx -1 }
 set close_margin %(close)s
 set recover_swap %(rswap)d
+set ropts {%(ropts)s}
+set opt_seq_first [expr {[lsearch -exact $ropts seq_first] >= 0}]
+set opt_seq_pair [expr {[lsearch -exact $ropts seq_pair] >= 0}]
+set opt_comp 1
+set opt_pass 1
+foreach o $ropts { if {[regexp {^comp=([0-9]+)$} $o -> n]} { set opt_comp $n }; if {[regexp {^pass=([0-9]+)$} $o -> n]} { set opt_pass $n } }
+proc is_seq {inst} { return [regexp {DFF} [get_property $inst ref_name]] }
 proc leak_of {ref} {
   global leak_tab
   if {[dict exists $leak_tab $ref]} { return [dict get $leak_tab $ref] }
@@ -341,6 +408,7 @@ proc eco_ok {inst from to} {
         "rleak": int(self.recover_order == "leak"), "cap": self.ladder_cap,
         "esc": self.ladder_escalate, "close": "%g" % self.close_margin,
         "rswap": int(self.recover_swap),
+        "ropts": " ".join(x.strip() for x in self.recover_opts.split(",") if x.strip()),
         "leaks": " ".join("{%s} %.9g" % (c, v) for c, v in
                           sorted((self.leakage or {}).items()))
         if (self.fix == "sens" or self.recover_order == "leak"
@@ -386,6 +454,10 @@ class VtSwapSpec:
     # for what the capped fix left short of `close_margin_ps`.
     ladder_escalate: str = ""
     close_margin_ps: float = 0.0
+    # A ladder token above which the swap never moves a flop (cell names
+    # matching DFF); "" is no cap. The legacy variable CIRCT_VT_FLOP_CAP
+    # (option syn.vt_swap.flop_cap / post.flop_cap) is read during the transition.
+    flop_cap: str = ""
 
 
 def false_to_sdc(false_to) -> str:
@@ -405,7 +477,7 @@ def check_leakage_keys(d: dict, where: str) -> None:
         raise VtSwapError(f"{where}.sens_frac must be a number in (0, 1]")
     if d.get("recover_order", "inst") not in ("inst", "leak"):
         raise VtSwapError(f"{where}.recover_order must be inst or leak")
-    for k in ("ladder_cap", "ladder_escalate"):
+    for k in ("ladder_cap", "ladder_escalate", "flop_cap"):
         if not isinstance(d.get(k, ""), str):
             raise VtSwapError(f"{where}.{k} must be a ladder token")
     cm = d.get("close_margin_ps", 0.0)
@@ -423,9 +495,12 @@ def check_leakage_keys(d: dict, where: str) -> None:
                           "false")
 
 
-def check_ladder_tokens(cap: str, esc: str, tokens, where: str) -> None:
-    """`ladder_cap` / `ladder_escalate` name tokens of the pack's ladder."""
-    for k, v in (("ladder_cap", cap), ("ladder_escalate", esc)):
+def check_ladder_tokens(cap: str, esc: str, tokens, where: str,
+                        flop_cap: str = "") -> None:
+    """`ladder_cap` / `ladder_escalate` / `flop_cap` name tokens of the
+    pack's ladder."""
+    for k, v in (("ladder_cap", cap), ("ladder_escalate", esc),
+                 ("flop_cap", flop_cap)):
         if v and v not in tokens:
             raise VtSwapError(f"{where}.{k} {v!r} is not a token of the "
                               f"pack's vt_flavours ({', '.join(tokens)})")
@@ -470,7 +545,8 @@ def parse_vt_swap(d, where) -> VtSwapSpec:
                       d.get("recover_order", "inst"), d.get("ladder_cap", ""),
                       bool(d.get("allow_footprint_change", False)),
                       d.get("ladder_escalate", ""),
-                      float(d.get("close_margin_ps", 0.0)))
+                      float(d.get("close_margin_ps", 0.0)),
+                      d.get("flop_cap", ""))
 
 
 def parse_flavours(d, where) -> Optional[dict]:
@@ -506,6 +582,8 @@ def parse_flavours(d, where) -> Optional[dict]:
 TCL = r'''
 set flavours {%(flavours)s}
 set fre {%(fre)s}
+set flop_cap_idx [lsearch -exact $flavours {%(fcap)s}]
+if {"%(fcap)s" eq ""} { set flop_cap_idx -1 }
 # Per-rail flavour lists (chip view): {<rail>__ {tokens re} ...}; cells of
 # no listed rail use the defaults above.
 set rail_fl_default [list $flavours $fre]
@@ -605,6 +683,11 @@ proc hold_bad_paths {} {
 proc eco_ok {inst from to} { return 1 }
 set recover_leak 0
 set recover_swap 0
+set opt_seq_first 0
+set opt_seq_pair 0
+set opt_comp 1
+set opt_pass 1
+proc is_seq {inst} { return 0 }
 set ladder_cap_idx -1
 set escalate_idx -1
 set close_margin 0
@@ -622,6 +705,7 @@ proc move {inst dir} {
   for {set k2 [expr {$k + $dir}]} {$k2 >= 0 && $k2 < [llength $::flavours]} \
       {incr k2 $dir} {
     if {$dir > 0 && $::ladder_cap_idx >= 0 && $k2 > $::ladder_cap_idx} { return "" }
+    if {$dir > 0 && $::flop_cap_idx >= 0 && $k2 > $::flop_cap_idx && [regexp {DFF} $ref]} { return "" }
     set n [flav_swap $ref $k2]
     set lc [lib_cell_of $n]
     if {$lc ne "" && [eco_ok $inst $ref $n]} {
@@ -776,6 +860,11 @@ if {%(recover)d} {
       set cand {}
       foreach kv [lsort -real -decreasing -index 0 $keyed] { lappend cand [lindex $kv 1] }
     }
+    if {$opt_seq_first} {
+      set sq {}; set cb {}
+      foreach inst $cand { if {[is_seq $inst]} { lappend sq $inst } else { lappend cb $inst } }
+      set cand [concat $sq $cb]
+    }
     set changed 0
     for {set i 0} {$i < [llength $cand]} {incr i 256} {
       incr changed [try_down [lrange $cand $i [expr {$i + 255}]] $floor $tfloor]
@@ -784,7 +873,7 @@ if {%(recover)d} {
 }
 # 2b. Pair recovery (opt-in): a cell the plain recovery could not move down
 # goes down together with a cheaper compensating cell on the worst path.
-if {%(recover)d && $recover_swap > 0} {
+for {set pr 0} {$pr < $opt_pass && %(recover)d && $recover_swap > 0} {incr pr} {
   set floor2 [expr {[wns] < $margin ? [wns] : $margin}]
   set floor2 [expr {$floor2 < $floor ? $floor2 : $floor}]
   set cand {}
@@ -794,6 +883,11 @@ if {%(recover)d && $recover_swap > 0} {
     }
   }
   set cand [lsort -real -decreasing -index 0 $cand]
+  if {$opt_seq_pair} {
+    set sq {}; set cb {}
+    foreach kv $cand { if {[is_seq [lindex $kv 1]]} { lappend sq $kv } else { lappend cb $kv } }
+    set cand [concat $sq $cb]
+  }
   set ndone 0; set npair 0
   foreach kv [lrange $cand 0 [expr {$recover_swap - 1}]] {
     set inst [lindex $kv 1]
@@ -804,41 +898,44 @@ if {%(recover)d && $recover_swap > 0} {
     if {[holds $floor2 $tfloor]} {
       puts $rec "down [get_full_name $inst] $ref $to"; incr ndone; continue
     }
-    # compensate: best cell on the worst path (one step up, under the cap)
-    set best ""; set bw -1e9
-    foreach pe [find_timing_paths -path_delay max -group_path_count 1 -sort_by_slack] {
-      foreach pin [[$pe path] pins] {
-        set i2 [$pin instance]
-        if {$i2 eq "" || $i2 eq "NULL" || $i2 eq $inst} { continue }
-        if {[$i2 liberty_cell] eq "NULL" || [is_clock_cell $i2]} { continue }
-        set r2 [get_property $i2 ref_name]
-        set t2 [move $i2 1]
-        if {$t2 eq ""} { continue }
-        set cost [expr {[leak_of $t2] - [leak_of $r2]}]
-        # the pair must save leakage: the compensating move may cost at most
-        # nine tenths of what the first move saves
-        if {$cost < $saved * 0.9} {
-          set w2 [wns]
-          if {$w2 > $bw} { set bw $w2; set best [list $i2 $r2 $t2] }
+    # compensate: best cell on the worst path (one step up, under the cap);
+    # with comp=N up to N such cells, their leakage cost together < 0.9 x the saving
+    set ups {}; set spent 0.0; set okp 0
+    for {set ci 0} {$ci < $opt_comp} {incr ci} {
+      set best ""; set bw -1e9; set bc 0.0
+      foreach pe [find_timing_paths -path_delay max -group_path_count 1 -sort_by_slack] {
+        foreach pin [[$pe path] pins] {
+          set i2 [$pin instance]
+          if {$i2 eq "" || $i2 eq "NULL" || $i2 eq $inst} { continue }
+          if {[$i2 liberty_cell] eq "NULL" || [is_clock_cell $i2]} { continue }
+          set r2 [get_property $i2 ref_name]
+          set t2 [move $i2 1]
+          if {$t2 eq ""} { continue }
+          set cost [expr {[leak_of $t2] - [leak_of $r2]}]
+          if {$spent + $cost < $saved * 0.9} {
+            set w2 [wns]
+            if {$w2 > $bw} { set bw $w2; set best [list $i2 $r2 $t2]; set bc $cost }
+          }
+          replace_cell $i2 [lib_cell_of $r2]
         }
-        replace_cell $i2 [lib_cell_of $r2]
       }
-    }
-    if {$best ne ""} {
+      if {$best eq ""} { break }
       lassign $best i2 r2 t2
       replace_cell $i2 [lib_cell_of $t2]
-      if {[holds $floor2 $tfloor] && ![hold_bad]} {
-        puts $rec "down [get_full_name $inst] $ref $to"
-        puts $rec "up pair [get_full_name $i2] $r2 $t2"
-        incr npair; continue
-      }
-      replace_cell $i2 [lib_cell_of $r2]
+      lappend ups $best; set spent [expr {$spent + $bc}]
+      if {[holds $floor2 $tfloor]} { set okp 1; break }
     }
+    if {$okp && ![hold_bad]} {
+      puts $rec "down [get_full_name $inst] $ref $to"
+      foreach u $ups { puts $rec "up pair [get_full_name [lindex $u 0]] [lindex $u 1] [lindex $u 2]" }
+      incr npair; continue
+    }
+    foreach u [lreverse $ups] { replace_cell [lindex $u 0] [lib_cell_of [lindex $u 1]] }
     replace_cell $inst [lib_cell_of $ref]
   }
   puts $rec "pairrec singles $ndone pairs $npair"
 }
-lap recovered
+%(blk_pass)slap recovered
 puts $rec "end [format %%.6f [wns]] [total_negative_slack -max] [format %%.6f [whs]]"
 foreach {k v} [array get eco_stat] { puts $rec "stat $k $v" }
 close $rec
@@ -871,7 +968,8 @@ def swap(netlist: Path, top: str, out: Path, libs: Sequence[Path],
          rail_flavours: Optional[dict] = None,
          wire_model=None, wire_scales=None,
          layout: Optional["LayoutSpec"] = None,
-         keep_clock_cells: bool = False) -> dict:
+         keep_clock_cells: bool = False,
+         flop_cap: str = "") -> dict:
     """Swap flavours in `netlist` (see the module docstring); writes `out`
     and returns the record. With `layout` (a LayoutSpec: SPEF, propagated
     clocks, clock-network and footprint vetoes) the swap runs on a placed
@@ -939,6 +1037,7 @@ def swap(netlist: Path, top: str, out: Path, libs: Sequence[Path],
                             dict(wire_scales) if wire_scales else None)
                if (not layout or not layout.spef) else "")
             + TCL % {"hooks": layout.hooks_tcl() if layout else "",
+                     "blk_pass": layout.blk_tcl(recover) if layout else "",
                      "tns_accept": int(bool(layout)),
                      "flavours": " ".join(tokens), "fre": flavour_re,
                      "rails": " ".join(
@@ -949,7 +1048,10 @@ def swap(netlist: Path, top: str, out: Path, libs: Sequence[Path],
                      "record": record, "out": out, "paths": paths,
                      "max_iter": max_iter, "recover": int(recover),
                      "margin": f"{margin:g}",
-                     "keep_clk": int(keep_clock_cells)}
+                     "keep_clk": int(keep_clock_cells),
+                     # flop_cap: the option syn.vt_swap.flop_cap /
+                     # post.flop_cap (the caller resolves it)
+                     "fcap": flop_cap or ""}
             + "exit\n")
         local = os.environ.get("OPENSTA")
         if local:
@@ -962,6 +1064,8 @@ def swap(netlist: Path, top: str, out: Path, libs: Sequence[Path],
                    *[x for m in mounts for x in ("-v", f"{m}:{m}")],
                    image, STA_BIN, "-no_init", "-no_splash", "-exit",
                    str(tcl)]
+        from . import provenance_settings as _ps, stages as _st
+        _st.record_step("vt_swap", *cmd, f"vt_swap.tcl sha256 {_ps.text_sha(tcl.read_text())}")
         p = subprocess.run(cmd, capture_output=True, text=True)
         if p.returncode != 0 or not record.exists() or not out.exists():
             raise VtSwapError(f"vt_swap: OpenSTA failed ({p.returncode}):\n"
@@ -1007,6 +1111,16 @@ def swap(netlist: Path, top: str, out: Path, libs: Sequence[Path],
     new_cells = cell_changes(orig, out.read_text())
     out.write_text(retype(orig, new_cells))
     res["instances_changed"] = sum(len(v) for v in new_cells.values())
+    if layout is not None and recover and getattr(layout, "recover_block_re", ""):
+        st = res.get("eco_stat", {})
+        if st.get("blk_matched", 0) == 0:
+            raise VtSwapError(
+                f"vt_swap: block tail recovery: no cell instance name matches "
+                f"{layout.recover_block_re!r} (an option that matches nothing is refused)")
+        if st.get("blk_floor_clamped"):
+            print("vt_swap: WARNING block tail recovery: the global floor reached is below the "
+                  "block floor; the block recovers no deeper than the global state allows",
+                  file=sys.stderr)
     if rail_flavours:
         res["flavours_before"] = rail_flavour_counts(orig, rail_flavours)
         res["flavours_after"] = rail_flavour_counts(out.read_text(),
@@ -1215,8 +1329,10 @@ def run(cfg, spec: VtSwapSpec) -> dict:
     keep = cfg.synth_dir / f"{d.top_module}_preswap_openroad.v"
     keep.write_text(nl.read_text())
     out = cfg.synth_dir / f"{d.top_module}_vtswap_openroad.v"
+    from . import options
+    flop_cap = options.of(cfg)["syn.vt_swap.flop_cap"]
     check_ladder_tokens(spec.ladder_cap, spec.ladder_escalate,
-                        fl["tokens"], "vt_swap")
+                        fl["tokens"], "vt_swap", flop_cap)
     layout = None
     if (spec.fix != "bulk" or spec.recover_order != "inst" or spec.ladder_cap
             or spec.allow_footprint_change or spec.ladder_escalate):
@@ -1240,7 +1356,8 @@ def run(cfg, spec: VtSwapSpec) -> dict:
                hold_libs=hold_libs, wire_model=d.wire_model,
                wire_scales=wire_scales(d, prof.setup_corner,
                                        hold if hold_libs else None),
-               layout=layout, keep_clock_cells=spec.keep_clock_cells)
+               layout=layout, keep_clock_cells=spec.keep_clock_cells,
+               flop_cap=flop_cap)
     out.replace(nl)
     res.update({"mode": tight.name, "libs": [str(l) for l in libs],
                 "setup_corner": prof.setup_corner, "hold_corner": hold,
@@ -1259,7 +1376,7 @@ def run_power(cfg, spec: VtSwapSpec, power_summary: dict) -> dict:
     """The power flow's stage: swap on the chip view (see the module
     docstring); rewrites the stitched OpenSTA netlist in place and returns
     the record (also <out>/vt_swap.json)."""
-    from . import intent, profile as profile_mod, sta, vnetlist as vn
+    from . import intent, options, profile as profile_mod, sta, vnetlist as vn
     from .modes import unit_ps
     d = cfg.design
     prof = profile_mod.load(d.profile)
@@ -1354,7 +1471,8 @@ def run_power(cfg, spec: VtSwapSpec, power_summary: dict) -> dict:
                    hold_both_libs=ls_hold, rail_flavours=rail_fl_arg,
                    wire_model=d.wire_model,
                    wire_scales=wire_scales(d, corner,
-                                           hold if hold_libs else None))
+                                           hold if hold_libs else None),
+                   flop_cap=options.of(cfg)["syn.vt_swap.flop_cap"])
         rec["modes"][m.name] = res
         print(f"[vt_swap] chip, mode {m.name}"
               + (" (fix only)" if k else "") + f": {summary(res)}")

@@ -625,6 +625,9 @@ def run_views(views: List[View], sta_dir: Path, image: str) -> None:
                *[a for m in ms for a in ("-v", f"{m}:{m}" if rw(m)
                                          else f"{m}:{m}:ro")],
                image, "sh", str(script.resolve())]
+    from . import provenance_settings as _ps, stages as _st
+    _st.record_step("sta", *cmd, f"script sha256 {_ps.text_sha(script.read_text())}",
+                    *[f"{t.name} sha256 {_ps.text_sha(t.read_text())}" for t in tcls])
     print(f"[sta] OpenSTA: {len(views)} view(s) "
           + (f"with {local}" if local else f"in {image}"))
     p = subprocess.run(cmd, capture_output=True, text=True)

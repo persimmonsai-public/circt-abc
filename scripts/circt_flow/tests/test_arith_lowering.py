@@ -79,7 +79,7 @@ PREFIX = TESTS / "map-prefix-adders"
 
 
 @pytest.mark.parametrize("arch", ["SKLANSKEY", "KOGGE-STONE", "HAN-CARLSON", "BRENT-KUNG"])
-@pytest.mark.parametrize("module", ["add16", "add32_cin", "add48_one", "add8_const", "untouched"])
+@pytest.mark.parametrize("module", ["add16", "add32_cin", "add40_one", "add8_const", "untouched"])
 def test_prefix_adders_equivalent(tmp_path, module, arch):
     """Every architecture, SAT-proven (combinational, so the proof is complete)."""
     r = _equiv(tmp_path, PREFIX / "adds.mlir", module,

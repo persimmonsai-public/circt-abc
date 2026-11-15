@@ -1,0 +1,1 @@
+template stand-in: no layout, cell count and area only

@@ -1,0 +1,490 @@
+{
+ "format": 1,
+ "legacy_env_removed_in": 13,
+ "namespaces": [
+  "cts",
+  "hold",
+  "pnr",
+  "post",
+  "run",
+  "report"
+ ],
+ "recipe_dir": "pnr/notes",
+ "recipe_dir_option": "pnr.recipe_dir",
+ "recipe_dir_consumers": [
+  "recipe"
+ ],
+ "options": [
+  {
+   "name": "cts.skip_fanout_le",
+   "type": "int",
+   "default": null,
+   "shared": true,
+   "stage": "cts",
+   "var": "CTS_SKIP_FANOUT_LE",
+   "consumers": [
+    "command"
+   ],
+   "help": "gated clock nets of at most N loads are left to their gate (the recipe key cts_skip_fanout_le)"
+  },
+  {
+   "name": "cts.gate_sizing",
+   "type": "bool",
+   "default": false,
+   "stage": "cts",
+   "var": "CTS_SIZE_GATES",
+   "consumers": [
+    "command"
+   ],
+   "help": "size each clock gate by the clock arrival it gives (the recipe key cts_size_gates)"
+  },
+  {
+   "name": "cts.gate_drive_re",
+   "type": "str",
+   "default": null,
+   "stage": "cts",
+   "var": "CTS_GATE_DRIVE_RE",
+   "consumers": [
+    "command"
+   ],
+   "help": "regular expression with three groups (prefix, drive, suffix) of a clock-gate cell name; required with cts.gate_sizing"
+  },
+  {
+   "name": "cts.gate_drives",
+   "type": "str",
+   "default": null,
+   "stage": "cts",
+   "pattern": "[0-9]+( [0-9]+)*",
+   "var": "CTS_GATE_DRIVES",
+   "consumers": [
+    "command"
+   ],
+   "help": "candidate clock-gate drives, space separated; required with cts.gate_sizing"
+  },
+  {
+   "name": "cts.gate_size_tolerance",
+   "type": "float",
+   "default": null,
+   "stage": "cts",
+   "unit": "ns",
+   "range": [
+    0,
+    null
+   ],
+   "var": "CTS_GATE_TOL",
+   "consumers": [
+    "command"
+   ],
+   "help": "clock-gate sizing: prefer the first listed drive within this of the fastest; required with cts.gate_sizing"
+  },
+  {
+   "name": "cts.gate_port_tol",
+   "type": "float",
+   "default": null,
+   "shared": true,
+   "stage": "cts",
+   "unit": "ns",
+   "range": [
+    0,
+    null
+   ],
+   "var": "CTS_GATE_PORT_TOL",
+   "consumers": [
+    "command"
+   ],
+   "help": "clock-gate sizing tolerance for the gates that clock a register in the fan-in of an output port (unset: cts.gate_size_tolerance)"
+  },
+  {
+   "name": "cts.gate_variants",
+   "type": "str",
+   "default": null,
+   "stage": "cts",
+   "var": "CTS_GATE_VARIANTS",
+   "consumers": [
+    "command"
+   ],
+   "help": "other variants of a clock-gate cell to try (replacing the match of cts.gate_variant_re)"
+  },
+  {
+   "name": "cts.gate_variant_re",
+   "type": "str",
+   "default": null,
+   "stage": "cts",
+   "var": "CTS_GATE_VARIANT_RE",
+   "consumers": [
+    "command"
+   ],
+   "help": "regular expression of the variant part of a clock-gate cell name"
+  },
+  {
+   "name": "cts.gate_report",
+   "type": "bool",
+   "default": false,
+   "stage": "cts",
+   "consumers": [
+    "command"
+   ],
+   "help": "print every clock gate's candidate arrivals"
+  },
+  {
+   "name": "cts.flatten_root",
+   "type": "choice",
+   "default": "0",
+   "shared": true,
+   "stage": "cts",
+   "choices": [
+    "0",
+    "1",
+    "all"
+   ],
+   "var": "CTS_FLATTEN_ROOT",
+   "consumers": [
+    "command"
+   ],
+   "help": "remove the root clock buffer (1: a lone root buffer; all: every buffer the port drives)"
+  },
+  {
+   "name": "cts.repair_dont_use",
+   "type": "str",
+   "default": null,
+   "stage": "cts",
+   "var": "REPAIR_DONT_USE_RE",
+   "consumers": [
+    "command"
+   ],
+   "help": "space separated regular expressions of cells the post-clock-tree repair must not use"
+  },
+  {
+   "name": "pnr.spef_restore_pincap",
+   "type": "bool",
+   "default": true,
+   "shared": true,
+   "stage": "finish",
+   "var": "SPEF_RESTORE_PINCAP",
+   "consumers": [
+    "command"
+   ],
+   "help": "restore the pin capacitance the global-route SPEF estimate leaves out"
+  },
+  {
+   "name": "pnr.flow.hold_margin",
+   "type": "str",
+   "default": null,
+   "stage": "cts",
+   "var": "HOLD_MARGIN",
+   "consumers": [
+    "command"
+   ],
+   "help": "hold repair margin of the command's P&R flow"
+  },
+  {
+   "name": "pnr.flow.setup_margin",
+   "type": "str",
+   "default": null,
+   "stage": "cts",
+   "var": "SETUP_MARGIN",
+   "consumers": [
+    "command"
+   ],
+   "help": "setup repair margin of the command's P&R flow"
+  },
+  {
+   "name": "pnr.floorplan.utilization",
+   "type": "float",
+   "default": null,
+   "stage": "floorplan",
+   "range": [
+    0,
+    null
+   ],
+   "consumers": [
+    "command"
+   ],
+   "help": "core utilization of the floorplan"
+  },
+  {
+   "name": "pnr.floorplan.aspect_ratio",
+   "type": "float",
+   "default": null,
+   "stage": "floorplan",
+   "range": [
+    0,
+    null
+   ],
+   "consumers": [
+    "command"
+   ],
+   "help": "aspect ratio of the core"
+  },
+  {
+   "name": "pnr.floorplan.core_margin",
+   "type": "float",
+   "default": null,
+   "stage": "floorplan",
+   "range": [
+    0,
+    null
+   ],
+   "consumers": [
+    "command"
+   ],
+   "help": "margin between core and die"
+  },
+  {
+   "name": "pnr.floorplan.place_density",
+   "type": "float",
+   "default": null,
+   "stage": "place",
+   "range": [
+    0,
+    null
+   ],
+   "consumers": [
+    "command"
+   ],
+   "help": "target placement density"
+  },
+  {
+   "name": "pnr.floorplan.cell_padding",
+   "type": "float",
+   "default": null,
+   "stage": "place",
+   "range": [
+    0,
+    null
+   ],
+   "consumers": [
+    "command"
+   ],
+   "help": "placement padding around each cell"
+  },
+  {
+   "name": "pnr.top_override",
+   "type": "str",
+   "default": null,
+   "stage": "floorplan",
+   "consumers": [
+    "command"
+   ],
+   "help": "name of the top module, when it is not the netlist's first module"
+  },
+  {
+   "name": "pnr.post_route_repair",
+   "type": "bool",
+   "default": null,
+   "stage": "route",
+   "consumers": [
+    "command"
+   ],
+   "help": "run a timing repair after routing"
+  },
+  {
+   "name": "pnr.max_utilization",
+   "type": "float",
+   "default": null,
+   "stage": "route",
+   "range": [
+    0,
+    null
+   ],
+   "consumers": [
+    "command"
+   ],
+   "help": "utilization limit of the post-route repair"
+  },
+  {
+   "name": "pnr.recipe_dir",
+   "type": "path",
+   "default": null,
+   "stage": "floorplan",
+   "consumers": [
+    "command"
+   ],
+   "help": "the directory the command reads its recipe files from (the session sets it to the pack's when an option that needs it is set)"
+  },
+  {
+   "name": "hold.corner",
+   "type": "bool",
+   "default": null,
+   "shared": true,
+   "stage": "cts",
+   "consumers": [
+    "command"
+   ],
+   "help": "time hold at the pack's hold corner (the recipe key hold_corner)"
+  },
+  {
+   "name": "pnr.file_roots",
+   "type": "str",
+   "default": null,
+   "stage": "run",
+   "consumers": [
+    "command"
+   ],
+   "help": "extra directories (':'-separated) under which files named by options may be found"
+  },
+  {
+   "name": "post.margin_ps",
+   "type": "int",
+   "default": null,
+   "shared": true,
+   "stage": "finish",
+   "unit": "ps",
+   "range": [
+    0,
+    null
+   ],
+   "consumers": [
+    "command"
+   ],
+   "help": "post-layout setup margin (the flow option post.margin_ps)"
+  },
+  {
+   "name": "post.fix",
+   "type": "choice",
+   "default": null,
+   "shared": true,
+   "stage": "finish",
+   "choices": [
+    "bulk",
+    "sens"
+   ],
+   "consumers": [
+    "command"
+   ],
+   "help": "post-layout fix: bulk or sens (the flow option post.fix)"
+  },
+  {
+   "name": "post.flop_cap",
+   "type": "str",
+   "default": "",
+   "shared": true,
+   "stage": "finish",
+   "consumers": [
+    "command"
+   ],
+   "help": "ladder token above which the post-layout swap never moves a flop (the flow option post.flop_cap)"
+  },
+  {
+   "name": "run.ladder.mode",
+   "type": "choice",
+   "default": null,
+   "shared": true,
+   "stage": "run",
+   "choices": [
+    "parallel",
+    "sequential"
+   ],
+   "consumers": [
+    "command"
+   ],
+   "help": "closure ladder: parallel or sequential rungs (the flow option run.ladder.mode)"
+  },
+  {
+   "name": "run.ladder.fresh",
+   "type": "bool",
+   "default": null,
+   "shared": true,
+   "stage": "run",
+   "consumers": [
+    "command"
+   ],
+   "help": "closure ladder: start from no earlier placement or rung record (the flow option run.ladder.fresh)"
+  },
+  {
+   "name": "run.partition",
+   "type": "str",
+   "default": null,
+   "stage": "run",
+   "consumers": [
+    "command"
+   ],
+   "help": "scheduler partition of the command's jobs (run mechanics)"
+  },
+  {
+   "name": "run.rung_cpus",
+   "type": "int",
+   "default": null,
+   "stage": "run",
+   "range": [
+    1,
+    null
+   ],
+   "consumers": [
+    "command"
+   ],
+   "help": "CPUs of a P&R job (run mechanics)"
+  },
+  {
+   "name": "run.rung_mem",
+   "type": "str",
+   "default": null,
+   "stage": "run",
+   "pattern": "[0-9]+[KMGT]?",
+   "consumers": [
+    "command"
+   ],
+   "help": "memory of a P&R job (run mechanics)"
+  },
+  {
+   "name": "run.rung_time",
+   "type": "str",
+   "default": null,
+   "stage": "run",
+   "consumers": [
+    "command"
+   ],
+   "help": "time limit of a P&R job (run mechanics)"
+  },
+  {
+   "name": "report.area_digits",
+   "type": "int",
+   "default": 4,
+   "range": [
+    0,
+    9
+   ],
+   "var": "REPORT_AREA_DIGITS",
+   "consumers": [
+    "command"
+   ],
+   "help": "decimal digits of stdcell_area in pnr_metrics.json",
+   "group": "report"
+  },
+  {
+   "name": "report.cell_histogram",
+   "type": "bool",
+   "default": false,
+   "var": "REPORT_CELL_HISTOGRAM",
+   "consumers": [
+    "command"
+   ],
+   "help": "also write cell_histogram.json (instances per cell)",
+   "group": "report"
+  },
+  {
+   "name": "report.label",
+   "type": "str",
+   "default": "",
+   "empty_ok": true,
+   "var": "REPORT_LABEL",
+   "consumers": [
+    "command"
+   ],
+   "help": "a label written to report.json",
+   "group": "report"
+  },
+  {
+   "name": "report.note",
+   "type": "str",
+   "default": null,
+   "pattern": "[A-Za-z0-9_.-]+",
+   "consumers": [
+    "recipe"
+   ],
+   "var": "REPORT_NOTE",
+   "help": "a file of the recipe directory whose first line is written to report.json",
+   "group": "report"
+  }
+ ]
+}

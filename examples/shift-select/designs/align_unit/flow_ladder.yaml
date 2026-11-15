@@ -39,3 +39,8 @@ pnr:
             - /OpenROAD-flow-scripts/flow/platforms/asap7/lib/NLDM/asap7sc7p5t_SEQ_RVT_FF_nldm_220123.lib
           setup_ws: {min: 0}
           hold_ws: {min: 0}
+# The flow knobs of this example (were CIRCT_FLOW_NO_CLOCK_GATING=1 and
+# CIRCT_FLOW_OUTLINE_AFTER_FLATTEN=1 in run.sh / ladder.sh).
+options:
+  syn.clock_gating.enable: false
+  syn.outline_after_flatten: true

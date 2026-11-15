@@ -7,3 +7,8 @@ pdk:
   profile: ../../techpack.yaml
 modes:
   func: func.sdc
+# The flow knobs of this example (were CIRCT_FLOW_NO_CLOCK_GATING=1 and
+# CIRCT_FLOW_OUTLINE_AFTER_FLATTEN=1 in run.sh / ladder.sh).
+options:
+  syn.clock_gating.enable: false
+  syn.outline_after_flatten: true

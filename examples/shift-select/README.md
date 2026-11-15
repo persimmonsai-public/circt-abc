@@ -77,9 +77,9 @@ pass builds the one of least cell area; treat the recipe as something to search.
   directory, aside). `scripts/circt_flow/tests/test_shift_example.py` does the same
   in the test suite (skipped when the libraries are not built).
 
-Clock gating is switched off in this example (`CIRCT_FLOW_NO_CLOCK_GATING=1`): a
+Clock gating is switched off in this example (`syn.clock_gating.enable: false` in the flow configs' `options:`): a
 gated clock is outside what a Yosys miter proves, and the example is about the
-select. `CIRCT_FLOW_OUTLINE_AFTER_FLATTEN=1` makes the netlist one flat module, which
+select. `syn.outline_after_flatten: true` makes the netlist one flat module, which
 a design whose top has no sub-modules needs for the fanout stage and OpenSTA.
 
 ## Closure ladder
@@ -145,5 +145,5 @@ that of every rung that started, including those above the accepted one, in exch
 shorter wall-clock.
 
 On a cluster, each job can go through a scheduler instead of a local process:
-`CIRCT_FLOW_LADDER_SUBMIT='sbatch --wait -c 16 --job-name={name} -o {log} --wrap {cmdq}'`
+`pnr.ladder.submit: 'sbatch --wait -c 16 --job-name={name} -o {log} --wrap {cmdq}'` in the flow config (option `run.ladder.submit`; the variable `CIRCT_FLOW_LADDER_SUBMIT` is deprecated)
 (see "Where jobs run" in `doc/ladder.md`).

@@ -29,11 +29,39 @@ from .config import FlowConfig
 from .ladder import RungRejected
 
 
+# Every command the stages ran in this process, as executed (settings.json's
+# "pipeline", provenance_settings.py), and the later steps (fanout, vt-swap,
+# STA) as record_step entries.
+EXECUTED: list = []
+
+
+def record_step(step: str, *items) -> None:
+    """One pipeline entry of a step that does not go through _run: its name,
+    then its command or parameters (strings)."""
+    EXECUTED.append([f"({step})", *[str(x) for x in items]])
+
+
+# The one seam of the editable pass pipeline (pipeline_edit.py): while
+# a stage with pipeline edits or pass hooks runs, or while a stage's passes are
+# planned without running a tool, RUNNER(cmd, stdout=, env=) takes every
+# command instead of _run (and calls _run_plain for what it runs). None, the
+# default and always the case without edits and hooks: _run is unchanged.
+RUNNER = None
+
+
 def _run(cmd: Sequence[str | Path], *, stdout: Path | None = None, env=None) -> None:
     """Run `cmd`, optionally redirecting stdout to the file at `stdout`
     (mirroring bash's `> file`). Raises subprocess.CalledProcessError on a
     non-zero exit, with the full argv attached."""
+    if RUNNER is not None:
+        return RUNNER([str(c) for c in cmd], stdout=stdout, env=env)
+    _run_plain(cmd, stdout=stdout, env=env)
+
+
+def _run_plain(cmd: Sequence[str | Path], *, stdout: Path | None = None, env=None) -> None:
+    """_run without the RUNNER seam."""
     str_cmd = [str(c) for c in cmd]
+    EXECUTED.append(str_cmd + ([">", str(stdout)] if stdout is not None else []))
     if stdout is not None:
         with open(stdout, "w") as f:
             subprocess.run(str_cmd, stdout=f, env=env, check=True)
@@ -109,7 +137,7 @@ def hw_aggregate_to_comb(cfg: FlowConfig) -> Path:
     # redundancy ABC cannot see. CIRCT_FLOW_LOCALIZE_RMW=0 restores the
     # previous (byte-identical) flow. Modules without the idiom are
     # untouched.
-    if os.environ.get("CIRCT_FLOW_LOCALIZE_RMW") != "0":
+    if cfg.settings["syn.cleanup.localize_rmw"]:
         if _binary_has_pass(cfg.circt_abc_opt, "localize-dynamic-rmw"):
             src = cfg.core_mlir_rmw
             print(f"[circt_flow] localize-dynamic-rmw -> {src}")
@@ -120,7 +148,7 @@ def hw_aggregate_to_comb(cfg: FlowConfig) -> Path:
             # previous flow rather than failing on an unknown pass.
             print(f"[circt_flow] WARNING: {cfg.circt_abc_opt} lacks "
                   "--localize-dynamic-rmw; skipping (rebuild the mapper, or "
-                  "set CIRCT_FLOW_LOCALIZE_RMW=0 to silence)")
+                  "set syn.cleanup.localize_rmw=false to silence)")
     print(f"[circt_flow] hw-aggregate-to-comb -> {cfg.core_mlir}")
     _run(
         [
@@ -176,13 +204,19 @@ def _multibit_option(cfg: FlowConfig) -> str:
 
 
 def structural_mapping(cfg: FlowConfig) -> Path:
+    S = cfg.settings
+    # Scoped settings (scoping.py) and their legacy forms: checked against
+    # the core IR here, emitted below, checked against the passes' report.
+    from . import scoping
+    _sc = scoping.plan(cfg)
     print(
         "[circt_flow] narrow-array-registers + register-legalize + "
         "clock-gate-inference + propagate-register-constants + "
         "narrow-dead-register-bits + register-mapper + structural-mapper "
         f"+ cse + outline-residual-logic -> {cfg.struct_mlir}"
     )
-    _run(
+    with scoping.applying(_sc, cfg):
+      _run(
         [
             cfg.circt_abc_opt,
             # Small seq.firmem memories (llhd-mem2reg promotes depth-2/4 FIFO
@@ -203,7 +237,7 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             *(([x for _ in range(3)
                   for x in ("--prune-unused-residual-outputs=any-module=true"
                             + (" propagate-constant-outputs=true"
-                               if os.environ.get("CIRCT_FLOW_PRUNE_CONST_OUTPUTS") == "1"
+                               if S["syn.cleanup.prune_const_outputs"]
                                else "")
                             # CIRCT_FLOW_PRUNE_OUTPUT_FIELDS=1: split a
                             # struct-typed output into one port per field
@@ -215,12 +249,12 @@ def structural_mapping(cfg: FlowConfig) -> Path:
                             # not cross an aggregate port, so nothing else
                             # sees it.
                             + (" prune-unused-output-fields=true"
-                               if os.environ.get("CIRCT_FLOW_PRUNE_OUTPUT_FIELDS") == "1"
+                               if S["syn.cleanup.prune_output_fields"]
                                else ""),
                             "--canonicalize")])
-              if (os.environ.get("CIRCT_FLOW_PRUNE_ANY_MODULE") == "1"
-                  or os.environ.get("CIRCT_FLOW_PRUNE_CONST_OUTPUTS") == "1"
-                  or os.environ.get("CIRCT_FLOW_PRUNE_OUTPUT_FIELDS") == "1") else []),
+              if (S["syn.cleanup.prune_any_module"]
+                  or S["syn.cleanup.prune_const_outputs"]
+                  or S["syn.cleanup.prune_output_fields"]) else []),
             # CIRCT_FLOW_SPECIALIZE_INPUTS=1: inward dual of the prune loop's
             # propagate-constant-outputs. A module input every instance
             # drives with the same literal becomes that literal inside the
@@ -243,7 +277,7 @@ def structural_mapping(cfg: FlowConfig) -> Path:
                   for x in ("--specialize-constant-module-inputs="
                             "enable-specialize-constant-inputs=true",
                             "--canonicalize", "--cse")])
-              if os.environ.get("CIRCT_FLOW_SPECIALIZE_INPUTS") == "1" else []),
+              if S["syn.cleanup.specialize_inputs"] else []),
             # CIRCT_FLOW_SHIFT_SELECT_EARLY=1: build the shift-select network
             # from the still-intact priority mux chain of a `case` over a
             # shift amount, BEFORE clock-gate-inference and the first
@@ -254,7 +288,7 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             # `shift_select:` in the flow config sets the same options
             # (shiftselect.py); the variables win.
             *(["--map-shift-select=" + _ss.format(lib=cfg.design.lib)]
-              if (_ss := shiftselect.pass_options(cfg.design.shift_select, True))
+              if (_ss := shiftselect.pass_options_from(S, True))
               else []),
             "--lower-firmem",
             "--narrow-array-registers",
@@ -275,12 +309,20 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             *(["--propagate-register-constants=fold-unknown-ops=true "
                "mutual-fixpoint=true absorbing-operands=true",
                "--canonicalize", "--cse"]
-              if os.environ.get("CIRCT_FLOW_RCP_SEQUENTIAL") == "1" else []),
+              if S["syn.cleanup.rcp_sequential"] else []),
+            # CIRCT_FLOW_DATA_GATE=<slices>: data-following clock gating of
+            # named register slices (opt-in, off by default). Comma-separated
+            # [module/]reg@lo-hi[@zero|xor]; e.g. total_r@0-2@xor,total_r@3-9.
+            # data-gate-enables rewrites each slice to hold when loading would
+            # not change it, so bit-level clock-gate-inference gives the slice
+            # its own gate whose enable follows the data (doc/passes.md).
+            # Scoped form: gate_register entries of syn.scoped (scoping.py).
+            *_sc.data_gate_args(),
             # CIRCT_FLOW_NO_CLOCK_GATING=1 keeps every register on the plain
             # clock (miter-friendly gate netlists); default unchanged.
             cfg.directives.clock_gate_inference_option(cfg.design.all_libs)
             + (" enable-clock-gating=false"
-               if os.environ.get("CIRCT_FLOW_NO_CLOCK_GATING") == "1" else "")
+               if not S["syn.clock_gating.enable"] else "")
             # CIRCT_FLOW_CG_BITLEVEL=1: resolve enables per BIT through the
             # concat/extract/mux chains of an entry-array register and split
             # it into same-enable sub-registers on gated clocks. CVA6's TLB
@@ -291,7 +333,7 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             # configurations (N=2 non-overlapping runs), timing inside
             # noise, `cva6_tlb` miter SUCCESS.
             # CIRCT_FLOW_CG_BITLEVEL=0 disables.
-            + ("" if os.environ.get("CIRCT_FLOW_CG_BITLEVEL") == "0"
+            + ("" if not S["syn.clock_gating.bit_level"]
                else " bit-level-enables=true")
             # clock_gating: (clockgating.py): gate merging by enable
             # function, a savings test, a depth limit. Off unless the flow
@@ -305,7 +347,7 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             # (hpdcache_cmo's cmoh_set_q is the motivating case).
             # OFF by default.
             + (" select-dont-care=true"
-               if os.environ.get("CIRCT_FLOW_CG_SELECT_DC") == "1" else ""),
+               if S["syn.clock_gating.select_dont_care"] else ""),
             # De-aggregate BEFORE narrow-constant-register-bits, not only
             # after register-mapper. That pass evaluates a bit-level
             # known-bits lattice over comb ops and stops dead at any
@@ -342,7 +384,7 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             "--propagate-register-constants"
             + ("=fold-unknown-ops=true mutual-fixpoint=true"
                " absorbing-operands=true"
-               if os.environ.get("CIRCT_FLOW_RCP_SEQUENTIAL") == "1" else ""),
+               if S["syn.cleanup.rcp_sequential"] else ""),
             # Per-bit, cross-single-instance constant propagation (direction 2:
             # the CSR reserved/read-only bits); design-level, see Passes.td.
             # CIRCT_FLOW_NCRB_MULTI_INSTANCE=1 lifts the single-instance
@@ -352,7 +394,7 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             *(["--narrow-constant-register-bits="
                + " ".join(
                    (["cross-multi-instance=true"]
-                    if os.environ.get("CIRCT_FLOW_NCRB_MULTI_INSTANCE") == "1" else [])
+                    if S["syn.cleanup.ncrb_multi_instance"] else [])
                    # CIRCT_FLOW_NCRB_AGGREGATES=1: evaluate struct/array values
                    # as packed known-bits, so a constant crossing an
                    # aggregate-typed PORT or sitting in an array register is
@@ -361,7 +403,7 @@ def structural_mapping(cfg: FlowConfig) -> Path:
                    # legalize CVA6's array-of-struct ports. cv32a60x: constant
                    # bits removed 1,046 -> 2,616.
                    + (["cross-aggregates=true"]
-                      if os.environ.get("CIRCT_FLOW_NCRB_AGGREGATES") == "1" else [])
+                      if S["syn.cleanup.ncrb_aggregates"] else [])
                    # CLOSED ON POLICY, not on numbers: X-optimistic. Treating an
             # unreset register as holding a known constant is the line this
             # project deliberately does not cross, so this stays off however
@@ -374,10 +416,10 @@ def structural_mapping(cfg: FlowConfig) -> Path:
                    # is NOT equivalence-preserving against an X-modelling
                    # simulator. OFF by default for that reason.
                    + (["fold-unreset-holds=true"]
-                      if os.environ.get("CIRCT_FLOW_NCRB_UNRESET_HOLDS") == "1" else []))]
-              if (os.environ.get("CIRCT_FLOW_NCRB_MULTI_INSTANCE") == "1"
-                  or os.environ.get("CIRCT_FLOW_NCRB_AGGREGATES") == "1"
-                  or os.environ.get("CIRCT_FLOW_NCRB_UNRESET_HOLDS") == "1")
+                      if S["syn.cleanup.ncrb_unreset_holds"] else []))]
+              if (S["syn.cleanup.ncrb_multi_instance"]
+                  or S["syn.cleanup.ncrb_aggregates"]
+                  or S["syn.cleanup.ncrb_unreset_holds"])
               else ["--narrow-constant-register-bits"]),
             # CIRCT_FLOW_DEAD_OUTPUT_BITS=1: design-level, callers-first
             # per-bit liveness of every instance result; output-port bits no
@@ -390,14 +432,14 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             # cv64a6, part of the cv32a60x win above; cv32a60x top-level
             # bounded miter SUCCESS (14.9 M vars, seq 4 from reset).
             # CIRCT_FLOW_DEAD_OUTPUT_BITS=0 disables.
-            *([] if os.environ.get("CIRCT_FLOW_DEAD_OUTPUT_BITS") == "0"
+            *([] if not S["syn.cleanup.dead_output_bits"]
               else ["--narrow-dead-output-bits"]),
             # With it, narrow-dead-register-bits must see through the
             # integer -> aggregate -> integer bitcast pair a zeroed aggregate
             # output leaves between the slices and the register (hw.bitcast
             # is a bit reinterpretation, never a permutation).
             cfg.directives.narrow_dead_register_bits_option()
-            + ("" if os.environ.get("CIRCT_FLOW_DEAD_OUTPUT_BITS") == "0"
+            + ("" if not S["syn.cleanup.dead_output_bits"]
                else (("" if "=" in cfg.directives.narrow_dead_register_bits_option()
                       else "=")
                      + ("" if "=" not in cfg.directives.narrow_dead_register_bits_option()
@@ -409,7 +451,7 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             # slack clearly worse (2026-08-27). Enable only when trading
             # timing for area deliberately.
             *(["--dedup-registers=enable-register-dedup=true"]
-              if os.environ.get("CIRCT_FLOW_DEDUP_REGISTERS") == "1" else []),
+              if S["syn.cleanup.dedup_registers"] else []),
             f"--register-mapper=liberty={cfg.design.lib}"
             + _multibit_option(cfg),
             # Must sit between register-mapper and outline-residual-logic.
@@ -448,8 +490,8 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             # default came from narrow decoder/bound-table chains).
             "--decode-mux-chains"
             + ("=priority-decode=true priority-min-width="
-               + os.environ.get("CIRCT_FLOW_PRIORITY_MIN_WIDTH", "2")
-               if os.environ.get("CIRCT_FLOW_PRIORITY_DECODE") == "1" else ""),
+               + str(S["syn.mux.priority_min_width"])
+               if S["syn.mux.priority_decode"] else ""),
             # CIRCT_FLOW_NARROW_EXT_MUL=1: rewrite a 2W-bit comb.mul whose
             # operands are W-bit values widened by a replicated sign bit into
             # a zero-extended multiply plus a W-bit correction. CombToSynth
@@ -462,7 +504,7 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             # too. Inert on ibex, which has no comb.mul at all. OFF by
             # default (project convention).
             *(["--narrow-extended-multiplies=enable-narrow-extended-multiplies=true"]
-              if os.environ.get("CIRCT_FLOW_NARROW_EXT_MUL") == "1" else []),
+              if S["syn.cleanup.narrow_ext_mul"] else []),
             # CIRCT_FLOW_NARROW_SPARSE_SHIFT=1: same blind spot, shift side.
             # CombToSynth builds a full barrel shifter even when the amount
             # has provably-constant bits. CVA6's icache has six 128-bit shru
@@ -471,7 +513,7 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             # fully variable shift, where the 4:1 mux costs 12. Those six are
             # 23.4% of CVA6's combinational AIG. OFF by default.
             *(["--narrow-sparse-shifts=enable-narrow-sparse-shifts=true"]
-              if os.environ.get("CIRCT_FLOW_NARROW_SPARSE_SHIFT") == "1" else []),
+              if S["syn.cleanup.narrow_sparse_shift"] else []),
             # Adder architecture CombToSynth will use for comb.add/icmp >= 8
             # bits. Default BRENT-KUNG (2026-09-03: cv64a6 macro-flow P&R N=2
             # smaller std-cell area and power, timing met vs the width
@@ -492,17 +534,36 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             # was the timing loss this lever was closed on.
             *([f"--map-compressor-cells=enable-compressor-cells=true "
                f"liberty={cfg.design.lib}"
-               + (f" min-width={os.environ['CIRCT_FLOW_MUL_CELLS_MIN_WIDTH']}"
-                  if os.environ.get("CIRCT_FLOW_MUL_CELLS_MIN_WIDTH") else "")
+               + (f" min-width={S['syn.multipliers.min_width']}"
+                  if S["syn.multipliers.min_width"] is not None else "")
                + (" merge-adds=true"
-                  if os.environ.get("CIRCT_FLOW_MUL_CELLS_MERGE") == "1" else "")
+                  if S["syn.multipliers.merge_adds"] else "")
                + (" flatten-adds=true"
                   + (" flatten-gated=false"
-                     if os.environ.get("CIRCT_FLOW_MUL_CELLS_FLATTEN_GATED") == "0" else "")
-                  if os.environ.get("CIRCT_FLOW_MUL_CELLS_FLATTEN") == "1" else "")
+                     if not S["syn.multipliers.flatten_gated"] else "")
+                  if S["syn.multipliers.flatten_adds"] else "")
                + (" prefix-final-adder=true"
-                  if os.environ.get("CIRCT_FLOW_MUL_CELLS_PREFIX") == "1" else "")]
-              if os.environ.get("CIRCT_FLOW_MUL_CELLS") == "1" else []),
+                  if S["syn.multipliers.prefix_final_adder"] else "")
+               # CIRCT_FLOW_MUL_CELLS_GATES=1 (adders as plain
+               # logic for ABC), _CELL_STAGES=N (hard cells in the first N
+               # stages only), _TREE=dadda|wallace|array, _NANDPP=1 (NAND
+               # partial products, complement carried through the self-dual
+               # cells), _MAPFINAL=1 (final add of each tree left to ABC).
+               + (" gate-compressors=true"
+                  if S["syn.multipliers.gate_compressors"] else "")
+               + (f" cell-stages={S['syn.multipliers.cell_stages']}"
+                  if S["syn.multipliers.cell_stages"] is not None else "")
+               + (f" tree={S['syn.multipliers.tree']}"
+                  if S["syn.multipliers.tree"] else "")
+               + (" nand-pp=true"
+                  if S["syn.multipliers.nand_pp"] else "")
+               + (" map-final-adder=true"
+                  if S["syn.multipliers.map_final_adder"] else "")
+               # CIRCT_FLOW_MUL_CELLS_MAPFINAL_MINW=N, option
+               # syn.multipliers.map_final_min_width
+               + (f" map-final-min-width={S['syn.multipliers.map_final_min_width']}"
+                  if S["syn.multipliers.map_final_min_width"] is not None else "")]
+              if S["syn.multipliers.cells"] else []),
             # CIRCT_FLOW_ADD_CARRY_IN=1: a + b + zext(c), the conditional-
             # invert add/subtract form, becomes one {a,1} + {b,c} add so the
             # architecture below applies to ONE carry-propagate add.
@@ -510,14 +571,14 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             # serial adds (an incrementer, then the adder) and drops the
             # architecture attribute. OFF by default (project convention).
             *(["--lower-carry-in-adds=enable=true"]
-              if os.environ.get("CIRCT_FLOW_ADD_CARRY_IN") == "1" else []),
+              if S["syn.adders.carry_in"] else []),
             # CIRCT_FLOW_BARREL_SHIFT=1: variable shifts become log2(width)
             # stages of 2:1 muxes (CombToSynth builds a mux tree over every
             # shifted copy: ~width^2 mux bits, same depth).
             *(["--lower-barrel-shifts=enable=true"]
-              if os.environ.get("CIRCT_FLOW_BARREL_SHIFT") == "1" else []),
-            *([f"--set-adder-arch=arch={os.environ.get('CIRCT_FLOW_ADDER_ARCH', 'BRENT-KUNG')}"]
-              if os.environ.get("CIRCT_FLOW_ADDER_ARCH", "BRENT-KUNG") != "none" else []),
+              if S["syn.shifters.barrel"] else []),
+            *([f"--set-adder-arch=arch={S['syn.adders.arch']}"]
+              if S["syn.adders.arch"] != "none" else []),
             # CIRCT_FLOW_ADDER_CELLS=<min-width>: lower comb.add at or above
             # that width straight into a ripple of the library's two-output
             # half/full adder cells, which ABC's mapper CANNOT emit
@@ -528,15 +589,19 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             # is gone before the arch attribute matters. Unset = off.
             *([f"--map-adder-chains=liberty={cfg.design.lib} "
                f"enable-adder-chains=true "
-               f"min-width={os.environ['CIRCT_FLOW_ADDER_CELLS']}"
-               + (f" max-width={os.environ['CIRCT_FLOW_ADDER_CELLS_MAX']}"
-                  if os.environ.get("CIRCT_FLOW_ADDER_CELLS_MAX") else "")
+               f"min-width={S['syn.adders.cells.min_width']}"
+               + (f" max-width={S['syn.adders.cells.max_width']}"
+                  if S["syn.adders.cells.max_width"] is not None else "")
                # CIRCT_FLOW_ADDER_CELLS_INCREMENTS=0: leave `x + 1` (and the
                # negate it comes from) to the logic mapper instead of an
                # INV + half-adder ripple.
                + (" increments=false"
-                  if os.environ.get("CIRCT_FLOW_ADDER_CELLS_INCREMENTS") == "0" else "")]
-              if os.environ.get("CIRCT_FLOW_ADDER_CELLS") else []),
+                  if not S["syn.adders.cells.increments"] else "")]
+              if S["syn.adders.cells.min_width"] is not None else []),
+            # CIRCT_FLOW_ADDCH2_MIN/_MAX (legacy) and the scoped form
+            # map_adders(form=cells): more map-adder-chains instances (ADDF/ADDH
+            # ripple) for other width windows; scoping.py.
+            *_sc.adder_args("cells"),
             # CIRCT_FLOW_PREFIX_ADDERS=<min-width>: every comb.add (a+b,
             # a+b+zext(c), a+b+1) at or above that width is built here as a
             # parallel-prefix network of library cells, so ABC (whose
@@ -547,17 +612,23 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             # bounds the range. OFF by default (project convention).
             *([f"--map-prefix-adders=enable-prefix-adders=true "
                f"liberty={cfg.design.lib} "
-               f"min-width={os.environ['CIRCT_FLOW_PREFIX_ADDERS']} "
-               f"max-width={os.environ.get('CIRCT_FLOW_PREFIX_MAX_WIDTH', '0')} "
-               f"arch={os.environ.get('CIRCT_FLOW_PREFIX_ARCH', 'SKLANSKEY')}"]
-              if os.environ.get("CIRCT_FLOW_PREFIX_ADDERS") else []),
+               f"min-width={S['syn.adders.prefix.min_width']} "
+               f"max-width={S['syn.adders.prefix.max_width']} "
+               f"arch={S['syn.adders.prefix.arch']}"]
+              if S["syn.adders.prefix.min_width"] is not None else []),
+            # CIRCT_FLOW_PREFIX2_ADDERS=<min-width>: a second instance of the
+            # pass for wider adds (CIRCT_FLOW_PREFIX2_MAX_WIDTH, _ARCH), with
+            # CIRCT_FLOW_PREFIX2_ISOLATE=1: NAND2+NOR2-only first level.
+            # The legacy CIRCT_FLOW_PREFIX2_* and the scoped form
+            # map_adders(form=prefix) become such instances (scoping.py).
+            *_sc.adder_args("prefix"),
             # CIRCT_FLOW_SHIFT_SELECT=1: a decoded one-hot select over shifted
             # copies of one word (decode-mux-chains' output for a `case` on a
             # shift amount) becomes a radix-r AND-OR network of cells that ABC
             # cannot turn back into a switching-heavy 2:1 mux ladder.
             # CIRCT_FLOW_SHIFT_SELECT_MIN_ARMS / _RADIX tune it. OFF by default.
             *(["--map-shift-select=" + _ss.format(lib=cfg.design.lib)]
-              if (_ss := shiftselect.pass_options(cfg.design.shift_select, False))
+              if (_ss := shiftselect.pass_options_from(S, False))
               else []),
             "--canonicalize",
             f"--structural-mapper=liberty={cfg.design.lib}",
@@ -565,21 +636,21 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             # CIRCT_FLOW_DP_OVERRIDES=<json>: per-op architecture overrides
             # keyed by dp-annotate ids (the PHYS-DP loop's write-back); runs
             # right after the global default stamp so it wins.
-            *([f"--dp-apply-arch=json={os.environ['CIRCT_FLOW_DP_OVERRIDES']}"]
-              if os.environ.get("CIRCT_FLOW_DP_OVERRIDES") else []),
+            *([f"--dp-apply-arch=json={S['syn.datapath.overrides']}"]
+              if S["syn.datapath.overrides"] else []),
             # CIRCT_FLOW_DP_JSON=<path> (PHYS-DP step 1): sidecar JSON of wide
             # arithmetic ops with their launch/capture flop anchors, taken
             # BEFORE outlining so anchors are mapped-flop instances whose
             # names survive to the netlist. IR untouched.
-            *([f"--dp-annotate=json={os.environ['CIRCT_FLOW_DP_JSON']}"]
-              if os.environ.get("CIRCT_FLOW_DP_JSON") else []),
+            *([f"--dp-annotate=json={S['syn.datapath.annotate_json']}"]
+              if S["syn.datapath.annotate_json"] else []),
             # CIRCT_FLOW_OUTLINE_DATAPATH=1 (PHYS-DP step 1): every wide
             # arithmetic op becomes its own residual (identity + per-op group).
             # CIRCT_FLOW_DP_IDS=<file>: outline only these dp-annotate ids
             # (the loop's critical set); without it, every wide op.
-            *([("--outline-datapath-ops=ids=" + os.environ["CIRCT_FLOW_DP_IDS"])
-               if os.environ.get("CIRCT_FLOW_DP_IDS") else "--outline-datapath-ops"]
-              if os.environ.get("CIRCT_FLOW_OUTLINE_DATAPATH") == "1" else []),
+            *([("--outline-datapath-ops=ids=" + S["syn.datapath.outline_ids"])
+               if S["syn.datapath.outline_ids"] else "--outline-datapath-ops"]
+              if S["syn.datapath.outline"] else []),
             # CIRCT_FLOW_OUTLINE_AFTER_FLATTEN=1 (experiment, M7 re-measure):
             # defer outlining to stage 4 so one residual spans the flattened
             # design and ABC sees no module boundaries.
@@ -587,15 +658,15 @@ def structural_mapping(cfg: FlowConfig) -> Path:
             # create (every shipped feedback-cut op / shell cell on cv64a6)
             # before the outliner cuts them; CIRCT_FLOW_NARROW_WHOLE_VALUE_READS=0
             # restores the cut. Cycle-directed: modules without SCCs are untouched.
-            *([] if os.environ.get("CIRCT_FLOW_NARROW_WHOLE_VALUE_READS") == "0"
+            *([] if not S["syn.cleanup.narrow_whole_value_reads"]
               else ["--narrow-whole-value-reads", "--cse"]),
-            *([] if os.environ.get("CIRCT_FLOW_OUTLINE_AFTER_FLATTEN") == "1"
+            *([] if S["syn.outline_after_flatten"]
               else ["--outline-residual-logic", "--canonicalize"]),
             cfg.core_mlir,
             "-o",
             cfg.struct_mlir,
         ]
-    )
+      )
     return cfg.struct_mlir
 
 
@@ -615,7 +686,7 @@ def flatten_shell(cfg: FlowConfig) -> Path:
             cfg.flat_mlir,
         ]
     )
-    if os.environ.get("CIRCT_FLOW_OUTLINE_AFTER_FLATTEN") == "1":
+    if cfg.settings["syn.outline_after_flatten"]:
         print("[circt_flow] outline-residual-logic AFTER flatten (one residual)")
         _run(
             [
@@ -632,7 +703,7 @@ def flatten_shell(cfg: FlowConfig) -> Path:
     # would become AIG primary outputs and ABC would keep their cones), then
     # canonicalize/cse the dead cones away. Default on (function-preserving by
     # construction); CIRCT_FLOW_PRUNE_RESIDUAL_OUTPUTS=0 disables.
-    if os.environ.get("CIRCT_FLOW_PRUNE_RESIDUAL_OUTPUTS", "1") != "0":
+    if cfg.settings["syn.cleanup.prune_residual_outputs"]:
         print("[circt_flow] prune-unused-residual-outputs + canonicalize/cse")
         _run(
             [
@@ -673,8 +744,9 @@ def _abc_bridge_opt(cfg: FlowConfig, extra: str = "") -> str:
     # network's global critical delay (which lets area recovery deepen every
     # non-critical cone to the critical path -- the mechanism behind a
     # long tail of needlessly deep paths). Unset = upstream behaviour.
-    if os.environ.get("CIRCT_FLOW_NF_RELAX"):
-        opt += f" nf-relax-per-output={os.environ['CIRCT_FLOW_NF_RELAX']}"
+    S = cfg.settings
+    if S["syn.abc.nf_relax"] is not None:
+        opt += f" nf-relax-per-output={S['syn.abc.nf_relax']}"
     # &deepsyn is bounded by -J steps without improvement (option
     # deepsyn-no-improve, default 3; CIRCT_FLOW_DEEPSYN_J=<n>): deterministic,
     # the result depends on the input and the seed only. There is NO
@@ -684,10 +756,10 @@ def _abc_bridge_opt(cfg: FlowConfig, extra: str = "") -> str:
     # (per partition), so it must be scaled when the partition count
     # changes: comparing partition counts without scaling compares
     # optimisation budgets, not partitioning.
-    if os.environ.get("CIRCT_FLOW_DEEPSYN_J"):
-        opt += f" deepsyn-no-improve={os.environ['CIRCT_FLOW_DEEPSYN_J']}"
-    if os.environ.get("CIRCT_FLOW_DEEPSYN_SEC"):
-        opt += f" deepsyn-time-sec={os.environ['CIRCT_FLOW_DEEPSYN_SEC']}"
+    if S["syn.abc.deepsyn_no_improve"] is not None:
+        opt += f" deepsyn-no-improve={S['syn.abc.deepsyn_no_improve']}"
+    if S["syn.abc.deepsyn_time_sec"] is not None:
+        opt += f" deepsyn-time-sec={S['syn.abc.deepsyn_time_sec']}"
     if getattr(cfg, "abc_read_lib_args", None):
         # pass-option values cannot contain spaces (MLIR splits on them)
         opt += f" read-lib-args={str(cfg.abc_read_lib_args).strip().replace(' ', ',')}"
@@ -713,7 +785,7 @@ def _remove_identity_buffers_opt(cfg: FlowConfig) -> str:
     return opt
 
 
-def _specialize_mux_arms_opts() -> list[str]:
+def _specialize_mux_arms_opts(cfg: FlowConfig) -> list[str]:
     """CIRCT_FLOW_SPECIALIZE_MUX_ARMS=1: rewrite each mux arm (and each i1
     AND/OR input) under the value its select (siblings) must have for it to
     be observed. Removes the path-predicate false dependences
@@ -723,12 +795,12 @@ def _specialize_mux_arms_opts() -> list[str]:
     pass cva6 has 0 SCCs, div op_a depth 179 -> 127 AIG levels, csr instret
     158 -> 108, and the bit-level graph is 3% smaller. Function-preserving
     by construction. Runs on the residual logic right before merging."""
-    if os.environ.get("CIRCT_FLOW_SPECIALIZE_MUX_ARMS") != "1":
+    if not cfg.settings["syn.cleanup.specialize_mux_arms"]:
         return []
     return ["--specialize-mux-arms=enable=true", "--canonicalize", "--cse"]
 
 
-def _select_prefix_or_opts() -> list[str]:
+def _select_prefix_or_opts(cfg: FlowConfig) -> list[str]:
     """CIRCT_FLOW_SELECT_PREFIX_OR=1: collapse pass-through mux select chains
     into prefix ORs (select-chain-prefix-or). In a systolic array whose PEs
     forward a value combinationally, each PE's select is computed from the
@@ -739,7 +811,7 @@ def _select_prefix_or_opts() -> list[str]:
     single-partition path only. Function-preserving by construction. Runs
     after the last aggregate lowering, and lowers again because canonicalize
     can re-fold aggregate constants."""
-    if os.environ.get("CIRCT_FLOW_SELECT_PREFIX_OR") != "1":
+    if not cfg.settings["syn.mux.select_prefix_or"]:
         return []
     return ["--select-chain-prefix-or=enable=true", "--canonicalize", "--cse",
             "--hw-aggregate-to-comb"]
@@ -763,8 +835,9 @@ def merge_and_map(cfg: FlowConfig) -> Path:
     # ibex's 5,139 residual input bits (57%) arrive as a severed (PO, PI) pair,
     # so the AIG ABC and emap optimise has that combinational path CUT -- no
     # structural hashing, no common-divisor extraction, no cut can span it.
-    if (os.environ.get("CIRCT_FLOW_INTERNALIZE_SELF_FED") == "1"
-            or os.environ.get("CIRCT_FLOW_SELECT_PREFIX_OR") == "1"):
+    S = cfg.settings
+    if (S["syn.abc.internalize_self_fed"]
+            or S["syn.mux.select_prefix_or"]):
         _mopts.append("internalize-self-fed-ports=true")
     # CIRCT_FLOW_FREE_DEAD_OUTPUTS=1 constant-drives merged-instance outputs
     # with no consumer. Recorded as a net loss (an emap win, a finished-
@@ -772,14 +845,14 @@ def merge_and_map(cfg: FlowConfig) -> Path:
     # harness that was not yet deterministic, so it was never separable from
     # noise. Re-testable now; still OFF by default until it is re-measured
     # deterministically.
-    if os.environ.get("CIRCT_FLOW_FREE_DEAD_OUTPUTS") == "1":
+    if S["syn.abc.free_dead_outputs"]:
         _mopts.append("free-dead-output-ports=true")
     if _mopts:
         merge_opt += "=" + " ".join(_mopts)
     _run(
         [
             cfg.circt_abc_opt,
-            *_specialize_mux_arms_opts(),
+            *_specialize_mux_arms_opts(cfg),
             merge_opt,
             "--canonicalize",
             # A third aggregate lowering, AFTER the canonicalize: struct-
@@ -790,13 +863,13 @@ def merge_and_map(cfg: FlowConfig) -> Path:
             # the bridge, where convert-comb-to-synth refuses aggregates.
             # Idempotent and cheap at this stage (no LLHD regions remain).
             "--hw-aggregate-to-comb",
-            *_select_prefix_or_opts(),
+            *_select_prefix_or_opts(cfg),
             # CIRCT_FLOW_NARROW_MUX=1: see the partitioned path below for
             # what this is and why. Same placement -- immediately before the
             # bridge, which is what bit-blasts the word-level mux.
             *(["--narrow-mux-to-differing-bits=enable-narrow-mux=true",
                "--canonicalize", "--cse"]
-              if os.environ.get("CIRCT_FLOW_NARROW_MUX") == "1" else []),
+              if S["syn.cleanup.narrow_mux"] else []),
             _abc_bridge_opt(cfg),
             f"--map-shell-logic=liberty={cfg.design.lib}",
             _remove_identity_buffers_opt(cfg),
@@ -807,8 +880,8 @@ def merge_and_map(cfg: FlowConfig) -> Path:
             # those trees at placement.
             *([f"--limit-fanout=liberty={cfg.design.lib} "
                f"enable-limit-fanout=true "
-               f"max-fanout={os.environ['CIRCT_FLOW_MAX_FANOUT']}"]
-              if os.environ.get("CIRCT_FLOW_MAX_FANOUT") else []),
+               f"max-fanout={S['syn.fanout.max']}"]
+              if S["syn.fanout.max"] is not None else []),
             cfg.flat_mlir,
             "-o",
             cfg.mapped_mlir,
@@ -842,21 +915,26 @@ def _merge_and_map_partitioned(cfg: FlowConfig) -> Path:
     # SoC the alphabetical split put cva6's serdiv beside an interrupt
     # controller's long priority chain and rippled the divider's adder into
     # the design's worst path. Produces the group-map consumed below.
-    group_map = os.environ.get("CIRCT_FLOW_GROUP_MAP")
-    if os.environ.get("CIRCT_FLOW_GROUP_BY_DEPTH") == "1" and not group_map:
+    S = cfg.settings
+    group_map = S["syn.abc.partition.group_map"]
+    if S["syn.abc.partition.group_by_depth"] and not group_map:
         group_map = str(workdir / "depth_group_map.json")
         _run([sys.executable, str(Path(__file__).with_name("depth_groups.py")),
               str(cfg.flat_mlir), str(k), group_map,
               "--opt", str(cfg.circt_abc_opt),
-              "--report", str(workdir / "depth_groups.tsv")])
+              "--report", str(workdir / "depth_groups.tsv"),
+              # the adder architecture the script used to read from the
+              # environment; given only when an option source set it
+              *(["--adder-arch", S["syn.adders.arch"]]
+                if S.is_set("syn.adders.arch") else [])])
     merge_args = []
     for i in range(k):
         opt = f"--merge-residual-modules=group-count={k} group-index={i}"
         # CIRCT_FLOW_ISOLATE_SUBSTR=<substr>: modules containing it (the
         # outlined datapath ops, "_dp") go to the LAST group alone (PHYS-DP)
-        if os.environ.get("CIRCT_FLOW_ISOLATE_SUBSTR"):
-            opt += f" isolate-substr={os.environ['CIRCT_FLOW_ISOLATE_SUBSTR']}"
-            if os.environ.get("CIRCT_FLOW_ISOLATE_EACH") == "1":
+        if S["syn.abc.partition.isolate_substr"]:
+            opt += f" isolate-substr={S['syn.abc.partition.isolate_substr']}"
+            if S["syn.abc.partition.isolate_each"]:
                 opt += " isolate-each=true"
         # CIRCT_FLOW_GROUP_MAP=<json {module: group index}>: pin the
         # non-isolated modules to the baseline grouping (netlist reuse stays
@@ -875,11 +953,11 @@ def _merge_and_map_partitioned(cfg: FlowConfig) -> Path:
     # group g30 measured 68,254 -> 19,497 AIGER ANDs, ABC `cec`-equivalent.
     # OFF by default (project convention for a new lever).
     _run([cfg.circt_abc_opt, "--mlir-disable-threading",
-          *_specialize_mux_arms_opts(), *merge_args,
+          *_specialize_mux_arms_opts(cfg), *merge_args,
           "--canonicalize", "--hw-aggregate-to-comb",
           *(["--narrow-mux-to-differing-bits=enable-narrow-mux=true",
              "--canonicalize", "--cse"]
-            if os.environ.get("CIRCT_FLOW_NARROW_MUX") == "1" else []),
+            if S["syn.cleanup.narrow_mux"] else []),
           cfg.flat_mlir, "-o", grouped])
 
     print(f"[circt_flow] abc-bridge on {k} partitions, pool={cfg.abc_pool_size}")
@@ -887,11 +965,13 @@ def _merge_and_map_partitioned(cfg: FlowConfig) -> Path:
     # body override (PHYS-DP: the depth-preserving body for groups holding a
     # timing-critical datapath op); other groups keep the default body.
     per_group = {}
-    if os.environ.get("CIRCT_FLOW_GROUP_SCRIPTS"):
+    if S["syn.abc.partition.group_scripts"]:
         import json as _json
         per_group = {g: f"abc-script-file={f}" for g, f in
-                     _json.load(open(os.environ["CIRCT_FLOW_GROUP_SCRIPTS"])).items()}
+                     _json.load(open(S["syn.abc.partition.group_scripts"])).items()}
         print(f"[circt_flow] per-group ABC scripts for {len(per_group)} group(s)")
+    EXECUTED.append(["(per group)", str(cfg.circt_abc_opt), _abc_bridge_opt(cfg),
+                     *[f"{g}: {x}" for g, x in sorted(per_group.items())]])
     results = ap.map_groups(grouped, workdir / "parts", str(cfg.circt_abc_opt),
                             _abc_bridge_opt(cfg), cfg.abc_pool_size,
                             per_group_extra=per_group)
@@ -930,7 +1010,7 @@ def export_netlist(cfg: FlowConfig) -> Path:
     cfg.synth_dir.mkdir(parents=True, exist_ok=True)
     print(f"[circt_flow] hw-flatten-modules + export-verilog -> {cfg.netlist}")
     src = cfg.mapped_mlir
-    if os.environ.get("CIRCT_FLOW_OUTLINE_AFTER_FLATTEN") == "1":
+    if cfg.settings["syn.outline_after_flatten"]:
         # outline-after-flatten leaves one public `<top>_residual` module,
         # which hw-flatten-modules keeps; make it private so the netlist is
         # flat (the fanout stage, sv2v and OpenSTA's flat view need one
@@ -960,7 +1040,7 @@ def export_netlist(cfg: FlowConfig) -> Path:
     # until it has been measured on the cv32a60x/cv64a6 arms.
     # CIRCT_FLOW_SWEEP_STUBS adds blackbox stub files (macros) for the Yosys
     # read.
-    if os.environ.get("CIRCT_FLOW_POST_MAP_SWEEP") == "1":
+    if cfg.settings["syn.post_map_sweep.enable"]:
         post_map_sweep(cfg)
     return cfg.netlist
 
@@ -971,7 +1051,7 @@ def post_map_sweep(cfg: FlowConfig) -> Path:
            str(cfg.netlist), cfg.design.top_module, str(swept)]
     for lib in cfg.design.synth_lib_tt:
         cmd += ["--liberty", str(lib)]
-    for stub in filter(None, os.environ.get("CIRCT_FLOW_SWEEP_STUBS", "").split(",")):
+    for stub in filter(None, (cfg.settings["syn.post_map_sweep.stubs"] or "").split(",")):
         cmd += ["--stubs", stub]
     _run(cmd)
     os.replace(swept, cfg.netlist)
@@ -1060,8 +1140,13 @@ def orfs_pnr(cfg: FlowConfig) -> Path:
     """Run circt_flow.orfs_pnr on the OpenSTA-compatible netlist, configured
     by the flow.yaml's `pnr:` section, on the tech pack's own ORFS platform
     if it has one (`pnr.orfs_platform_dir`), or hand the netlist to the
-    pack's own P&R command (`pnr.command`, pack_pnr below). Returns
-    <out>/pnr/pnr_metrics.json."""
+    pack's own P&R command (`pnr.command`, pack_pnr below), also through
+    the closure ladder (`pnr.ladder`). Returns <out>/pnr/pnr_metrics.json.
+
+    A pack command gets the pack's own P&R options as `--settings FILE`
+    (pack_command: the profile's pnr.settings_defaults and a session's
+    values, cfg.design.pack_settings). Without a pack command, values in
+    cfg.design.pack_settings are refused (never dropped)."""
     from . import orfs_pnr as pnr_mod
 
     p = cfg.design.pnr
@@ -1073,6 +1158,11 @@ def orfs_pnr(cfg: FlowConfig) -> Path:
         raise FileNotFoundError(
             f"{cfg.openroad_netlist} was not produced (the sv2v step needs "
             "its docker image); ORFS reads that netlist, not the raw one")
+    given = getattr(cfg.design, "pack_settings", None) or {}
+    if given and "command" not in cfg.design.pack_pnr:
+        raise ValueError(
+            f"pack P&R option(s) {', '.join(sorted(given))} need the tech pack's own P&R "
+            f"command (pnr.command); this run uses ORFS")
     if p.get("ladder"):
         from . import ladder as ladder_mod
         if "command" not in cfg.design.pack_pnr and (
@@ -1289,7 +1379,10 @@ def pack_command(cfg: FlowConfig, out: Path) -> tuple:
     """Write the netlist and SDC a tech pack's P&R command reads into out
     and return (argv, env): the command with its arguments, and the
     environment it runs in (the process environment plus the pack's wire RC
-    variables and the recipe's)."""
+    variables and the recipe's). With pack P&R options to hand over (the
+    profile's pnr.settings_defaults, cfg.design.pack_settings over them;
+    pack_options.handover), they are written to <out>/pack_settings.json
+    and the command gets `--settings <that file>` in front."""
     from . import orfs_pnr as pnr_mod
 
     p, top = cfg.design.pnr, cfg.design.top_module
@@ -1335,7 +1428,13 @@ def pack_command(cfg: FlowConfig, out: Path) -> tuple:
                   "skip those nets; rename with circt_flow.netlist_names")
     except OSError:
         pass
-    cmd = [*cfg.design.pack_pnr["command"], "--netlist", str(netlist),
+    from . import pack_options
+    settings_file = pack_options.write_handover(
+        cfg.design.pack_root, cfg.design.pack_pnr, out,
+        getattr(cfg.design, "pack_settings", None) or {}, log=print)
+    cmd = [*cfg.design.pack_pnr["command"],
+           *(["--settings", str(Path(settings_file).resolve())] if settings_file else []),
+           "--netlist", str(netlist),
            "--sdc", str(sdc), "--top", top, "--out", str(out),
            "--pack", str(cfg.design.pack_root)]
     # The pack's wire RC: CIRCT_FLOW_WIRE_RC (setup corner) and

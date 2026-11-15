@@ -111,8 +111,12 @@ the first rejection stops the others.
   rejection. Words that start with `./` or `../` are relative to the flow
   config. It gets the environment variables `CIRCT_FLOW_RUNG_DIR`,
   `CIRCT_FLOW_RUNG_INDEX`, `CIRCT_FLOW_LADDER_PARAM`,
-  `CIRCT_FLOW_LADDER_VALUE` (JSON), `CIRCT_FLOW_OUT` (the flow's `pnr` directory, `<out>/pnr`) and
-  `CIRCT_FLOW_PNR_METRICS`. **Exit 0: pass. Exit 1: reject. Exit 1 is also what an uncaught Python exception gives, so when `check.log` ends the way a crash ends the status is read as unverified: the last `Traceback (most recent call last):` followed only by indented lines (and the `During handling...` notices) and then one final line of the form `Name` or `Name: message`, where `Name` contains a lower-case letter (`ValueError`, `StopIteration`, `KeyboardInterrupt`). Anything after that final line, or a final line like `REJECT: too slow` (no lower-case letter in the first word), is the script's own output and the exit 1 stays a rejection. This is a heuristic: a multi-line message, or a script's own last line shaped like an exception, is misread. A check should catch its own errors and exit 2 for them. Anything else
+  `CIRCT_FLOW_LADDER_VALUE` (JSON), `CIRCT_FLOW_OUT` (the flow's `pnr` directory, `<out>/pnr`),
+  `CIRCT_FLOW_PNR_METRICS`, and, when the rung's pack command was handed pack
+  options, `CIRCT_FLOW_PACK_SETTINGS` (the rung's `pack_settings.json`, the
+  same file its command got with `--settings`; doc/pack-options.md; unset
+  otherwise, also when the flow's own environment has it). A rung's recorded
+  verdict is reused only with the same settings content. **Exit 0: pass. Exit 1: reject. Exit 1 is also what an uncaught Python exception gives, so when `check.log` ends the way a crash ends the status is read as unverified: the last `Traceback (most recent call last):` followed only by indented lines (and the `During handling...` notices) and then one final line of the form `Name` or `Name: message`, where `Name` contains a lower-case letter (`ValueError`, `StopIteration`, `KeyboardInterrupt`). Anything after that final line, or a final line like `REJECT: too slow` (no lower-case letter in the first word), is the script's own output and the exit 1 stays a rejection. This is a heuristic: a multi-line message, or a script's own last line shaped like an exception, is misread. A check should catch its own errors and exit 2 for them. Anything else
   (another status, a crash, a timeout, not starting): the check did not
   complete.** This is where a slower check goes: a simulation, a signoff run.
 
@@ -269,8 +273,11 @@ keeps its usual arguments (`--netlist --sdc --top --out --pack`) and its
 (relative to the pack) that the command reads and that a restart must not
 outlive a change of: they are hashed into the placement's manifest.
 
-**What the command backend's manifest covers**: the whole command line, the
-content of every word of it that is a file (the script), the netlist and SDC
+**What the command backend's manifest covers**: the whole command line (the
+job's own directory written as `<dir>`), the content of every word of it that
+is a file (the script, and the pack settings file `pack_settings.json` the flow
+writes into each job's directory when there are pack options to hand over,
+doc/pack-options.md), the netlist and SDC
 the flow gives it, the environment the flow itself builds for it (the pack's wire RC files and what they name, the variables the flow built for the command: values and file content), every option of the flow config's `pnr:` section (the
 command cannot say which of them act before the restart stage, so all count as
 acting before it; only the ladder parameter is left out), and the

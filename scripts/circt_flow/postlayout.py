@@ -60,7 +60,8 @@ from . import vtswap
 POST_KEYS = {"enabled", "margin_ps", "paths", "max_iter", "recover",
              "allow_footprint_change", "false_from", "hold_scope", "hold_tol_ps", "fix", "false_to",
              "sens_frac", "recover_order", "ladder_cap",
-             "ladder_escalate", "close_margin_ps", "recover_swap", "also_spef"}
+             "ladder_escalate", "close_margin_ps", "recover_swap", "also_spef", "recover_opts",
+             "flop_cap", "recover_block"}
 
 
 @dataclass(frozen=True)
@@ -92,9 +93,17 @@ class PostLayoutSpec:
     ladder_escalate: str = ""
     close_margin_ps: float = 0.0
     recover_swap: int = 0         # pair recovery: try this many top-leak cells
+    recover_opts: str = ""        # leakage recovery: comma list: seq_first, comp=N, seq_pair, pass=N
+    # ladder token above which the swap never moves a flop ("" none; the
+    # environment variable CIRCT_VT_FLOP_CAP applies when this is empty)
+    flop_cap: str = ""
     # second parasitic view timed together with the SPEF (opt-in): the fix and
     # the recovery then keep the worst slack over both
     also_spef: str = ""
+    # `recover_block` (opt-in): "<regex>@<ps>", a tail recovery after the pair recovery for
+    # the cells whose instance name matches, with their own slack floor in ps (vtswap.LayoutSpec.recover_block_re).
+    # The recover_opts token `blk=<regex>@<ps>` is the same setting.
+    recover_block: str = ""
 
 
 def spef_for_timing(spef: Path, out_dir: Path, restore: bool,
@@ -189,6 +198,12 @@ def parse_post_layout(d, where) -> PostLayoutSpec:
     if isinstance(ff, str) or not all(isinstance(x, str) for x in ff):
         raise vtswap.VtSwapError(f"{where}: pnr.post_layout.false_from must "
                                  "be a list of port names")
+    ropts = check_recover_opts(d.get("recover_opts", ""), f"{where}: pnr.post_layout")
+    blk = recover_block(ropts, d.get("recover_block", ""), f"{where}: pnr.post_layout")
+    check_block_floor(blk, float(mg), f"{where}: pnr.post_layout")
+    if blk and d.get("recover", True) is False:
+        raise vtswap.VtSwapError(f"{where}: pnr.post_layout.recover_block (or recover_opts "
+                                 "blk=) is a recovery pass: it needs recover: true")
     return PostLayoutSpec(
         enabled=d.get("enabled", True), margin_ps=float(mg),
         paths=d.get("paths", 1000), max_iter=d.get("max_iter", 40),
@@ -203,7 +218,148 @@ def parse_post_layout(d, where) -> PostLayoutSpec:
         ladder_escalate=d.get("ladder_escalate", ""),
         close_margin_ps=float(d.get("close_margin_ps", 0.0)),
         recover_swap=int(d.get("recover_swap", 0)),
+        recover_opts=ropts, recover_block=blk,
+        flop_cap=_flop_cap(d.get("flop_cap", ""), where),
         also_spef=str(d.get("also_spef", "")))
+
+
+def check_recover_opts(v, where: str) -> str:
+    """recover_opts: a comma list of seq_first, seq_pair, comp=N, pass=N
+    (N >= 1) and blk=<regex>@<ps> (the block tail recovery, the same as the
+    recover_block key: check_block). Returned unchanged."""
+    if not isinstance(v, str):
+        raise vtswap.VtSwapError(f"{where}.recover_opts must be a string "
+                                 "(comma list of seq_first, seq_pair, "
+                                 "comp=N, pass=N, blk=<regex>@<ps>)")
+    for t in (x.strip() for x in v.split(",")):
+        if not t or t in ("seq_first", "seq_pair"):
+            continue
+        if t.startswith("blk="):
+            check_block(t[4:], f"{where}.recover_opts")
+            continue
+        k, _, n = t.partition("=")
+        if k not in ("comp", "pass") or not n.isdigit() or int(n) < 1:
+            raise vtswap.VtSwapError(
+                f"{where}.recover_opts: {t!r} is not seq_first, seq_pair, "
+                "comp=N, pass=N (N >= 1) or blk=<regex>@<ps>")
+    return v
+
+
+# Constructs whose meaning differs between Python's re and Tcl's regexp (ARE): refused when tclsh is not there to
+# check the expression itself.
+_PY_ONLY = (("\\b", r"\b (backspace in Tcl, word boundary in Python)"),
+            ("(?P<", r"(?P<name> (Python named group, not Tcl)"),
+            ("(?<=", "lookbehind (not in Tcl)"), ("(?<!", "lookbehind (not in Tcl)"))
+_TCL_CHECKED: dict = {}
+_RUN = subprocess.run   # bound at import: the regex check is not a swap's OpenSTA call
+
+
+def _has_escape(rx: str, ch: str) -> bool:
+    """`rx` holds the escape backslash-`ch` (a backslash not itself escaped)."""
+    i = 0
+    while i < len(rx) - 1:
+        if rx[i] == "\\":
+            if rx[i + 1] == ch:
+                return True
+            i += 2
+        else:
+            i += 1
+    return False
+
+
+def tcl_regex_check(rx: str) -> Tuple[str, str]:
+    """('tclsh', "") when `rx` compiles as a Tcl regular expression, ('tclsh', error) when it does not;
+    without tclsh ('conservative', error or ""): constructs known to differ between Python's re and Tcl's
+    are refused (\\b, (?P<, lookbehind) and the rest is compiled with re. The first element says which path was used."""
+    import shutil
+    # \b compiles in Tcl too, as a BACKSPACE (a word boundary in Python): an
+    # instance name never holds one, so the branch it is in would silently
+    # match nothing. Refused on both paths; Tcl's word
+    # boundaries are \y, \m, \M.
+    if _has_escape(rx, "b"):
+        return ("tclsh" if shutil.which("tclsh") else "conservative",
+                r"\b is a backspace in a Tcl regular expression (not a word boundary): "
+                r"use \y (or \m / \M) for a word boundary")
+    tcl = shutil.which("tclsh")
+    if tcl:
+        if rx not in _TCL_CHECKED:
+            # the expression goes through the environment, not through the script text
+            p = _RUN([tcl], input="if {[catch {regexp -- $env(TCLCHECK_RX) {}} e]} "
+                                            "{puts $e; exit 3}\nexit 0\n",
+                               capture_output=True, text=True, timeout=30,
+                               env={**os.environ, "TCLCHECK_RX": rx})
+            _TCL_CHECKED[rx] = "" if p.returncode == 0 else (p.stdout.strip() or "invalid")
+        return "tclsh", _TCL_CHECKED[rx]
+    for frag, why in _PY_ONLY:
+        if frag in rx:
+            return "conservative", f"{why}: refused because tclsh is not available to check it"
+    import re as _re
+    try:
+        _re.compile(rx)
+    except _re.error as e:
+        return "conservative", str(e)
+    return "conservative", ""
+
+
+def check_block(v, where: str):
+    """A block tail recovery setting "<regex>@<ps>" (recover_block, or the
+    recover_opts token blk=): (regex, ps). The regex is a Tcl regexp matched
+    against full instance names, checked as a Tcl regular expression (tclsh
+    when it is available, else constructs known to differ from Python's re
+    are refused: tcl_regex_check); no comma (it is also a recover_opts token,
+    a comma list) and no white space; ps >= 0."""
+    import re as _re
+    m = _re.fullmatch(r"(.+)@([0-9]+(?:\.[0-9]*)?)", v) if isinstance(v, str) else None
+    if not m or _re.search(r"[,\s]", m.group(1)):
+        raise vtswap.VtSwapError(
+            f"{where}: {v!r} is not <regex>@<ps> (a regular expression without comma "
+            "or white space, @, a slack floor in ps >= 0)")
+    path, err = tcl_regex_check(m.group(1))
+    if err:
+        raise vtswap.VtSwapError(f"{where}: {v!r}: not a Tcl regular expression ({path} check): {err}")
+    return m.group(1), float(m.group(2))
+
+
+def check_block_floor(blk: str, margin_ps: float, where: str) -> None:
+    """The block floor is a slack the block may go down to, below the global margin: above it the recovery
+    would clamp it to the global floor, so it is refused (never clamped silently)."""
+    if blk and check_block(blk, where)[1] > margin_ps:
+        raise vtswap.VtSwapError(
+            f"{where}: the block floor of {blk!r} ({check_block(blk, where)[1]:g} ps) is above the global "
+            f"margin_ps ({margin_ps:g}); the block tail recovery goes below the global floor, "
+            "so a higher floor could never apply")
+
+
+def recover_block(ropts: str, key, where: str) -> str:
+    """The block tail recovery setting from the recover_block key or a
+    recover_opts blk= token ("" when neither is given; both is an error)."""
+    toks = [t.strip()[4:] for t in ropts.split(",") if t.strip().startswith("blk=")]
+    if key not in ("", None):
+        if not isinstance(key, str):
+            raise vtswap.VtSwapError(f"{where}.recover_block must be a string <regex>@<ps>")
+        check_block(key, f"{where}.recover_block")
+        toks.append(key)
+    if len(toks) > 1:
+        raise vtswap.VtSwapError(
+            f"{where}: one block tail recovery only (recover_block / recover_opts blk=): "
+            + ", ".join(toks))
+    return toks[0] if toks else ""
+
+
+def _block_fields(block: str, time_unit_ps: float) -> dict:
+    """LayoutSpec fields of a recover_block setting (none when it is off,
+    so the swap's script is the default one)."""
+    if not block:
+        return {}
+    rx, ps = check_block(block, "recover_block")
+    return {"recover_block_re": rx, "recover_block_floor": ps / time_unit_ps}
+
+
+def _flop_cap(v, where: str) -> str:
+    if not isinstance(v, str):
+        raise vtswap.VtSwapError(f"{where}: pnr.post_layout.flop_cap must be "
+                                 "a ladder token")
+    return v
 
 
 # ---------------------------------------------------------------- data
@@ -482,6 +638,10 @@ def optimise(netlist, top, out_dir, libs, hold_libs, tokens, flavour_re, sdc,
                                close_margin=spec.close_margin_ps
                                / time_unit_ps,
                                recover_swap=spec.recover_swap,
+                               recover_opts=",".join(
+                                   t for t in spec.recover_opts.split(",")
+                                   if not t.strip().startswith("blk=")),
+                               **_block_fields(spec.recover_block, time_unit_ps),
                                spef2=(Path(spec.also_spef)
                                       if spec.also_spef else None))
     out = out_dir / f"{top}_postopt.v"
@@ -490,7 +650,8 @@ def optimise(netlist, top, out_dir, libs, hold_libs, tokens, flavour_re, sdc,
     res = vtswap.swap(netlist, top, out, libs, tokens, flavour_re, sdc_text,
                       spec.paths, spec.max_iter, spec.recover, image=image,
                       margin=spec.margin_ps / time_unit_ps,
-                      hold_libs=hold_libs, layout=layout)
+                      hold_libs=hold_libs, layout=layout,
+                      flop_cap=spec.flop_cap)
     after = measure(out, top, libs, sdc, spef, hold_libs,
                     report=out_dir / "paths_after.rpt")
     orig, new = netlist.read_text(), out.read_text()
@@ -578,8 +739,13 @@ def run_flow(cfg, spec: PostLayoutSpec, pnr_dir: Path) -> Optional[dict]:
     if not fl:
         raise vtswap.VtSwapError(f"post_layout: {prof.name} has no "
                                  "vt_flavours:")
+    # the option post.flop_cap: the key, or an argument / the legacy
+    # variable over it (options.py)
+    from . import options
+    import dataclasses as _dc
+    spec = _dc.replace(spec, flop_cap=options.of(cfg)["post.flop_cap"])
     vtswap.check_ladder_tokens(spec.ladder_cap, spec.ladder_escalate,
-                               fl["tokens"], "pnr.post_layout")
+                               fl["tokens"], "pnr.post_layout", spec.flop_cap)
     libs = prof.libs_at(rail=d.rail)
     hold = prof.hold_corner
     hold_libs = (prof.libs_at(hold, rail=d.rail)
@@ -640,6 +806,21 @@ def main(argv=None) -> int:
     ap.add_argument("--close-margin-ps", type=float, default=0.0)
     ap.add_argument("--recover-swap", type=int, default=0,
                     help="pair recovery over this many top-leakage cells")
+    ap.add_argument("--recover-opts", default="",
+                    help="comma list: seq_first (flops lead the recovery "
+                    "order), comp=N (up to N compensating cells per pair), "
+                    "seq_pair (flops lead the pair candidates), pass=N "
+                    "(repeat the pair recovery N times), blk=<regex>@<ps> (= "
+                    "--recover-block)")
+    ap.add_argument("--recover-block", default="", metavar="REGEX@PS",
+                    help="option post.recover.block: after the pair recovery, the "
+                    "cells whose instance name matches REGEX go down with their own "
+                    "slack floor of PS picoseconds (other cells untouched)")
+    ap.add_argument("--flop-cap", default=None,
+                    help="ladder token above which no flop is moved (option "
+                    "post.flop_cap; default none; the legacy variable "
+                    "CIRCT_VT_FLOP_CAP applies, with a warning, when this is "
+                    "not given)")
     ap.add_argument("--also-spef", default="",
                     help="second parasitic view (SPEF) timed together with "
                     "--spef: worst slack over both (needs a hold corner)")
@@ -685,8 +866,16 @@ def main(argv=None) -> int:
               "the swap moves cells along); --measure-only times without one",
               file=sys.stderr)
         return 2
+    if a.flop_cap is None:
+        from . import options
+        a.flop_cap = options.cli_default("post.flop_cap")
     vtswap.check_ladder_tokens(a.ladder_cap, a.ladder_escalate, fl["tokens"],
-                               "postlayout")
+                               "postlayout", a.flop_cap)
+    check_recover_opts(a.recover_opts, "postlayout")
+    blk = recover_block(a.recover_opts, a.recover_block, "postlayout")
+    check_block_floor(blk, a.margin_ps, "postlayout")
+    if blk and a.no_recover:
+        ap.error("--recover-block / recover-opts blk= is a recovery pass: not with --no-recover")
     spec = PostLayoutSpec(margin_ps=a.margin_ps, paths=a.paths,
                           max_iter=a.max_iter, recover=not a.no_recover,
                           allow_footprint_change=a.allow_footprint_change,
@@ -700,6 +889,9 @@ def main(argv=None) -> int:
                           ladder_escalate=a.ladder_escalate,
                           close_margin_ps=a.close_margin_ps,
                           recover_swap=a.recover_swap,
+                          recover_opts=a.recover_opts,
+                          recover_block=blk,
+                          flop_cap=a.flop_cap,
                           also_spef=a.also_spef)
     rec = optimise(a.netlist, a.top, a.out, libs, hold_libs, fl["tokens"],
                    fl["re"], a.sdc, a.spef, a.lef, spec, unit_ps)
