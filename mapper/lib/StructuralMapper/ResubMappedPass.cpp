@@ -276,7 +276,11 @@ struct ResubMappedPass
           continue;
         // Pin assignments are name=source; resolve to the cell's liberty
         // input-pin ORDER so the pass can instantiate positionally.
-        const CellPattern *pat = libRef->patternFor(cellName);
+        // an implementation that needs a cell --liberty-dont-use excludes is
+        // dropped like one whose cell the library does not have
+        const CellPattern *pat = LibertyLibrary::isDontUse(cellName)
+                                     ? nullptr
+                                     : libRef->patternFor(cellName);
         if (!pat) {
           db.erase(curTT);
           have = false;

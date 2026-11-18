@@ -656,8 +656,10 @@ def optimise(netlist, top, out_dir, libs, hold_libs, tokens, flavour_re, sdc,
                     report=out_dir / "paths_after.rpt")
     orig, new = netlist.read_text(), out.read_text()
     changes = vtswap.cell_changes(orig, new)
-    flat = {i: (c, new_c) for m, d in changes.items() for i, new_c in d.items()
-            for c in [vtswap.instance_cells(orig)[m][i]]}
+    # parsed once: inside the comprehension it was parsed again for every
+    # changed instance (slow on a large netlist)
+    orig_cells = vtswap.instance_cells(orig)
+    flat = {i: (orig_cells[m][i], new_c) for m, d in changes.items() for i, new_c in d.items()}
     footprint = []
     if sizes:
         for i, (a, b) in sorted(flat.items()):

@@ -69,6 +69,36 @@ def _run_plain(cmd: Sequence[str | Path], *, stdout: Path | None = None, env=Non
         subprocess.run(str_cmd, env=env, check=True)
 
 
+_DONT_USE_CHECKED: set = set()
+
+
+def _mapper_tool(cfg) -> list:
+    """The head of a circt-abc-opt command: the tool and its tool-wide options.
+    syn.library.dont_use_structural: the profile's dont_use patterns (cell-name
+    globs, what ABC already gets as `read_lib -X`) also keep the structural
+    passes off those cells (--liberty-dont-use: every pass takes its cells from
+    one library class, so one tool-wide option covers them all)."""
+    tool = cfg.circt_abc_opt
+    pats = list(getattr(cfg.design, "dont_use", None) or [])
+    if not pats or not cfg.settings["syn.library.dont_use_structural"]:
+        return [tool]
+    bad = [p for p in pats if "," in p or " " in p]
+    if bad:
+        raise ValueError(f"syn.library.dont_use_structural: dont_use pattern(s) {bad} hold a comma or a blank, "
+                         "which the tool option's list cannot carry")
+    if str(tool) not in _DONT_USE_CHECKED and RUNNER is None:
+        try:
+            has = "liberty-dont-use" in subprocess.run([str(tool), "--help"], capture_output=True, text=True,
+                                                       timeout=60).stdout
+        except (OSError, subprocess.SubprocessError):
+            has = True                     # the tool's own error is the clearer one
+        if not has:
+            raise ValueError(f"syn.library.dont_use_structural needs a circt-abc-opt with --liberty-dont-use; "
+                             f"{tool} does not have it (rebuild the mapper)")
+        _DONT_USE_CHECKED.add(str(tool))
+    return [tool, "--liberty-dont-use=" + ",".join(pats)]
+
+
 def _binary_has_pass(binary: str | Path, pass_name: str) -> bool:
     """True if `binary --help` lists `--<pass_name>` (an opt tool prints
     every registered pass there). Lets a flow stage degrade to the previous
@@ -141,7 +171,7 @@ def hw_aggregate_to_comb(cfg: FlowConfig) -> Path:
         if _binary_has_pass(cfg.circt_abc_opt, "localize-dynamic-rmw"):
             src = cfg.core_mlir_rmw
             print(f"[circt_flow] localize-dynamic-rmw -> {src}")
-            _run([cfg.circt_abc_opt, "--localize-dynamic-rmw",
+            _run([*_mapper_tool(cfg), "--localize-dynamic-rmw",
                   cfg.core_mlir_raw, "-o", src])
         else:
             # A circt-abc-opt built before the pass existed: keep the
@@ -218,7 +248,7 @@ def structural_mapping(cfg: FlowConfig) -> Path:
     with scoping.applying(_sc, cfg):
       _run(
         [
-            cfg.circt_abc_opt,
+            *_mapper_tool(cfg),
             # Small seq.firmem memories (llhd-mem2reg promotes depth-2/4 FIFO
             # data words into them) become per-word registers first: AIGER
             # has no memory primitive, so a residual carrying one blackboxes.
@@ -690,7 +720,7 @@ def flatten_shell(cfg: FlowConfig) -> Path:
         print("[circt_flow] outline-residual-logic AFTER flatten (one residual)")
         _run(
             [
-                cfg.circt_abc_opt,
+                *_mapper_tool(cfg),
                 "--outline-residual-logic",
                 "--canonicalize",
                 cfg.flat_mlir,
@@ -707,7 +737,7 @@ def flatten_shell(cfg: FlowConfig) -> Path:
         print("[circt_flow] prune-unused-residual-outputs + canonicalize/cse")
         _run(
             [
-                cfg.circt_abc_opt,
+                *_mapper_tool(cfg),
                 "--prune-unused-residual-outputs",
                 "--canonicalize",
                 "--cse",
@@ -817,7 +847,40 @@ def _select_prefix_or_opts(cfg: FlowConfig) -> list[str]:
             "--hw-aggregate-to-comb"]
 
 
+def _map_once_refusals(cfg: FlowConfig, n: int) -> None:
+    """Called when map_once is about to map `n` module(s) by themselves. What acts on a GROUP before it is mapped, or
+    names its files per group, does not reach such a module: refused, not ignored. So are pipeline edits and pass
+    hooks of the stage (its commands depend on the design and are not the planned ones)."""
+    S = cfg.settings
+    clash = [o for o in ("syn.cleanup.specialize_mux_arms", "syn.cleanup.narrow_mux",
+                         "syn.abc.partition.group_scripts", "syn.abc.partition.isolate_substr") if S[o]]
+    clash += [f"the mapper's {o}" for o, v in (("use-mapped-dir", cfg.abc_use_mapped_dir),
+                                                ("save-mapped-dir", cfg.abc_save_mapped_dir),
+                                                ("save-aig-dir", getattr(cfg, "abc_save_aig_dir", None))) if v]
+    if clash:
+        raise ValueError(f"syn.abc.partition.map_once: {n} module(s) would be mapped by themselves, where "
+                         f"{', '.join(clash)} does not act; turn one of them off")
+    if RUNNER is not None:
+        raise ValueError("syn.abc.partition.map_once cannot be combined with pipeline edits or pass hooks of the "
+                         "mapping stage: its commands depend on the design and are not the planned ones")
+
+
+def _check_map_once_options(cfg: FlowConfig) -> None:
+    """An option of the map_once family that could not act is refused, not ignored."""
+    S = cfg.settings
+    once, cache, verify = (S["syn.abc.partition.map_once"], S["syn.abc.partition.map_cache"],
+                           S["syn.abc.partition.map_cache_verify"])
+    if once and cfg.partitions < 2:
+        raise ValueError("syn.abc.partition.map_once acts in the partitioned mapping only (partitions >= 2)")
+    if cache and not once:
+        raise ValueError("syn.abc.partition.map_cache needs syn.abc.partition.map_once (the cache holds modules mapped "
+                         "by themselves)")
+    if verify and not cache:
+        raise ValueError("syn.abc.partition.map_cache_verify needs syn.abc.partition.map_cache")
+
+
 def merge_and_map(cfg: FlowConfig) -> Path:
+    _check_map_once_options(cfg)
     if cfg.partitions > 1:
         return _merge_and_map_partitioned(cfg)
     print(
@@ -851,7 +914,7 @@ def merge_and_map(cfg: FlowConfig) -> Path:
         merge_opt += "=" + " ".join(_mopts)
     _run(
         [
-            cfg.circt_abc_opt,
+            *_mapper_tool(cfg),
             *_specialize_mux_arms_opts(cfg),
             merge_opt,
             "--canonicalize",
@@ -916,11 +979,35 @@ def _merge_and_map_partitioned(cfg: FlowConfig) -> Path:
     # controller's long priority chain and rippled the divider's adder into
     # the design's worst path. Produces the group-map consumed below.
     S = cfg.settings
+    # syn.abc.partition.map_once: the residual modules instantiated more than
+    # once are mapped once each, by themselves, and kept out of the groups
+    # (map_once.py). `flat` is what the grouping below reads.
+    flat = cfg.flat_mlir
+    shared_parts = {}
+    if S["syn.abc.partition.map_once"]:
+        from . import map_once
+        EXECUTED.append(["(map_once)", f"min-instances={S['syn.abc.partition.map_once_min_instances']}",
+                         f"cache={S['syn.abc.partition.map_cache']}",
+                         f"cache-verify={S['syn.abc.partition.map_cache_verify']}"])
+        # (a command-line recording without tools has no flat IR: nothing is shared then)
+        text = Path(cfg.flat_mlir).read_text() if Path(cfg.flat_mlir).is_file() else ""
+        # the report of this stage run only (an earlier run's would otherwise stay when nothing is cached now)
+        (workdir / "once" / "cache_report.json").unlink(missing_ok=True)
+        blocks = ap.module_blocks(text)
+        shared = map_once.shared_modules(text, blocks, int(S["syn.abc.partition.map_once_min_instances"]))
+        if shared:
+            _map_once_refusals(cfg, len(shared))
+            once = workdir / "once"
+            EXECUTED.append(["(per shared module)", str(cfg.circt_abc_opt), _abc_bridge_opt(cfg),
+                             *[f"target={n}" for n in shared]])
+            shared_parts = map_once.map_shared(cfg, text, blocks, shared, once, _abc_bridge_opt(cfg))
+            flat = once / "flat_without_shared.mlir"
+            flat.write_text(map_once.hide(text, blocks, sorted(shared_parts)))
     group_map = S["syn.abc.partition.group_map"]
     if S["syn.abc.partition.group_by_depth"] and not group_map:
         group_map = str(workdir / "depth_group_map.json")
         _run([sys.executable, str(Path(__file__).with_name("depth_groups.py")),
-              str(cfg.flat_mlir), str(k), group_map,
+              str(flat), str(k), group_map,
               "--opt", str(cfg.circt_abc_opt),
               "--report", str(workdir / "depth_groups.tsv"),
               # the adder architecture the script used to read from the
@@ -952,13 +1039,44 @@ def _merge_and_map_partitioned(cfg: FlowConfig) -> Path:
     # and ABC then spends the group's whole budget proving it away. cv32a60x
     # group g30 measured 68,254 -> 19,497 AIGER ANDs, ABC `cec`-equivalent.
     # OFF by default (project convention for a new lever).
-    _run([cfg.circt_abc_opt, "--mlir-disable-threading",
+    _run([*_mapper_tool(cfg), "--mlir-disable-threading",
           *_specialize_mux_arms_opts(cfg), *merge_args,
           "--canonicalize", "--hw-aggregate-to-comb",
           *(["--narrow-mux-to-differing-bits=enable-narrow-mux=true",
              "--canonicalize", "--cse"]
             if S["syn.cleanup.narrow_mux"] else []),
-          cfg.flat_mlir, "-o", grouped])
+          flat, "-o", grouped])
+
+    # (`text` is empty when the commands are only being planned: no flat IR, and a grouped file found then is an
+    # earlier run's)
+    if S["syn.abc.partition.map_once"] and text and Path(grouped).is_file():
+        from . import map_once
+        # What the grouping left unmerged is mapped by itself: the pass does nothing with a group that has a single
+        # instantiation site, and with the shared modules out of the groups that is easy to arrive at. Such a module
+        # was neither merged nor blackboxed, so a failure here stops the stage (also with skip-unmappable).
+        gtext = Path(grouped).read_text()
+        gblocks = ap.module_blocks(gtext)
+        left = map_once.left_unmerged(gtext, gblocks, ap.GROUP_PREFIX)
+        if left:
+            _map_once_refusals(cfg, len(left))
+            EXECUTED.append(["(per module left unmerged)", str(cfg.circt_abc_opt), _abc_bridge_opt(cfg),
+                             *[f"target={n}" for n in left]])
+            # the modules mapped above are extern declarations in this text: they are not cells, and are left out of
+            # what the mapper is given
+            got = map_once.map_shared(cfg, gtext, gblocks, left, workdir / "once", _abc_bridge_opt(cfg), alone=True,
+                                      leave_out=sorted(shared_parts), earlier_report=bool(shared_parts))
+            bad = [n for n in left if n not in got]
+            if bad:
+                raise RuntimeError(f"map_once: {', '.join(bad)}: left unmerged by the grouping and the mapper fails on it by "
+                                   "itself; it would reach the netlist unmapped (see its log under partitions/once; "
+                                   "syn.abc.partition.map_once can be turned off for this design)")
+            shared_parts.update(got)
+            gtext = map_once.hide(gtext, gblocks, left)
+            Path(grouped).write_text(gtext)
+        if shared_parts and not ap.group_names(gtext):
+            # no group: nothing was left for ABC here; the grouping command's whole-design passes have run
+            print("[circt_flow] map_once: no group left to map")
+            return _finish_partitioned(cfg, grouped, shared_parts)
 
     print(f"[circt_flow] abc-bridge on {k} partitions, pool={cfg.abc_pool_size}")
     # CIRCT_FLOW_GROUP_SCRIPTS=<json {group: abc script file}>: per-group ABC
@@ -985,6 +1103,12 @@ def _merge_and_map_partitioned(cfg: FlowConfig) -> Path:
     spliced = workdir / "spliced.mlir"
     ap.combine(grouped, results, spliced)
 
+    return _finish_partitioned(cfg, spliced, shared_parts)
+
+
+def _finish_partitioned(cfg: FlowConfig, spliced: Path, shared_parts: dict) -> Path:
+    """The whole-design passes after the groups are mapped; with
+    syn.abc.partition.map_once also puts the modules mapped once back."""
     # map-shell-logic + remove-identity-buffers still run over the whole
     # design, exactly as in the monolithic path -- neither is
     # partition-sensitive. map-shell-logic maps the outliner's feedback-cut
@@ -992,10 +1116,18 @@ def _merge_and_map_partitioned(cfg: FlowConfig) -> Path:
     # is 100% cells + wiring (OpenSTA rejects operator expressions).
     print(f"[circt_flow] map-shell-logic + remove-identity-buffers -> "
           f"{cfg.mapped_mlir}")
-    _run([cfg.circt_abc_opt, "--canonicalize",
+    _run([*_mapper_tool(cfg), "--canonicalize",
           f"--map-shell-logic=liberty={cfg.design.lib}",
           _remove_identity_buffers_opt(cfg),
           spliced, "-o", cfg.mapped_mlir])
+    if shared_parts:
+        from . import abc_partition as ap
+        from . import map_once
+        mapped = Path(cfg.mapped_mlir)
+        pre = Path(str(mapped) + ".once_pre.mlir")
+        pre.write_text(map_once.put_back(mapped.read_text(), shared_parts, ap.module_blocks, ap._EXTERN_RE))
+        print(f"[circt_flow] map_once: {len(shared_parts)} mapped module(s) put back + remove-identity-buffers -> {mapped}")
+        _run([*_mapper_tool(cfg), "--canonicalize", _remove_identity_buffers_opt(cfg), pre, "-o", mapped])
     return cfg.mapped_mlir
 
 

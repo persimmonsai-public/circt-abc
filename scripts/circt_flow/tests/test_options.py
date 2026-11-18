@@ -436,6 +436,13 @@ _APPLIED_ELSEWHERE = {
     # post.* section keys need a pack with vt_flavours: here they are only refused for the
     # lack of one; this one is shown to reach the swap script with such a pack
     "post.recover.block": "test_postlayout.py::test_new_post_layout_options_reach_the_swap_script",
+    # acts only with a profile that has dont_use patterns (this check's flow.yaml has none)
+    "syn.library.dont_use_structural": "test_dont_use_structural_reaches_every_mapper_command",
+    # read by the partitioned mapping stage in Python (the design decides which modules are shared; no tool command
+    # carries them): shown to act in test_map_once.py::test_the_stage_maps_shared_modules_once_and_groups_the_rest
+    **{n: "test_map_once.py::test_the_stage_maps_shared_modules_once_and_groups_the_rest"
+       for n in ("syn.abc.partition.map_once", "syn.abc.partition.map_once_min_instances",
+                 "syn.abc.partition.map_cache", "syn.abc.partition.map_cache_verify")},
 }
 
 
@@ -756,3 +763,38 @@ def test_window_form_reaches_power_sub_runs(tmp_path, monkeypatch):
     with contextlib.redirect_stdout(io.StringIO()):
         assert "window-form=true window-count=5" in json.dumps(
             golden_cmdlines.stage_commands(seen["cfg"]))
+
+
+def test_dont_use_structural_reaches_every_mapper_command(tmp_path):
+    """syn.library.dont_use_structural: the profile's dont_use patterns go to every circt-abc-opt command as the
+    tool-wide --liberty-dont-use; without the option, or without patterns, no command changes."""
+    def cmds(on, pats):
+        d = tmp_path / f"{int(on)}{len(pats)}"
+        d.mkdir()
+        doc = {"design": {"top_module": "top", "clock_period_ps": 1000}, "pdk": {"synth_lib_tt": ["/LIB/a.lib"]}}
+        if on:
+            doc["options"] = {"syn.library.dont_use_structural": True}
+        (d / "f.yaml").write_text(yaml.safe_dump(doc))
+        cfg = FlowConfig.load(d / "f.yaml", d / "o", circt_abc_opt="/BIN/opt", circt_opt="/BIN/copt", abc_bin="/BIN/abc")
+        object.__setattr__(cfg.design, "dont_use", list(pats))      # as a profile with dont_use patterns gives it
+        import contextlib
+        with contextlib.redirect_stdout(io.StringIO()):
+            return [[a.replace(str(d), "<D>") for a in c] for c in golden_cmdlines.stage_commands(cfg)]
+    base = cmds(False, ["TINV*", "TBUF_X1"])
+    assert cmds(True, []) == cmds(False, [])
+    got = cmds(True, ["TINV*", "TBUF_X1"])
+    tool = [c for c in got if c[0] == "/BIN/opt"]
+    assert tool and all(c[1] == "--liberty-dont-use=TINV*,TBUF_X1" for c in tool)
+    assert [[a for a in c if not a.startswith("--liberty-dont-use")] for c in got] == base
+    with pytest.raises(ValueError, match="comma or a blank"):
+        cmds(True, ["A,B"])
+
+
+def test_the_pipeline_editor_keeps_liberty_dont_use_with_the_tool(tmp_path):
+    """--liberty-dont-use is a flag of the tool, not a pass: a command split at a pass hook keeps it in every part."""
+    from circt_flow import pipeline_edit as pe
+    argv = ["/BIN/opt", "--liberty-dont-use=TINV*", "--mlir-disable-threading", "--canonicalize", "--cse", "in.mlir", "-o", "out.mlir"]
+    c = pe.make_command("x", argv, None, {"/BIN/opt"})
+    assert c.editable and [p.arg for p in c.passes] == ["--canonicalize", "--cse"]
+    assert c.argv(c.passes[:1], dst="mid.mlir")[:3] == ["/BIN/opt", "--liberty-dont-use=TINV*", "--mlir-disable-threading"]
+    assert c.argv(c.passes[1:], src="mid.mlir")[1] == "--liberty-dont-use=TINV*"

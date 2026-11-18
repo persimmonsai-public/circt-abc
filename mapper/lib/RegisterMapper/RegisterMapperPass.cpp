@@ -413,6 +413,13 @@ struct RegisterMapperPass
   hw::HWModuleExternOp getOrCreateMbDecl(ModuleOp module, const MbClass &c,
                                          unsigned n) {
     std::string name = MbSpec::subst(c.cellTmpl, "n", n);
+    // The multibit spec names its cells itself: a cell it names that
+    // --liberty-dont-use excludes is a contradiction of the two inputs, and
+    // is refused rather than instantiated or silently replaced.
+    if (LibertyLibrary::isDontUse(name))
+      llvm::report_fatal_error(llvm::Twine("register-mapper: the multibit "
+                               "spec names cell ") + name +
+                               ", which --liberty-dont-use excludes");
     if (auto existing = externDecls.lookup(name))
       return existing;
     llvm::StringSet<> wantIn{c.clock};

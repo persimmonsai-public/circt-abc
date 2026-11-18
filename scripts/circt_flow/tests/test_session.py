@@ -1434,3 +1434,70 @@ def test_configure_after_the_run_started(flow, tmp_path, monkeypatch):
         t.configure(partitions=2)
     t.configure(run_vt_swap=True)
     assert t.cfg.run_vt_swap
+
+
+# ---- pack options on the command line, and taking one back
+def _run_script(tmp_path, args, body="def recipe(s):\n    SEEN.update(s.pack_options)\n"):
+    from circt_flow import script
+    sc = tmp_path / "r.py"
+    sc.write_text("SEEN = {}\n" + body)
+    return script.run_main([str(sc)] + [str(a) for a in args])
+
+
+def test_set_on_the_command_line_takes_pack_options(flow, tmp_path, monkeypatch, capsys):
+    f, _ = flow
+    pack = _pack_reg(tmp_path)
+    monkeypatch.setattr(Session, "_pack_root", lambda self, cfg=None: pack)
+    monkeypatch.setattr(Session, "_pack_pnr", lambda self, cfg=None: dict(_PACK_PNR))
+    made = []
+    orig = Session.set_pack_option
+    monkeypatch.setattr(Session, "set_pack_option",
+                        lambda self, n, v: (made.append(self), orig(self, n, v))[1])
+    assert _run_script(tmp_path, [f, tmp_path / "o", "--set", "xyz.tol=0.25", "--set", "syn.fanout.max=12"]) == 0
+    s = made[0]
+    assert s.pack_options == {"xyz.tol": 0.25} and s.pack_option_sources == {"xyz.tol": "set_pack_option"}
+    assert s._set_at["pack:xyz.tol"] == "--set" and s.db.syn.fanout.max == 12
+    # a wrong value and an unknown name are refused, as from a script
+    assert _run_script(tmp_path, [f, tmp_path / "o2", "--set", "xyz.tol=3"]) == 1
+    assert "xyz.tol" in capsys.readouterr().err
+    assert _run_script(tmp_path, [f, tmp_path / "o3", "--set", "xyz.toll=0.2"]) == 1
+    err = capsys.readouterr().err
+    assert "unknown option 'xyz.toll'" in err and "tech pack" in err and "did you mean xyz.tol" in err
+    # a mistyped circt-abc option keeps its suggestion
+    assert _run_script(tmp_path, [f, tmp_path / "o4", "--set", "syn.fanuot.max=3"]) == 1
+    assert "did you mean syn.fanout.max" in capsys.readouterr().err
+
+
+def test_set_of_an_unknown_name_without_a_pack_registry(flow, tmp_path, monkeypatch, capsys):
+    f, _ = flow
+    monkeypatch.setattr(Session, "_pack_registry", lambda self: {})
+    assert _run_script(tmp_path, [f, tmp_path / "o", "--set", "xyz.tol=0.25"]) == 1
+    assert "declares no P&R option registry" in capsys.readouterr().err
+
+
+def test_unset_pack_option(flow, tmp_path, monkeypatch):
+    f, _ = flow
+    pack = _pack_reg(tmp_path)
+    seen = {}
+    monkeypatch.setattr(Session, "_pack_root", lambda self, cfg=None: pack)
+    monkeypatch.setattr(Session, "_pack_pnr", lambda self, cfg=None: dict(_PACK_PNR))
+    monkeypatch.setattr(stages, "orfs_pnr", _handed([pack], seen))
+    s = Session(f, tmp_path / "o", **KW)
+    assert s.unset_pack_option("xyz.tol") is None                 # not set: nothing to take back
+    with pytest.raises(options.OptionError, match="unknown pack option"):
+        s.unset_pack_option("xyz.toll")
+    s.set_pack_option("xyz.tol", 0.25)
+    quiet(s.run, stop="sta")
+    quiet(s.place_and_route)
+    assert seen["options"] == {"xyz.tol": 0.25}
+    # the next run of the same directory: the option is still there, and cannot be taken back while the stage is done
+    r = Session.resume(tmp_path / "o")
+    assert r.pack_options == {"xyz.tol": 0.25}
+    with pytest.raises(SessionError, match="already run"):
+        r.unset_pack_option("xyz.tol")
+    r.invalidate("place_and_route")
+    assert r.unset_pack_option("xyz.tol") == 0.25
+    assert r.pack_options == {} and "pack:xyz.tol" not in r._set_at
+    quiet(r.place_and_route)
+    assert seen == {"given": {}, "options": {}}
+    assert Session.resume(tmp_path / "o").pack_options == {}

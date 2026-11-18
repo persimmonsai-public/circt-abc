@@ -643,6 +643,18 @@ OPTIONS: Tuple[Option, ...] = (
           "with isolate_substr: one group per isolated module"),
     _o("syn.abc.partition.group_scripts", "path", None, "JSON {group: abc script}: per-group ABC body",
        legacy_env=_E + "GROUP_SCRIPTS", binds=PassOption("abc-bridge", "abc-script-file")),
+    _o("syn.abc.partition.map_once", "bool", False,
+       "map every residual module instantiated more than once ONCE, by itself, instead of once per instance "
+       "(map_once.py; changes the netlist: such a module is optimised alone)",
+       binds=StageParam("merge_and_map (partitioned)", "map_once.py")),
+    _o("syn.abc.partition.map_once_min_instances", "int", 2, "with map_once: the instance count from which a module is mapped once",
+       range=(2, None), binds=StageParam("merge_and_map (partitioned)", "map_once.py")),
+    _o("syn.abc.partition.map_cache", "path", None,
+       "with map_once: a directory of mapped modules, reused when everything the mapper reads is unchanged "
+       "(map_cache.py: the module, every option, the files and binaries by content, the tools' environment)",
+       binds=StageParam("merge_and_map (partitioned)", "map_cache.py")),
+    _o("syn.abc.partition.map_cache_verify", "bool", False, "with map_cache: map on every hit as well and stop if the bytes differ (refused without map_cache)",
+       binds=StageParam("merge_and_map (partitioned)", "map_cache.py")),
     _o("syn.fanout.max", "int", None, "limit-fanout: balanced buffer trees above N loads (unset: off)",
        range=(1, None), legacy_env=_E + "MAX_FANOUT", binds=PassOption("limit-fanout", "max-fanout")),
     _o("syn.post_map_sweep.enable", "bool", False, "bit-level dead-logic sweep of the mapped netlist",
@@ -650,6 +662,12 @@ OPTIONS: Tuple[Option, ...] = (
        binds=StageParam("export_netlist", "post_map_sweep.py")),
     _o("syn.post_map_sweep.stubs", "str", "", "comma list of blackbox stub files for the sweep's read",
        legacy_env=_E + "SWEEP_STUBS", binds=StageParam("post_map_sweep", "--stubs")),
+    _o("syn.library.dont_use_structural", "bool", False,
+       "the profile's dont_use patterns also keep the structural mapping passes off those cells "
+       "(circt-abc-opt --liberty-dont-use); without it only ABC's library leaves them out. A multibit "
+       "register spec that would use an excluded cell is refused. A list written for ABC can leave a pass "
+       "without any cell of a kind (no clock-gating cell: nothing is gated)",
+       binds=StageParam("the pass commands of the stages and of run_pass", "--liberty-dont-use")),
     _o("syn.library.slow_cell_ratio", "float", None,
        "slow-cell filter: cells slower than ratio x median leave ABC's library (overrides the pack's ratio)",
        range=(0, None), legacy_env=_E + "SLOW_CELL_RATIO",
@@ -842,6 +860,9 @@ _req("syn.fanout_buffer.enabled syn.fanout_buffer.bundle_pins syn.fanout_buffer.
 _req("syn.post_map_sweep.stubs", ("syn.post_map_sweep.enable", True))
 _req("syn.abc.partition.group_map syn.abc.partition.group_by_depth "
      "syn.abc.partition.isolate_substr syn.abc.partition.group_scripts", ("_partitions", 2))
+_req("syn.abc.partition.map_once", ("_partitions", 2))
+_req("syn.abc.partition.map_once_min_instances syn.abc.partition.map_cache", ("syn.abc.partition.map_once", True))
+_req("syn.abc.partition.map_cache_verify", ("syn.abc.partition.map_once", True))
 _req("syn.abc.partition.isolate_each", ("_partitions", 2),
      ("syn.abc.partition.isolate_substr", "_dp"))
 
@@ -1175,6 +1196,22 @@ def parse_assignments(items: Iterable[str]) -> Dict[str, Any]:
         o = lookup(k, "--set")
         out[k] = o.parse(v, "--set") if o.type != "object" else _yaml_value(v)
     return out
+
+
+def split_assignments(items: Iterable[str]):
+    """parse_assignments for the session entries (`run`, `shell`): the
+    assignments to circt-abc's own options, parsed, and the `(NAME, VALUE)`
+    pairs whose name is not one of them. Those are the tech pack's own P&R
+    options when the pack has a registry; only a session knows the pack, so
+    script.py hands them to Session.set_pack_option, which checks the name
+    and the value against the pack's registry."""
+    own, other = [], []
+    for it in items or ():
+        if "=" not in it:
+            raise OptionError(f"--set {it!r}: expected NAME=VALUE")
+        k, v = it.split("=", 1)
+        (own if k.strip() in registry() else other).append((it, k.strip(), v))
+    return parse_assignments(i for i, _, _ in own), [(k, v) for _, k, v in other]
 
 
 def _yaml_value(text: str):

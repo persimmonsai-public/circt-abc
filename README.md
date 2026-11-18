@@ -103,6 +103,79 @@ against ORFS's own synthesis are next.
 
 ## Changes in this release
 
+Release 12. The new mapping options are off by default; without them the
+stages build the commands of release 11 and give its netlist.
+
+* Partitioned mapping, repeated modules (`syn.abc.partition.map_once`):
+  a residual module that is instantiated more than once is mapped once, by
+  itself, and used at every instance. Before, each instance's copy went
+  through ABC, so a design built from N identical blocks mapped the
+  block's logic N times. The netlist is not the one the stage gives without
+  the option: such a module is optimised alone, with its own critical delay
+  as ABC's budget. `syn.abc.partition.map_once_min_instances` (default 2)
+  sets the instance count from which a module is treated this way. Only
+  modules without an instance inside are taken. Such a module goes to ABC
+  as it stands, so what acts on a group before mapping, or names its files
+  per group, is refused whenever a module is mapped by itself
+  (`syn.cleanup.specialize_mux_arms`, `syn.cleanup.narrow_mux`,
+  `syn.abc.partition.group_scripts`, `syn.abc.partition.isolate_substr`,
+  the mapper's `use-mapped-dir`, `save-mapped-dir`, `save-aig-dir`), as are
+  pipeline edits and pass hooks of the mapping stage. A module the grouping
+  then leaves unmerged (it does nothing with a group that has a single
+  instantiation site) is mapped by itself as well, and the stage stops if
+  that fails, so no such module reaches the netlist unmapped.
+  The option needs the partitioned mapping (`partitions` of 2 or more) and
+  is refused without it.
+* Cache of mapped modules (`syn.abc.partition.map_cache`, a directory; with
+  `map_once`): a mapped module is kept and reused when everything the
+  mapper reads is unchanged: the module as handed to the mapper, every
+  mapper option, the content of the liberty, the cell stubs and the ABC
+  script (and of files the script names), the mapper and ABC binaries with
+  their shared libraries, the files ABC opens by name (`.abc.rc`, `abc.rc`,
+  `<library>.skip`), the tools' environment variables and the platform.
+  No file is keyed on its name or a time stamp; a call that cannot be
+  covered this way is mapped every time and reported (an option naming a
+  directory, a liberty with an `include_file`, an ABC script that sources
+  a file that is not found). Every word of the ABC script, and of
+  an ABC rc file, that names an existing file counts as a file it reaches,
+  and those files are followed in turn (a file over 4 MB is taken by
+  content only; a small file that is not text, or nesting deeper than 8
+  files, makes the call uncacheable). A record holds the host name and the paths
+  used, so a shared cache directory shares them. A hit is checked against
+  its record and checksum before use;
+  `syn.abc.partition.map_cache_verify` maps on every hit as well and stops
+  the run if the bytes differ. `<out>/partitions/once/cache_report.json`
+  lists the hits and misses of the stage's last run.
+* Excluded cells in the structural passes
+  (`syn.library.dont_use_structural`): the profile's `dont_use` patterns,
+  which so far only kept cells out of ABC's library, also keep the
+  structural mapping passes from choosing those cells: single-bit
+  registers, clock gates, adders, shell logic, fanout buffers and the
+  resubstitution database. A multibit register spec that would use an
+  excluded cell is refused. When the list excludes every inverter, a match
+  that needs one is not offered: a function with a direct cell still gets
+  it, one without is left as a pass leaves a function the library has no
+  cell for (the shell-logic pass stops with its "no liberty cell matches"
+  diagnostic; the other passes skip it). A list written
+  for ABC can leave a pass
+  without any cell of a kind: with every clock-gating cell excluded, for
+  instance, no clock is gated. The mapper tool has the option behind it,
+  `circt-abc-opt --liberty-dont-use=<glob>[,<glob>...]`; a combinational
+  cell that is already instantiated is still recognised.
+* Tech pack options on the command line: `run` and `shell` take
+  `--set NAME=VALUE` for a pack's own P&R options too (a name that is not
+  one of circt-abc's options is checked against the pack's registry).
+* `Session.unset_pack_option(name)` takes a pack option back. A session
+  keeps its pack options across runs of one run directory, and there was
+  no way to clear one.
+* Post-layout swap: writing the result parsed the original netlist once
+  per changed instance; it is parsed once.
+* Deprecation, as announced: this is the last release that accepts the
+  `CIRCT_FLOW_*` / `CIRCT_VT_*` environment variables (with a warning);
+  release 13 refuses them.
+
+## Changes in release 11
+
 * Option registry (`scripts/circt_flow/options.py`, reference
   `doc/options.md`): every switch of the flow is a named, typed option
   (`syn.*`, `pnr.*`, `cts.*`, `hold.*`, `post.*`, `run.*`) with its default,
@@ -116,7 +189,7 @@ against ORFS's own synthesis are next.
   between two runs' records.
 * Deprecation: the `CIRCT_FLOW_*` / `CIRCT_VT_*` environment variables are
   accepted, with one warning each naming the option that replaces it, in
-  this release and the next; from release 13 on they are refused. `--strict`
+  releases 11 and 12; from release 13 on they are refused. `--strict`
   refuses them now, and refuses any unknown name with those prefixes.
 * Behaviour changes of the legacy variables: a flag variable must be `1` or
   `0` (any other value is an error; earlier releases read it as off, or as on for a

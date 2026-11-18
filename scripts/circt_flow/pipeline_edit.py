@@ -72,7 +72,7 @@ OTHER_STEPS = {"elaborate": "front end and LLHD lowering, directive checks, cell
 REQUIRED = {"abc-bridge": "maps the residual logic to cells",
             "export-verilog": "writes the netlist"}
 # Flags of an opt tool that are not passes.
-_TOOL_FLAGS = {"o", "allow-unregistered-dialect", "split-input-file", "verify-diagnostics",
+_TOOL_FLAGS = {"o", "liberty-dont-use", "allow-unregistered-dialect", "split-input-file", "verify-diagnostics",
                "verify-each", "pass-pipeline", "load-pass-plugin", "load-dialect-plugin",
                "show-dialects", "emit-bytecode", "no-implicit-module", "debug", "help",
                "version", "help-hidden", "print-ir-after-all", "print-ir-before-all"}

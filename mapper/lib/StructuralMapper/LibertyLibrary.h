@@ -201,6 +201,12 @@ public:
   // be matchable, only enough of them for the patterns we look for).
   static std::optional<LibertyLibrary> loadFromFile(llvm::StringRef path);
 
+  // True when `name` matches a --liberty-dont-use pattern: the cell is left
+  // out of every cheapest-cell index (lookup, lookupFF*, lookupICGCell,
+  // lookupHalfAdder, lookupFullAdder, lookupWideAndOr) and is still found
+  // by name (patternFor, cellNamesWithTable).
+  static bool isDontUse(llvm::StringRef name);
+
   // Looks up the cheapest (lowest-area) cell whose function matches `table`
   // over `arity` inputs, under any permutation of which leaf feeds which
   // cell input pin. Returns std::nullopt if no cell of that arity matches.
@@ -318,6 +324,10 @@ private:
   // Area of the cheapest inverter, charged to an inverted-data flop: the
   // worst case, since ABC usually absorbs the inverter into D's logic.
   double inverterArea = 0.0;
+  // Set when the file has inverters and --liberty-dont-use excludes all of
+  // them (one excluded inverter's name): lookup() then offers no match
+  // that needs an inverter to complete it.
+  std::string excludedInverter;
   const FFCellPattern *cheapestNoResetFF = nullptr;
   const FFCellPattern *cheapestClearFF = nullptr;
   const FFCellPattern *cheapestSetFF = nullptr;

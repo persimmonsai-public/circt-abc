@@ -13,6 +13,14 @@ class db_syn_abc_partition:
     """with isolate_substr: one group per isolated module"""
     isolate_substr: str
     """modules containing this go to the last group alone"""
+    map_cache: str
+    """with map_once: a directory of mapped modules, reused when everything the mapper reads is unchanged (map_cache.py: the module, every option, the files and binaries by content, the tools' environment)"""
+    map_cache_verify: bool
+    """with map_cache: map on every hit as well and stop if the bytes differ (refused without map_cache)"""
+    map_once: bool
+    """map every residual module instantiated more than once ONCE, by itself, instead of once per instance (map_once.py; changes the netlist: such a module is optimised alone)"""
+    map_once_min_instances: int
+    """with map_once: the instance count from which a module is mapped once"""
 
 class db_syn_adders_cells:
     """namespace syn.adders.cells"""
@@ -204,6 +212,8 @@ class db_syn_fanout_buffer:
 
 class db_syn_library:
     """namespace syn.library"""
+    dont_use_structural: bool
+    """the profile's dont_use patterns also keep the structural mapping passes off those cells (circt-abc-opt --liberty-dont-use); without it only ABC's library leaves them out. A multibit register spec that would use an excluded cell is refused. A list written for ABC can leave a pass without any cell of a kind (no clock-gating cell: nothing is gated)"""
     slow_cell_ratio: float
     """slow-cell filter: cells slower than ratio x median leave ABC's library (overrides the pack's ratio)"""
 

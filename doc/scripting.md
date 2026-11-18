@@ -539,6 +539,7 @@ of its techpack.yaml; doc/pack-options.md) takes them as a settings file:
 
 ```python
 s.set_pack_option("report.label", "trial-3")    # validated against the pack's registry now
+# s.unset_pack_option("report.label") takes it back: the profile's or the pack's default applies again
 s.pack_options                                  # what place_and_route hands over
 s.pack_option_sources                           # where each value comes from
 s.place_and_route()                             # the command gets --settings <out>/pnr/pack_settings.json
@@ -556,6 +557,13 @@ own values are recorded (`settings.json` "pack_options", `session.json`) and rep
 placement and every rung, and compares their content when it reuses a placement. A pack
 without its own command (the ORFS stage) has no pack options; options it shares with the flow,
 set through `s.db`, act through the flow's `pnr:` section.
+
+On the command line of `run` and `shell`, `--set NAME=VALUE` takes the pack's options too: a name
+that is not one of circt-abc's options goes to `s.set_pack_option` (the same checks). A session
+keeps its pack options across runs of one run directory (`--resume`), so a script that sets an
+option in one mode only takes it back in the others with `s.unset_pack_option`. As with every
+option, one of a stage that has already run is refused until the stage is re-opened
+(`s.invalidate("place_and_route")`).
 
 ## 10. Not here yet
 

@@ -143,6 +143,9 @@ struct LimitFanoutPass
     // declare ourselves.
     const CellPattern *bufCell = nullptr;
     for (StringRef n : lib->identityCellNames()) {
+      // a buffer --liberty-dont-use excludes is never the one inserted
+      if (LibertyLibrary::isDontUse(n))
+        continue;
       const CellPattern *p = lib->patternFor(n);
       if (p && p->arity() == 1 && (!bufCell || p->area < bufCell->area))
         bufCell = p;

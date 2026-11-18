@@ -867,6 +867,26 @@ class Session:
         self._pack_given[name] = pack_options.parse_value(o, value, "set_pack_option")
         self._set_at[f"pack:{name}"] = _caller()
 
+    def unset_pack_option(self, name: str) -> Any:
+        """Take back a value set_pack_option (or `--set`) gave: the option is
+        handed to the pack as if this session had never set it (the profile's
+        settings_defaults or the pack's own default apply again). Returns the
+        value it had, None when it was not set. A session keeps its pack
+        options across runs of one run directory (resume), so a recipe that
+        sets an option in one mode only takes it back in the others. An
+        option shared with circt-abc is reset through s.db instead."""
+        reg = self._pack_registry()
+        if not reg:
+            raise SessionError(f"the tech pack ({self._pack_root()}) declares no P&R option "
+                               "registry (pnr.settings_registry in its techpack.yaml)")
+        if name not in reg:
+            raise options.OptionError(f"unknown pack option {name!r}{_near(name, reg)}")
+        if name not in self._pack_given:
+            return None
+        self._refuse_closed("place_and_route", name)
+        self._set_at.pop(f"pack:{name}", None)
+        return self._pack_given.pop(name)
+
     def _pack_given_all(self, reg=None) -> Dict[str, Any]:
         """The pack options this session sets: shared ones set through s.db
         and set_pack_option's values (over them)."""
@@ -1121,7 +1141,7 @@ class Session:
         dst = Path(output) if output is not None else \
             Path(cfg.out_dir) / "passes" / f"{self._npass:02d}_{name}.mlir"
         dst.parent.mkdir(parents=True, exist_ok=True)
-        cmd = [str(cfg.circt_abc_opt), spec, str(src), "-o", str(dst)]
+        cmd = [*map(str, stages._mapper_tool(cfg)), spec, str(src), "-o", str(dst)]
         t0 = time.time()
         with self._active():
             stages._run(cmd)

@@ -17,9 +17,12 @@
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
+#include <fnmatch.h>
 #include <memory>
 
 using namespace llvm;
@@ -899,6 +902,29 @@ std::optional<ICGCellPattern> buildICGPattern(const RawCell &raw) {
 
 } // namespace
 
+// --liberty-dont-use=<glob>[,<glob>...]: cells no pass may CHOOSE. A tool-wide
+// option, because every pass that instantiates a library cell takes it from
+// this class: the cheapest-cell indices below are built without the cells
+// whose name matches a pattern (fnmatch, the matching ABC's `read_lib -X`
+// uses, so one pattern list serves both). Combinational cells stay known by
+// name (patternFor, cellNamesWithTable): an instance that is already in the
+// design is still recognised. The cells a pass picks outside these indices
+// are filtered where they are picked: limit-fanout's buffer and the
+// resubstitution database's cells are skipped, and a multibit register spec
+// that names an excluded cell is refused.
+static llvm::cl::list<std::string> libertyDontUse(
+    "liberty-dont-use", llvm::cl::CommaSeparated,
+    llvm::cl::desc("cell-name globs: library cells the mapping passes must "
+                   "not choose (existing instances are still recognised)"));
+
+bool LibertyLibrary::isDontUse(llvm::StringRef name) {
+  std::string n = name.str();
+  for (const std::string &pat : libertyDontUse)
+    if (fnmatch(pat.c_str(), n.c_str(), 0) == 0)
+      return true;
+  return false;
+}
+
 void LibertyLibrary::indexCell(const CellPattern &cell) {
   auto key = std::make_pair(cell.arity(), cell.table);
   auto it = exactIndex.find(key);
@@ -943,8 +969,10 @@ std::optional<LibertyLibrary> LibertyLibrary::loadFromFile(StringRef path) {
       lib.cells.push_back(std::move(*pat));
     for (FFCellPattern &ffPat : buildFFPatterns(raw))
       lib.ffCells.push_back(std::move(ffPat));
+    // wideAndOr is a selection list only (lookupWideAndOr)
     if (auto wPat = buildWideAndOrPattern(raw))
-      lib.wideAndOr.push_back(std::move(*wPat));
+      if (!isDontUse(wPat->name))
+        lib.wideAndOr.push_back(std::move(*wPat));
     if (auto icgPat = buildICGPattern(raw))
       lib.icgCells.push_back(std::move(*icgPat));
     if (auto haPat = buildHalfAdderPattern(raw))
@@ -957,19 +985,33 @@ std::optional<LibertyLibrary> LibertyLibrary::loadFromFile(StringRef path) {
   // growing, so the pointers `indexCell`/`indexFFCell`/`indexICGCell` store
   // stay valid for the library's lifetime.
   for (const CellPattern &cell : lib.cells)
-    lib.indexCell(cell);
+    if (!isDontUse(cell.name))
+      lib.indexCell(cell);
   if (auto inv = lib.exactIndex.find({1, TruthTable(0b01)});
       inv != lib.exactIndex.end())
     lib.inverterArea = inv->second->area;
+  else
+    // No usable inverter. When that is the pattern list's doing (the file
+    // has inverters, all excluded), lookup() offers no match that would
+    // need one.
+    for (const CellPattern &cell : lib.cells)
+      if (cell.arity() == 1 && cell.table == TruthTable(0b01)) {
+        lib.excludedInverter = cell.name;
+        break;
+      }
   for (const FFCellPattern &cell : lib.ffCells)
-    lib.indexFFCell(cell);
+    if (!isDontUse(cell.name))
+      lib.indexFFCell(cell);
   for (const ICGCellPattern &cell : lib.icgCells)
-    lib.indexICGCell(cell);
+    if (!isDontUse(cell.name))
+      lib.indexICGCell(cell);
   for (const HalfAdderCellPattern &cell : lib.halfAdderCells)
-    if (!lib.cheapestHalfAdder || cell.area < lib.cheapestHalfAdder->area)
+    if (!isDontUse(cell.name) &&
+        (!lib.cheapestHalfAdder || cell.area < lib.cheapestHalfAdder->area))
       lib.cheapestHalfAdder = &cell;
   for (const FullAdderCellPattern &cell : lib.fullAdderCells)
-    if (!lib.cheapestFullAdder || cell.area < lib.cheapestFullAdder->area)
+    if (!isDontUse(cell.name) &&
+        (!lib.cheapestFullAdder || cell.area < lib.cheapestFullAdder->area))
       lib.cheapestFullAdder = &cell;
 
   return lib;
@@ -1025,6 +1067,12 @@ std::optional<CellMatch> LibertyLibrary::lookup(unsigned arity,
   std::optional<CellMatch> best;
   double bestCost = 0.0;
   auto consider = [&](TruthTable queryTable, bool inverted) {
+    // Every inverter of this library is excluded (--liberty-dont-use): a
+    // match that needs one to complete it is not offered. The caller then
+    // gets the direct cell if there is one, or no match, as in a library
+    // that has no such cell.
+    if (inverted && !inversionIsFree && !excludedInverter.empty())
+      return;
     TruthTable permuted = permuteInputs(queryTable, arity, perm);
     auto it = exactIndex.find(std::make_pair(arity, permuted));
     if (it == exactIndex.end())

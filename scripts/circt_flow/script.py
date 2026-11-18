@@ -70,16 +70,16 @@ def _session(a) -> Optional[Session]:
         kw["run_sta"] = True
     if a.abc_script_file:
         kw["abc_script_file"] = a.abc_script_file
-    given = options.parse_assignments(a.set_options)
+    given, pack = options.split_assignments(a.set_options)
     if a.resume:
         if a.config or a.settings:
             raise SessionError("--resume takes no FLOW.yaml / OUT_DIR / --settings")
-        return Session.resume(a.resume, settings=given,
-                              allow_changed_inputs=a.allow_changed_inputs, **kw)
+        return _pack_set(Session.resume(a.resume, settings=given,
+                                        allow_changed_inputs=a.allow_changed_inputs, **kw), pack)
     if a.allow_changed_inputs:
         raise SessionError("--allow-changed-inputs goes with --resume")
     if a.config is None:
-        if given or a.settings or kw:
+        if given or pack or a.settings or kw:
             raise SessionError("--set / --settings / flow flags need FLOW.yaml OUT_DIR")
         return None
     if a.out_dir is None:
@@ -88,8 +88,29 @@ def _session(a) -> Optional[Session]:
         s = Session.from_settings(a.config, a.out_dir, a.settings, strict=a.strict, **kw)
         for k, v in given.items():
             s._set(k, v, where="--set")
+        return _pack_set(s, pack)
+    return _pack_set(Session(a.config, a.out_dir, settings=given, strict=a.strict, **kw), pack)
+
+
+def _pack_set(s: Session, pack) -> Session:
+    """`--set NAME=VALUE` for the names that are not circt-abc's own options:
+    the tech pack's P&R options (Session.set_pack_option; the same checks, and
+    like every option, one of a stage that has already run is refused)."""
+    if not pack:
         return s
-    return Session(a.config, a.out_dir, settings=given, strict=a.strict, **kw)
+    import difflib
+    reg = s._pack_registry() or {}
+    for k, v in pack:
+        if k not in reg:
+            near = difflib.get_close_matches(k, [*options.registry(), *reg], 3, 0.5)
+            hint = f" (did you mean {', '.join(near)}?)" if near else ""
+            where = ("and not one of the tech pack's P&R options (`python3 -m circt_flow options --pack <pack>`)"
+                     if reg else "and the tech pack declares no P&R option registry")
+            raise options.OptionError(f"--set: unknown option {k!r}{hint}: not an option of circt-abc "
+                                      f"(`python3 -m circt_flow options`) {where}")
+        s.set_pack_option(k, v)
+        s._set_at[f"pack:{k}"] = "--set"
+    return s
 
 
 class _Help:
