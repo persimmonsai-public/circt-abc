@@ -122,7 +122,9 @@ proc cts_recipe_gates {} {
     set gates {}
     foreach inst [get_cells *] {
         set lc [get_property $inst liberty_cell]
-        if {$lc eq "" || [get_property $lc is_buffer] || [get_property $lc is_inverter]} continue
+        # a physical-only cell (endcap, well tap, filler) has no liberty cell: the property is then a null object, not ""
+        if {$lc eq "" || $lc eq "NULL" || [catch {get_property $lc is_buffer} _isb]} continue
+        if {$_isb || [get_property $lc is_inverter]} continue
         foreach op [get_pins -of_objects $inst] {
             if {[get_property $op direction] eq "output" && [sta::is_clock $op]} { lappend gates [list $inst $op]; break }
         }
@@ -142,7 +144,7 @@ proc cts_recipe_flatten_root {} {
             if {[llength $loads] != 1} continue
             set inst [get_cells -of_objects [lindex $loads 0]]
             set lc [get_property $inst liberty_cell]
-            if {$lc eq "" || ![get_property $lc is_buffer]} continue
+            if {$lc eq "" || $lc eq "NULL" || [catch {get_property $lc is_buffer} _isb] || !$_isb} continue
             set outnet ""
             foreach op [get_pins -of_objects $inst] {
                 if {[get_property $op direction] eq "output"} { set outnet [get_nets -of_objects $op] }
